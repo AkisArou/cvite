@@ -1,0 +1,181 @@
+name: Clean bootstrap delivery files
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Wait for the exact CI revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f .cvite/fix-live-test-lifetime.py ]]; then
+            echo "The staged test fix has not been consumed yet."
+            exit 0
+          fi
+          grep -q 'iteration < 600' tests/fixtures/run_app.c || {
+            echo "The live test lifetime fix is not present yet."
+            exit 0
+          }
+
+          conclusion=""
+          for _ in $(seq 1 120); do
+            response=$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&event=push&per_page=100")
+            state=$(jq -r '[.workflow_runs[] | select(.name == "CI")][0].status // "missing"' <<<"$response")
+            conclusion=$(jq -r '[.workflow_runs[] | select(.name == "CI")][0].conclusion // ""' <<<"$response")
+            if [[ "$state" == "completed" ]]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [[ "$conclusion" != "success" ]]; then
+            echo "CI for ${GITHUB_SHA} did not finish green (conclusion=${conclusion:-missing})."
+            exit 1
+          fi
+
+      - name: Restore normal CI and remove delivery files
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > .github/workflows/ci.yml <<'YAML'
+          name: CI
+
+          on:
+            push:
+            pull_request:
+            workflow_dispatch:
+
+          jobs:
+            build:
+              name: ${{ matrix.compiler }}
+              runs-on: ubuntu-latest
+              strategy:
+                fail-fast: false
+                matrix:
+                  compiler: [gcc, clang]
+
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Install Ninja
+                  run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+                - name: Configure
+                  env:
+                    CC: ${{ matrix.compiler }}
+                  run: >-
+                    cmake -S . -B build -G Ninja
+                    -DCMAKE_BUILD_TYPE=Debug
+                    -DCVITE_WARNINGS_AS_ERRORS=ON
+
+                - name: Build
+                  run: cmake --build build --verbose
+
+                - name: Test
+                  run: ctest --test-dir build --output-on-failure
+
+            sanitizers:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Install Ninja and Clang
+                  run: sudo apt-get update && sudo apt-get install -y ninja-build clang
+
+                - name: Configure
+                  env:
+                    CC: clang
+                    CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+                    LDFLAGS: -fsanitize=address,undefined
+                  run: >-
+                    cmake -S . -B build-sanitize -G Ninja
+                    -DCMAKE_BUILD_TYPE=Debug
+                    -DCVITE_WARNINGS_AS_ERRORS=ON
+
+                - name: Build
+                  run: cmake --build build-sanitize --verbose
+
+                - name: Test
+                  env:
+                    ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+                    UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+                  run: ctest --test-dir build-sanitize --output-on-failure
+
+            compiler-pipeline:
+              name: Clang/LLVM compiler pipeline
+              runs-on: ubuntu-24.04
+              steps:
+                - uses: actions/checkout@v4
+
+                - name: Install Clang 18 development libraries
+                  run: >-
+                    sudo apt-get update &&
+                    sudo apt-get install -y
+                    ninja-build
+                    clang-18
+                    llvm-18
+                    llvm-18-dev
+                    libclang-18-dev
+                    python3
+
+                - name: Configure
+                  run: >-
+                    cmake -S . -B build-compiler -G Ninja
+                    -DCMAKE_BUILD_TYPE=Debug
+                    -DCMAKE_C_COMPILER=clang-18
+                    -DCMAKE_CXX_COMPILER=clang++-18
+                    -DCVITE_BUILD_COMPILER=ON
+                    -DCVITE_BUILD_LLVM_PASS=ON
+                    -DCVITE_BUILD_ORC_LOADER=ON
+                    -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+                    -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+                    -DCVITE_WARNINGS_AS_ERRORS=ON
+
+                - name: Build
+                  run: cmake --build build-compiler --verbose
+
+                - name: Test
+                  run: ctest --test-dir build-compiler --output-on-failure
+          YAML
+
+          git rm -f --ignore-unmatch \
+            .cvite/compile-db-patch.tar.gz.b64 \
+            .cvite/compile-db-patch.part-00 \
+            .cvite/compile-db-patch.part-01 \
+            .cvite/compile-db-patch.part-02 \
+            .cvite/compile-db-patch.part-03 \
+            .cvite/fix-live-test-lifetime.py \
+            .github/workflows/apply-compile-db-patch.yml \
+            .github/workflows/apply-live-test-fix.yml \
+            .github/workflows/cleanup-bootstrap.yml
+          git add -- .github/workflows/ci.yml
+          git diff --cached --check
+
+          if git diff --cached --quiet; then
+            echo "Nothing to clean."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: remove bootstrap delivery workflows"
+          git push origin HEAD:bootstrap/m0-runtime
