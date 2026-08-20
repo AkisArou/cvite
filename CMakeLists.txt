@@ -118,6 +118,7 @@ if(CVITE_BUILD_LLVM_PASS)
     add_llvm_pass_plugin(CViteLoweringPass
         src/transform/lowering_pass.cpp
     )
+    target_include_directories(CViteLoweringPass SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
     cvite_set_warnings(CViteLoweringPass)
 
     if(BUILD_TESTING)
