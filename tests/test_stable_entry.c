@@ -42,7 +42,8 @@ int main(int argc, char **argv)
     update_fn stable_address = cvite_e2e_update;
 
     CHECK(argc == 2);
-    CHECK(stable_address(&state, 2) == 7);
+    CHECK(cvite_host_storage_count() == 1U);
+    CHECK(stable_address(&state, 2) == 17);
     CHECK(state.updates == 1);
     CHECK(cvite_host_generation() == 0U);
 
@@ -71,7 +72,7 @@ int main(int argc, char **argv)
     CHECK(cvite_host_apply_patch(&patch, &error) == CVITE_STATUS_OK);
 
     CHECK(cvite_e2e_update == stable_address);
-    CHECK(stable_address(&state, 3) == 37);
+    CHECK(stable_address(&state, 3) == 58);
     CHECK(state.updates == 2);
     CHECK(cvite_host_generation() == 1U);
 

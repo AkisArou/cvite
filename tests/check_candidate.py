@@ -43,6 +43,7 @@ def main() -> int:
         directory = pathlib.Path(temp)
         raw_ir = directory / "raw.ll"
         transformed_ir = directory / "transformed.ll"
+        baseline_ir_path = directory / "baseline.ll"
         run(
             [
                 str(clang),
@@ -59,6 +60,17 @@ def main() -> int:
             [
                 str(opt),
                 f"-load-pass-plugin={plugin}",
+                "-passes=cvite-lowering,cvite-baseline,cvite-baseline-manifest,verify",
+                "-S",
+                str(raw_ir),
+                "-o",
+                str(baseline_ir_path),
+            ]
+        )
+        run(
+            [
+                str(opt),
+                f"-load-pass-plugin={plugin}",
                 "-passes=cvite-lowering,cvite-candidate,cvite-candidate,verify",
                 "-S",
                 str(raw_ir),
@@ -66,6 +78,7 @@ def main() -> int:
                 str(transformed_ir),
             ]
         )
+        baseline_ir = baseline_ir_path.read_text(encoding="utf-8")
         ir = transformed_ir.read_text(encoding="utf-8")
 
         if "cvite.candidate.schema" not in ir:
@@ -74,12 +87,39 @@ def main() -> int:
             fail("candidate manifest is missing")
         if "@__cvite_candidate_records" not in ir:
             fail("candidate function records are missing")
+        if "@__cvite_candidate_storage_records" not in ir:
+            fail("candidate storage requirements are missing")
         if "@__cvite_host_target_for" not in ir:
             fail("candidate entries do not resolve stable targets by ID")
 
         implementations = re.findall(rf"@__cvite_patch\.({ID})", ir)
         if len(set(implementations)) != 2:
             fail(f"expected two candidate implementations: {implementations!r}")
+
+        storage_symbols = set(re.findall(rf"@__cvite_storage\.({ID})", ir))
+        storage_records = set(
+            re.findall(rf"@__cvite_candidate_storage_name\.({ID})", ir)
+        )
+        if len(storage_symbols) != 2:
+            fail(f"expected global and static-local storage proxies: {storage_symbols!r}")
+        if storage_symbols != storage_records:
+            fail("storage manifest records do not match generated proxies")
+        baseline_storage = set(
+            re.findall(rf"@__cvite_baseline_storage_name\.({ID})", baseline_ir)
+        )
+        if storage_symbols != baseline_storage:
+            fail(
+                "baseline and candidate transforms disagree on stable storage IDs: "
+                f"{baseline_storage!r} != {storage_symbols!r}"
+            )
+        for storage_id in storage_symbols:
+            if not re.search(
+                rf"@__cvite_storage\.{storage_id}\s*=\s*external\s+global",
+                ir,
+            ):
+                fail(f"storage proxy {storage_id} is not an external data symbol")
+        if "!cvite.storage" not in ir:
+            fail("candidate storage proxies are missing layout metadata")
 
         if not re.search(r"define [^{@]*@app_update\(", ir):
             fail("app_update candidate entry is missing")
@@ -105,6 +145,8 @@ def main() -> int:
         )
         if not any("call" in body and "@helper" in body for body in implementation_bodies):
             fail("candidate inter-function calls bypass generated stable entries")
+        if not any("@__cvite_storage." in body for body in implementation_bodies):
+            fail("candidate implementations do not use persistent baseline storage")
 
         record_ids = re.findall(rf"@__cvite_candidate_name\.({ID})", ir)
         if set(record_ids) != set(implementations):

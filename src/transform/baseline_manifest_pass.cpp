@@ -26,15 +26,27 @@ constexpr llvm::StringLiteral kPassName = "cvite-baseline-manifest";
 constexpr llvm::StringLiteral kBaselineFlag = "cvite.baseline.schema";
 constexpr llvm::StringLiteral kManifestFlag = "cvite.baseline.manifest.schema";
 constexpr llvm::StringLiteral kManifestSymbol = "__cvite_baseline_manifest";
-constexpr llvm::StringLiteral kRecordsSymbol = "__cvite_baseline_records";
+constexpr llvm::StringLiteral kFunctionRecordsSymbol =
+    "__cvite_baseline_records";
+constexpr llvm::StringLiteral kStorageRecordsSymbol =
+    "__cvite_baseline_storage_records";
 constexpr llvm::StringLiteral kProgramMainSymbol = "__cvite_program_main";
-constexpr unsigned kManifestSchema = 1U;
+constexpr unsigned kManifestSchema = 2U;
 
 struct BaselineFunction final {
     llvm::Function *implementation = nullptr;
     llvm::GlobalVariable *slot = nullptr;
     Hash128 identity;
     Hash128 abi;
+    std::string debug_name;
+};
+
+struct BaselineStorage final {
+    llvm::GlobalVariable *global = nullptr;
+    Hash128 identity;
+    Hash128 layout;
+    std::uint64_t size = 0U;
+    std::uint64_t alignment = 0U;
     std::string debug_name;
 };
 
@@ -120,25 +132,60 @@ bool extractFunction(
     return true;
 }
 
+bool extractStorage(
+    llvm::Module &module,
+    llvm::GlobalVariable &global,
+    BaselineStorage &result)
+{
+    if (!cvite::transform::shouldTrackStorageDefinition(global)) {
+        return false;
+    }
+
+    const std::uint64_t size =
+        cvite::transform::storageSize(module, global);
+    const std::uint64_t alignment =
+        cvite::transform::storageAlignment(module, global);
+    if (size == 0U || alignment == 0U) {
+        module.getContext().emitError(
+            "CVite persistent storage has an unsupported target layout");
+        return false;
+    }
+
+    const std::string debug_name = global.getName().str();
+    result = BaselineStorage{
+        &global,
+        cvite::transform::hash128(cvite::transform::storageIdentitySeed(
+            module, global, debug_name)),
+        cvite::transform::hash128(
+            cvite::transform::storageLayoutSeed(module, global)),
+        size,
+        alignment,
+        debug_name,
+    };
+    return true;
+}
+
 llvm::GlobalVariable *createDebugName(
     llvm::Module &module,
-    const BaselineFunction &function)
+    llvm::StringRef prefix,
+    llvm::StringRef name,
+    const Hash128 &identity)
 {
     llvm::Constant *data = llvm::ConstantDataArray::getString(
-        module.getContext(), function.debug_name, true);
+        module.getContext(), name, true);
     auto *global = new llvm::GlobalVariable(
         module,
         data->getType(),
         true,
         llvm::GlobalValue::PrivateLinkage,
         data,
-        "__cvite_baseline_name." + function.identity.hex);
+        prefix.str() + identity.hex);
     global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
     global->setAlignment(llvm::Align(1U));
     return global;
 }
 
-void createManifest(
+llvm::GlobalVariable *createFunctionRecords(
     llvm::Module &module,
     llvm::ArrayRef<BaselineFunction> functions)
 {
@@ -153,7 +200,11 @@ void createManifest(
     llvm::SmallVector<llvm::Constant *, 32> records;
     records.reserve(functions.size());
     for (const BaselineFunction &function : functions) {
-        llvm::GlobalVariable *debug_name = createDebugName(module, function);
+        llvm::GlobalVariable *debug_name = createDebugName(
+            module,
+            "__cvite_baseline_name.",
+            function.debug_name,
+            function.identity);
         records.push_back(llvm::ConstantStruct::get(
             record_type,
             {
@@ -175,11 +226,73 @@ void createManifest(
         true,
         llvm::GlobalValue::InternalLinkage,
         llvm::ConstantArray::get(records_type, records),
-        kRecordsSymbol);
+        kFunctionRecordsSymbol);
     records_global->setAlignment(llvm::Align(8U));
+    return records_global;
+}
+
+llvm::GlobalVariable *createStorageRecords(
+    llvm::Module &module,
+    llvm::ArrayRef<BaselineStorage> storages)
+{
+    llvm::LLVMContext &context = module.getContext();
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    llvm::Type *pointer = llvm::PointerType::getUnqual(context);
+    llvm::StructType *record_type = llvm::StructType::get(
+        context,
+        {i64, i64, i64, i64, i64, i64, pointer, pointer},
+        false);
+
+    llvm::SmallVector<llvm::Constant *, 32> records;
+    records.reserve(storages.size());
+    for (const BaselineStorage &storage : storages) {
+        llvm::GlobalVariable *debug_name = createDebugName(
+            module,
+            "__cvite_baseline_storage_name.",
+            storage.debug_name,
+            storage.identity);
+        records.push_back(llvm::ConstantStruct::get(
+            record_type,
+            {
+                llvm::ConstantInt::get(i64, storage.identity.high),
+                llvm::ConstantInt::get(i64, storage.identity.low),
+                llvm::ConstantInt::get(i64, storage.layout.high),
+                llvm::ConstantInt::get(i64, storage.layout.low),
+                llvm::ConstantInt::get(i64, storage.size),
+                llvm::ConstantInt::get(i64, storage.alignment),
+                storage.global,
+                debug_name,
+            }));
+    }
+
+    llvm::ArrayType *records_type = llvm::ArrayType::get(
+        record_type, static_cast<std::uint64_t>(records.size()));
+    auto *records_global = new llvm::GlobalVariable(
+        module,
+        records_type,
+        true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(records_type, records),
+        kStorageRecordsSymbol);
+    records_global->setAlignment(llvm::Align(8U));
+    return records_global;
+}
+
+void createManifest(
+    llvm::Module &module,
+    llvm::ArrayRef<BaselineFunction> functions,
+    llvm::ArrayRef<BaselineStorage> storages)
+{
+    llvm::LLVMContext &context = module.getContext();
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    llvm::Type *pointer = llvm::PointerType::getUnqual(context);
+    llvm::GlobalVariable *function_records =
+        createFunctionRecords(module, functions);
+    llvm::GlobalVariable *storage_records =
+        createStorageRecords(module, storages);
 
     llvm::StructType *manifest_type = llvm::StructType::get(
-        context, {i64, i64, pointer}, false);
+        context, {i64, i64, pointer, i64, pointer}, false);
     auto *manifest = new llvm::GlobalVariable(
         module,
         manifest_type,
@@ -191,7 +304,10 @@ void createManifest(
                 llvm::ConstantInt::get(i64, kManifestSchema),
                 llvm::ConstantInt::get(
                     i64, static_cast<std::uint64_t>(functions.size())),
-                records_global,
+                function_records,
+                llvm::ConstantInt::get(
+                    i64, static_cast<std::uint64_t>(storages.size())),
+                storage_records,
             }),
         kManifestSymbol);
     manifest->setVisibility(llvm::GlobalValue::DefaultVisibility);
@@ -283,7 +399,15 @@ public:
             }
         }
 
-        createManifest(module, functions);
+        llvm::SmallVector<BaselineStorage, 32> storages;
+        for (llvm::GlobalVariable &global : module.globals()) {
+            BaselineStorage record;
+            if (extractStorage(module, global, record)) {
+                storages.push_back(std::move(record));
+            }
+        }
+
+        createManifest(module, functions, storages);
         createProgramMain(module);
         module.addModuleFlag(
             llvm::Module::Error,

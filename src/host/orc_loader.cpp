@@ -13,6 +13,7 @@
 #include "llvm/Support/TargetSelect.h"
 
 #include <atomic>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -28,8 +29,11 @@ namespace {
 
 constexpr const char *kTargetForSymbol = "__cvite_host_target_for";
 constexpr const char *kRegisterFunctionSymbol = "__cvite_host_register_function";
+constexpr const char *kRegisterStorageSymbol = "__cvite_host_register_storage";
 constexpr const char *kTargetAtSymbol = "__cvite_host_target_at";
-constexpr std::uint64_t kMaxCandidateFunctions = UINT64_C(1048576);
+constexpr const char *kStorageForSymbol = "__cvite_host_storage_for";
+constexpr const char *kStorageSymbolPrefix = "__cvite_storage.";
+constexpr std::uint64_t kMaxManifestRecords = UINT64_C(1048576);
 
 struct HostFunction final {
     std::string name;
@@ -113,6 +117,11 @@ llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> createJITLinkLayer(
             std::move(*memory_manager)));
 }
 
+bool isPowerOfTwo(std::uint64_t value)
+{
+    return value != 0U && (value & (value - 1U)) == 0U;
+}
+
 bool hasDuplicateUpdate(
     const std::vector<cvite_function_update> &updates,
     cvite_id id)
@@ -123,6 +132,32 @@ bool hasDuplicateUpdate(
         }
     }
     return false;
+}
+
+bool hasDuplicateId(const std::vector<cvite_id> &identities, cvite_id id)
+{
+    for (const cvite_id existing : identities) {
+        if (cvite_id_equal(existing, id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string storageSymbolName(cvite_id id)
+{
+    char name[64];
+    const int length = std::snprintf(
+        name,
+        sizeof(name),
+        "%s%016" PRIx64 "%016" PRIx64,
+        kStorageSymbolPrefix,
+        id.high,
+        id.low);
+    if (length <= 0 || static_cast<std::size_t>(length) >= sizeof(name)) {
+        return std::string();
+    }
+    return std::string(name, static_cast<std::size_t>(length));
 }
 
 } // namespace
@@ -177,8 +212,16 @@ extern "C" cvite_status cvite_orc_loader_create(
         reinterpret_cast<cvite_function_pointer>(&__cvite_host_register_function),
     });
     created->host_functions.push_back(HostFunction{
+        kRegisterStorageSymbol,
+        reinterpret_cast<cvite_function_pointer>(&__cvite_host_register_storage),
+    });
+    created->host_functions.push_back(HostFunction{
         kTargetAtSymbol,
         reinterpret_cast<cvite_function_pointer>(&__cvite_host_target_at),
+    });
+    created->host_functions.push_back(HostFunction{
+        kStorageForSymbol,
+        reinterpret_cast<cvite_function_pointer>(&__cvite_host_storage_for),
     });
     *loader = created.release();
     return CVITE_STATUS_OK;
@@ -273,6 +316,28 @@ extern "C" cvite_status cvite_orc_loader_stage_object(
             llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable,
         };
     }
+
+    const std::size_t storage_count = cvite_host_storage_count();
+    for (std::size_t index = 0U; index < storage_count; ++index) {
+        cvite_host_storage storage;
+        const cvite_status storage_status =
+            cvite_host_storage_at(index, &storage, error);
+        if (storage_status != CVITE_STATUS_OK) {
+            return storage_status;
+        }
+        const std::string symbol_name = storageSymbolName(storage.id);
+        if (symbol_name.empty()) {
+            return fail(
+                error,
+                CVITE_STATUS_INVALID_STATE,
+                "could not encode a persistent-storage symbol name");
+        }
+        host_symbols[loader->jit->mangleAndIntern(symbol_name)] = {
+            llvm::orc::ExecutorAddr::fromPtr(storage.address),
+            llvm::JITSymbolFlags::Exported,
+        };
+    }
+
     if (!host_symbols.empty()) {
         if (llvm::Error define_error =
                 candidate_dylib.define(
@@ -386,12 +451,14 @@ extern "C" cvite_status cvite_orc_loader_prepare_baseline(
             CVITE_STATUS_UNSUPPORTED_PROTOCOL,
             "baseline manifest schema is unsupported");
     }
-    if (manifest->function_count > kMaxCandidateFunctions ||
-        manifest->function_count > static_cast<std::uint64_t>(SIZE_MAX)) {
+    if (manifest->function_count > kMaxManifestRecords ||
+        manifest->function_count > static_cast<std::uint64_t>(SIZE_MAX) ||
+        manifest->storage_count > kMaxManifestRecords ||
+        manifest->storage_count > static_cast<std::uint64_t>(SIZE_MAX)) {
         return fail(
             error,
             CVITE_STATUS_INVALID_PACKET,
-            "baseline manifest function count is unreasonable");
+            "baseline manifest record count is unreasonable");
     }
     if (manifest->function_count != 0U && manifest->functions == nullptr) {
         return fail(
@@ -399,9 +466,45 @@ extern "C" cvite_status cvite_orc_loader_prepare_baseline(
             CVITE_STATUS_INVALID_PACKET,
             "baseline manifest has no function records");
     }
+    if (manifest->storage_count != 0U && manifest->storages == nullptr) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_PACKET,
+            "baseline manifest has no storage records");
+    }
 
-    std::vector<cvite_id> identities;
-    identities.reserve(static_cast<std::size_t>(manifest->function_count));
+    std::vector<cvite_id> storage_identities;
+    storage_identities.reserve(
+        static_cast<std::size_t>(manifest->storage_count));
+    for (std::uint64_t index = 0U;
+         index < manifest->storage_count;
+         ++index) {
+        const cvite_baseline_storage &record = manifest->storages[index];
+        const cvite_id id{record.id_high, record.id_low};
+        const cvite_id layout{record.layout_high, record.layout_low};
+        if (cvite_id_is_zero(id) || cvite_id_is_zero(layout) ||
+            record.size == 0U || !isPowerOfTwo(record.alignment) ||
+            record.size > static_cast<std::uint64_t>(SIZE_MAX) ||
+            record.alignment > static_cast<std::uint64_t>(SIZE_MAX) ||
+            record.address == nullptr || record.debug_name == nullptr ||
+            record.debug_name[0] == '\0') {
+            return fail(
+                error,
+                CVITE_STATUS_INVALID_PACKET,
+                "baseline manifest contains an invalid storage record");
+        }
+        if (hasDuplicateId(storage_identities, id)) {
+            return fail(
+                error,
+                CVITE_STATUS_DUPLICATE_SYMBOL,
+                "baseline manifest contains a duplicate storage ID");
+        }
+        storage_identities.push_back(id);
+    }
+
+    std::vector<cvite_id> function_identities;
+    function_identities.reserve(
+        static_cast<std::size_t>(manifest->function_count));
     for (std::uint64_t index = 0U;
          index < manifest->function_count;
          ++index) {
@@ -416,15 +519,33 @@ extern "C" cvite_status cvite_orc_loader_prepare_baseline(
                 CVITE_STATUS_INVALID_PACKET,
                 "baseline manifest contains an invalid function record");
         }
-        for (const cvite_id existing : identities) {
-            if (cvite_id_equal(existing, id)) {
-                return fail(
-                    error,
-                    CVITE_STATUS_DUPLICATE_SYMBOL,
-                    "baseline manifest contains a duplicate function ID");
-            }
+        if (hasDuplicateId(function_identities, id)) {
+            return fail(
+                error,
+                CVITE_STATUS_DUPLICATE_SYMBOL,
+                "baseline manifest contains a duplicate function ID");
         }
-        identities.push_back(id);
+        function_identities.push_back(id);
+    }
+
+    for (std::uint64_t index = 0U;
+         index < manifest->storage_count;
+         ++index) {
+        const cvite_baseline_storage &record = manifest->storages[index];
+        const cvite_storage_definition definition = {
+            cvite_id{record.id_high, record.id_low},
+            cvite_id{record.layout_high, record.layout_low},
+            static_cast<std::size_t>(record.size),
+            static_cast<std::size_t>(record.alignment),
+            nullptr,
+            record.debug_name,
+        };
+        cvite_host_storage registered;
+        const cvite_status register_status = cvite_host_register_storage(
+            &definition, record.address, &registered, error);
+        if (register_status != CVITE_STATUS_OK) {
+            return register_status;
+        }
     }
 
     for (std::uint64_t index = 0U;
@@ -513,18 +634,69 @@ extern "C" cvite_status cvite_orc_loader_prepare_patch(
             CVITE_STATUS_INVALID_PACKET,
             "candidate manifest contains no refreshable functions");
     }
-    if (manifest->function_count > kMaxCandidateFunctions ||
-        manifest->function_count > (std::uint64_t)SIZE_MAX) {
+    if (manifest->function_count > kMaxManifestRecords ||
+        manifest->function_count > static_cast<std::uint64_t>(SIZE_MAX) ||
+        manifest->storage_count > kMaxManifestRecords ||
+        manifest->storage_count > static_cast<std::uint64_t>(SIZE_MAX)) {
         return fail(
             error,
             CVITE_STATUS_INVALID_PACKET,
-            "candidate manifest function count is unreasonable");
+            "candidate manifest record count is unreasonable");
     }
     if (manifest->functions == nullptr) {
         return fail(
             error,
             CVITE_STATUS_INVALID_PACKET,
             "candidate manifest has no function records");
+    }
+    if (manifest->storage_count != 0U && manifest->storages == nullptr) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_PACKET,
+            "candidate manifest has no storage records");
+    }
+
+    std::vector<cvite_id> storage_identities;
+    storage_identities.reserve(
+        static_cast<std::size_t>(manifest->storage_count));
+    for (std::uint64_t index = 0U;
+         index < manifest->storage_count;
+         ++index) {
+        const cvite_candidate_storage &record = manifest->storages[index];
+        const cvite_id id{record.id_high, record.id_low};
+        const cvite_id layout{record.layout_high, record.layout_low};
+        if (cvite_id_is_zero(id) || cvite_id_is_zero(layout) ||
+            record.size == 0U || !isPowerOfTwo(record.alignment) ||
+            record.size > static_cast<std::uint64_t>(SIZE_MAX) ||
+            record.alignment > static_cast<std::uint64_t>(SIZE_MAX) ||
+            record.debug_name == nullptr || record.debug_name[0] == '\0') {
+            return fail(
+                error,
+                CVITE_STATUS_INVALID_PACKET,
+                "candidate manifest contains an invalid storage record");
+        }
+        if (hasDuplicateId(storage_identities, id)) {
+            return fail(
+                error,
+                CVITE_STATUS_DUPLICATE_SYMBOL,
+                "candidate manifest contains a duplicate storage ID");
+        }
+        storage_identities.push_back(id);
+
+        const cvite_storage_definition definition = {
+            id,
+            layout,
+            static_cast<std::size_t>(record.size),
+            static_cast<std::size_t>(record.alignment),
+            nullptr,
+            record.debug_name,
+        };
+        cvite_host_storage storage;
+        const cvite_status storage_status = cvite_host_require_storage(
+            &definition, &storage, error);
+        if (storage_status != CVITE_STATUS_OK) {
+            return storage_status;
+        }
     }
 
     Generation &candidate = found->second;

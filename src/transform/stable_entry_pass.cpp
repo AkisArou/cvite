@@ -29,8 +29,10 @@ constexpr llvm::StringLiteral kPassName = "cvite-baseline";
 constexpr llvm::StringLiteral kBaselineFlag = "cvite.baseline.schema";
 constexpr llvm::StringLiteral kRegisterFunction =
     "__cvite_host_register_function";
+constexpr llvm::StringLiteral kRegisterStorage =
+    "__cvite_host_register_storage";
 constexpr llvm::StringLiteral kTargetAt = "__cvite_host_target_at";
-constexpr unsigned kBaselineSchema = 1U;
+constexpr unsigned kBaselineSchema = 2U;
 constexpr int kRegistrationPriority = 1;
 
 struct WrappedFunction final {
@@ -39,6 +41,15 @@ struct WrappedFunction final {
     llvm::GlobalVariable *slot = nullptr;
     Hash128 identity;
     Hash128 abi;
+    std::string debug_name;
+};
+
+struct TrackedStorage final {
+    llvm::GlobalVariable *global = nullptr;
+    Hash128 identity;
+    Hash128 layout;
+    std::uint64_t size = 0U;
+    std::uint64_t alignment = 0U;
     std::string debug_name;
 };
 
@@ -97,6 +108,18 @@ llvm::FunctionCallee getRegisterFunction(llvm::Module &module)
     return module.getOrInsertFunction(kRegisterFunction, type);
 }
 
+llvm::FunctionCallee getRegisterStorageFunction(llvm::Module &module)
+{
+    llvm::LLVMContext &context = module.getContext();
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    llvm::Type *pointer = llvm::PointerType::getUnqual(context);
+    llvm::FunctionType *type = llvm::FunctionType::get(
+        pointer,
+        {i64, i64, i64, i64, i64, i64, pointer, pointer},
+        false);
+    return module.getOrInsertFunction(kRegisterStorage, type);
+}
+
 llvm::FunctionCallee getTargetFunction(llvm::Module &module)
 {
     llvm::LLVMContext &context = module.getContext();
@@ -113,6 +136,52 @@ void copyArgumentNames(llvm::Function &destination, const llvm::Function &source
         destination_argument->setName(source_argument.getName());
         ++destination_argument;
     }
+}
+
+void setStorageMetadata(
+    llvm::GlobalVariable &global,
+    const TrackedStorage &storage)
+{
+    llvm::LLVMContext &context = global.getContext();
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    llvm::Metadata *metadata[] = {
+        llvm::MDString::get(context, storage.identity.hex),
+        llvm::MDString::get(context, storage.layout.hex),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.identity.high)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.identity.low)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.layout.high)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.layout.low)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.size)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.alignment)),
+    };
+    global.setMetadata(
+        cvite::transform::kStorageMetadata,
+        llvm::MDNode::get(context, metadata));
+}
+
+TrackedStorage trackStorage(
+    llvm::Module &module,
+    llvm::GlobalVariable &global)
+{
+    const std::string original_name = global.getName().str();
+    TrackedStorage storage{
+        &global,
+        cvite::transform::hash128(cvite::transform::storageIdentitySeed(
+            module, global, original_name)),
+        cvite::transform::hash128(
+            cvite::transform::storageLayoutSeed(module, global)),
+        cvite::transform::storageSize(module, global),
+        cvite::transform::storageAlignment(module, global),
+        original_name,
+    };
+    setStorageMetadata(global, storage);
+    return storage;
 }
 
 WrappedFunction wrapFunction(llvm::Module &module, llvm::Function &function)
@@ -224,7 +293,8 @@ WrappedFunction wrapFunction(llvm::Module &module, llvm::Function &function)
 
 void createRegistrationConstructor(
     llvm::Module &module,
-    llvm::ArrayRef<WrappedFunction> functions)
+    llvm::ArrayRef<WrappedFunction> functions,
+    llvm::ArrayRef<TrackedStorage> storages)
 {
     llvm::LLVMContext &context = module.getContext();
     llvm::Type *i64 = llvm::Type::getInt64Ty(context);
@@ -242,7 +312,27 @@ void createRegistrationConstructor(
     llvm::BasicBlock *entry =
         llvm::BasicBlock::Create(context, "entry", constructor);
     llvm::IRBuilder<> builder(entry);
+    const llvm::FunctionCallee register_storage =
+        getRegisterStorageFunction(module);
     const llvm::FunctionCallee register_function = getRegisterFunction(module);
+
+    for (const TrackedStorage &storage : storages) {
+        llvm::Value *debug_name = builder.CreateGlobalStringPtr(
+            storage.debug_name,
+            "__cvite_storage_name." + storage.identity.hex);
+        builder.CreateCall(
+            register_storage,
+            {
+                llvm::ConstantInt::get(i64, storage.identity.high),
+                llvm::ConstantInt::get(i64, storage.identity.low),
+                llvm::ConstantInt::get(i64, storage.layout.high),
+                llvm::ConstantInt::get(i64, storage.layout.low),
+                llvm::ConstantInt::get(i64, storage.size),
+                llvm::ConstantInt::get(i64, storage.alignment),
+                storage.global,
+                debug_name,
+            });
+    }
 
     for (const WrappedFunction &function : functions) {
         llvm::Value *debug_name = builder.CreateGlobalStringPtr(
@@ -277,6 +367,18 @@ public:
             return llvm::PreservedAnalyses::all();
         }
 
+        llvm::SmallVector<llvm::GlobalVariable *, 32> storage_candidates;
+        for (llvm::GlobalVariable &global : module.globals()) {
+            if (cvite::transform::shouldTrackStorageDefinition(global)) {
+                storage_candidates.push_back(&global);
+            }
+        }
+        llvm::SmallVector<TrackedStorage, 32> storages;
+        storages.reserve(storage_candidates.size());
+        for (llvm::GlobalVariable *global : storage_candidates) {
+            storages.push_back(trackStorage(module, *global));
+        }
+
         llvm::SmallVector<llvm::Function *, 32> candidates;
         for (llvm::Function &function : module) {
             if (shouldWrap(function)) {
@@ -290,8 +392,8 @@ public:
             wrapped.push_back(wrapFunction(module, *function));
         }
 
-        if (!wrapped.empty()) {
-            createRegistrationConstructor(module, wrapped);
+        if (!wrapped.empty() || !storages.empty()) {
+            createRegistrationConstructor(module, wrapped, storages);
         }
         module.addModuleFlag(
             llvm::Module::Error,

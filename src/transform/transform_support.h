@@ -4,7 +4,9 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/raw_ostream.h"
@@ -18,6 +20,13 @@ inline constexpr llvm::StringLiteral kAbiSchema = "cvite.lowered-abi.v1";
 inline constexpr llvm::StringLiteral kIdentitySchema = "cvite.function-id.v1";
 inline constexpr llvm::StringLiteral kFunctionMetadata = "cvite.abi";
 inline constexpr llvm::StringLiteral kFunctionIndex = "cvite.functions";
+inline constexpr llvm::StringLiteral kStorageIdentitySchema =
+    "cvite.storage-id.v1";
+inline constexpr llvm::StringLiteral kStorageLayoutSchema =
+    "cvite.storage-layout.v1";
+inline constexpr llvm::StringLiteral kStorageMetadata = "cvite.storage";
+inline constexpr llvm::StringLiteral kStorageSymbolPrefix =
+    "__cvite_storage.";
 
 struct Hash128 final {
     std::uint64_t high = 0U;
@@ -86,6 +95,68 @@ inline std::string identitySeed(
     return output.str();
 }
 
+inline std::string storageIdentitySeed(
+    const llvm::Module &module,
+    const llvm::GlobalVariable &storage,
+    llvm::StringRef original_name)
+{
+    std::string seed;
+    llvm::raw_string_ostream output(seed);
+
+    output << kStorageIdentitySchema << '\n';
+    if (storage.hasLocalLinkage()) {
+        output << "scope=translation-unit\n";
+        output << "source=" << module.getSourceFileName() << '\n';
+    } else {
+        output << "scope=linkage-unit\n";
+    }
+    output << "name=" << original_name << '\n';
+    return output.str();
+}
+
+inline std::uint64_t storageSize(
+    const llvm::Module &module,
+    const llvm::GlobalVariable &storage)
+{
+    const llvm::TypeSize size =
+        module.getDataLayout().getTypeAllocSize(storage.getValueType());
+    return size.isScalable() ? 0U : size.getFixedValue();
+}
+
+inline std::uint64_t storageAlignment(
+    const llvm::Module &module,
+    const llvm::GlobalVariable &storage)
+{
+    const llvm::MaybeAlign explicit_alignment = storage.getAlign();
+    if (explicit_alignment.has_value()) {
+        return explicit_alignment->value();
+    }
+    return module.getDataLayout()
+        .getABITypeAlign(storage.getValueType())
+        .value();
+}
+
+inline std::string storageLayoutSeed(
+    const llvm::Module &module,
+    const llvm::GlobalVariable &storage)
+{
+    std::string seed;
+    llvm::raw_string_ostream output(seed);
+
+    output << kStorageLayoutSchema << '\n';
+    output << "target=" << module.getTargetTriple() << '\n';
+    output << "data-layout=" << module.getDataLayoutStr() << '\n';
+    output << "value-type=" << printType(*storage.getValueType()) << '\n';
+    output << "size=" << storageSize(module, storage) << '\n';
+    output << "alignment=" << storageAlignment(module, storage) << '\n';
+    return output.str();
+}
+
+inline std::string storageSymbolName(const Hash128 &identity)
+{
+    return kStorageSymbolPrefix.str() + identity.hex;
+}
+
 inline Hash128 hash128(llvm::StringRef input)
 {
     llvm::MD5 hash;
@@ -103,6 +174,23 @@ inline bool shouldIndex(const llvm::Function &function)
 {
     return !function.isDeclaration() && !function.isIntrinsic() &&
         !function.getName().starts_with("__cvite_");
+}
+
+inline bool hasSupportedStorageLinkage(const llvm::GlobalVariable &storage)
+{
+    return storage.hasExternalLinkage() || storage.hasInternalLinkage() ||
+        storage.hasPrivateLinkage() || storage.hasCommonLinkage();
+}
+
+inline bool shouldTrackStorageDefinition(
+    const llvm::GlobalVariable &storage)
+{
+    return !storage.isDeclaration() && !storage.isConstant() &&
+        !storage.isThreadLocal() && storage.getAddressSpace() == 0U &&
+        storage.getValueType()->isSized() &&
+        hasSupportedStorageLinkage(storage) &&
+        !storage.getName().starts_with("llvm.") &&
+        !storage.getName().starts_with("__cvite_");
 }
 
 } // namespace cvite::transform

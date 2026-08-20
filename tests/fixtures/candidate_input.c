@@ -2,9 +2,14 @@ typedef struct app_state {
     int value;
 } app_state;
 
+static int global_bias = 3;
+
 static int helper(int value)
 {
-    return value + 3;
+    static int calls = 1;
+    calls += 1;
+    global_bias += 1;
+    return value + calls + global_bias;
 }
 
 int app_update(app_state *state, int delta)
@@ -16,5 +21,5 @@ int app_update(app_state *state, int delta)
 int main(void)
 {
     app_state state = {0};
-    return app_update(&state, 1) == 4 ? 0 : 1;
+    return app_update(&state, 1) == 7 ? 0 : 1;
 }

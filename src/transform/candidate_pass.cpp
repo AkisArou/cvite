@@ -28,14 +28,26 @@ constexpr llvm::StringLiteral kCandidateFlag = "cvite.candidate.schema";
 constexpr llvm::StringLiteral kBaselineFlag = "cvite.baseline.schema";
 constexpr llvm::StringLiteral kTargetFor = "__cvite_host_target_for";
 constexpr llvm::StringLiteral kManifestSymbol = "__cvite_candidate_manifest";
-constexpr llvm::StringLiteral kRecordsSymbol = "__cvite_candidate_records";
-constexpr unsigned kCandidateSchema = 1U;
+constexpr llvm::StringLiteral kFunctionRecordsSymbol =
+    "__cvite_candidate_records";
+constexpr llvm::StringLiteral kStorageRecordsSymbol =
+    "__cvite_candidate_storage_records";
+constexpr unsigned kCandidateSchema = 2U;
 
 struct CandidateFunction final {
     llvm::Function *implementation = nullptr;
     llvm::Function *entry = nullptr;
     Hash128 identity;
     Hash128 abi;
+    std::string debug_name;
+};
+
+struct CandidateStorage final {
+    llvm::GlobalVariable *proxy = nullptr;
+    Hash128 identity;
+    Hash128 layout;
+    std::uint64_t size = 0U;
+    std::uint64_t alignment = 0U;
     std::string debug_name;
 };
 
@@ -122,6 +134,74 @@ void setRefreshMetadata(
     function.setMetadata(
         cvite::transform::kFunctionMetadata,
         llvm::MDNode::get(context, metadata));
+}
+
+void setStorageMetadata(
+    llvm::GlobalVariable &global,
+    const CandidateStorage &storage)
+{
+    llvm::LLVMContext &context = global.getContext();
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    llvm::Metadata *metadata[] = {
+        llvm::MDString::get(context, storage.identity.hex),
+        llvm::MDString::get(context, storage.layout.hex),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.identity.high)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.identity.low)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.layout.high)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.layout.low)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.size)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, storage.alignment)),
+    };
+    global.setMetadata(
+        cvite::transform::kStorageMetadata,
+        llvm::MDNode::get(context, metadata));
+}
+
+CandidateStorage transformStorage(
+    llvm::Module &module,
+    llvm::GlobalVariable &storage)
+{
+    const std::string original_name = storage.getName().str();
+    const Hash128 identity = cvite::transform::hash128(
+        cvite::transform::storageIdentitySeed(
+            module, storage, original_name));
+    const Hash128 layout = cvite::transform::hash128(
+        cvite::transform::storageLayoutSeed(module, storage));
+    const std::uint64_t size =
+        cvite::transform::storageSize(module, storage);
+    const std::uint64_t alignment =
+        cvite::transform::storageAlignment(module, storage);
+
+    auto *proxy = new llvm::GlobalVariable(
+        module,
+        storage.getValueType(),
+        false,
+        llvm::GlobalValue::ExternalLinkage,
+        nullptr,
+        cvite::transform::storageSymbolName(identity));
+    proxy->setVisibility(llvm::GlobalValue::DefaultVisibility);
+    proxy->setDSOLocal(false);
+    proxy->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::None);
+    proxy->setAlignment(llvm::Align(alignment));
+
+    CandidateStorage result{
+        proxy,
+        identity,
+        layout,
+        size,
+        alignment,
+        original_name,
+    };
+    setStorageMetadata(*proxy, result);
+    storage.replaceAllUsesWith(proxy);
+    storage.eraseFromParent();
+    return result;
 }
 
 CandidateFunction transformFunction(
@@ -223,23 +303,25 @@ CandidateFunction transformFunction(
 
 llvm::GlobalVariable *createDebugName(
     llvm::Module &module,
-    const CandidateFunction &function)
+    llvm::StringRef prefix,
+    llvm::StringRef name,
+    const Hash128 &identity)
 {
     llvm::Constant *data = llvm::ConstantDataArray::getString(
-        module.getContext(), function.debug_name, true);
+        module.getContext(), name, true);
     auto *global = new llvm::GlobalVariable(
         module,
         data->getType(),
         true,
         llvm::GlobalValue::PrivateLinkage,
         data,
-        "__cvite_candidate_name." + function.identity.hex);
+        prefix.str() + identity.hex);
     global->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
     global->setAlignment(llvm::Align(1U));
     return global;
 }
 
-void createManifest(
+llvm::GlobalVariable *createFunctionRecords(
     llvm::Module &module,
     llvm::ArrayRef<CandidateFunction> functions)
 {
@@ -254,7 +336,11 @@ void createManifest(
     llvm::SmallVector<llvm::Constant *, 32> records;
     records.reserve(functions.size());
     for (const CandidateFunction &function : functions) {
-        llvm::GlobalVariable *debug_name = createDebugName(module, function);
+        llvm::GlobalVariable *debug_name = createDebugName(
+            module,
+            "__cvite_candidate_name.",
+            function.debug_name,
+            function.identity);
         records.push_back(llvm::ConstantStruct::get(
             record_type,
             {
@@ -269,26 +355,88 @@ void createManifest(
 
     llvm::ArrayType *records_type = llvm::ArrayType::get(
         record_type, static_cast<std::uint64_t>(records.size()));
-    llvm::Constant *records_initializer =
-        llvm::ConstantArray::get(records_type, records);
     auto *records_global = new llvm::GlobalVariable(
         module,
         records_type,
         true,
         llvm::GlobalValue::InternalLinkage,
-        records_initializer,
-        kRecordsSymbol);
+        llvm::ConstantArray::get(records_type, records),
+        kFunctionRecordsSymbol);
     records_global->setAlignment(llvm::Align(8U));
+    return records_global;
+}
+
+llvm::GlobalVariable *createStorageRecords(
+    llvm::Module &module,
+    llvm::ArrayRef<CandidateStorage> storages)
+{
+    llvm::LLVMContext &context = module.getContext();
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    llvm::Type *pointer = llvm::PointerType::getUnqual(context);
+    llvm::StructType *record_type = llvm::StructType::get(
+        context,
+        {i64, i64, i64, i64, i64, i64, pointer},
+        false);
+
+    llvm::SmallVector<llvm::Constant *, 32> records;
+    records.reserve(storages.size());
+    for (const CandidateStorage &storage : storages) {
+        llvm::GlobalVariable *debug_name = createDebugName(
+            module,
+            "__cvite_candidate_storage_name.",
+            storage.debug_name,
+            storage.identity);
+        records.push_back(llvm::ConstantStruct::get(
+            record_type,
+            {
+                llvm::ConstantInt::get(i64, storage.identity.high),
+                llvm::ConstantInt::get(i64, storage.identity.low),
+                llvm::ConstantInt::get(i64, storage.layout.high),
+                llvm::ConstantInt::get(i64, storage.layout.low),
+                llvm::ConstantInt::get(i64, storage.size),
+                llvm::ConstantInt::get(i64, storage.alignment),
+                debug_name,
+            }));
+    }
+
+    llvm::ArrayType *records_type = llvm::ArrayType::get(
+        record_type, static_cast<std::uint64_t>(records.size()));
+    auto *records_global = new llvm::GlobalVariable(
+        module,
+        records_type,
+        true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(records_type, records),
+        kStorageRecordsSymbol);
+    records_global->setAlignment(llvm::Align(8U));
+    return records_global;
+}
+
+void createManifest(
+    llvm::Module &module,
+    llvm::ArrayRef<CandidateFunction> functions,
+    llvm::ArrayRef<CandidateStorage> storages)
+{
+    llvm::LLVMContext &context = module.getContext();
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    llvm::Type *pointer = llvm::PointerType::getUnqual(context);
+    llvm::GlobalVariable *function_records =
+        createFunctionRecords(module, functions);
+    llvm::GlobalVariable *storage_records =
+        createStorageRecords(module, storages);
 
     llvm::StructType *manifest_type = llvm::StructType::get(
-        context, {i64, i64, pointer}, false);
+        context, {i64, i64, pointer, i64, pointer}, false);
     llvm::Constant *manifest_initializer = llvm::ConstantStruct::get(
         manifest_type,
         {
             llvm::ConstantInt::get(i64, kCandidateSchema),
             llvm::ConstantInt::get(
                 i64, static_cast<std::uint64_t>(functions.size())),
-            records_global,
+            function_records,
+            llvm::ConstantInt::get(
+                i64, static_cast<std::uint64_t>(storages.size())),
+            storage_records,
         });
     auto *manifest = new llvm::GlobalVariable(
         module,
@@ -322,6 +470,18 @@ public:
             return llvm::PreservedAnalyses::all();
         }
 
+        llvm::SmallVector<llvm::GlobalVariable *, 32> storage_candidates;
+        for (llvm::GlobalVariable &global : module.globals()) {
+            if (cvite::transform::shouldTrackStorageDefinition(global)) {
+                storage_candidates.push_back(&global);
+            }
+        }
+        llvm::SmallVector<CandidateStorage, 32> storages;
+        storages.reserve(storage_candidates.size());
+        for (llvm::GlobalVariable *storage : storage_candidates) {
+            storages.push_back(transformStorage(module, *storage));
+        }
+
         llvm::SmallVector<llvm::Function *, 32> candidates;
         for (llvm::Function &function : module) {
             if (shouldTransform(function)) {
@@ -335,7 +495,7 @@ public:
             transformed.push_back(transformFunction(module, *function));
         }
 
-        createManifest(module, transformed);
+        createManifest(module, transformed, storages);
         module.addModuleFlag(
             llvm::Module::Error,
             kCandidateFlag,

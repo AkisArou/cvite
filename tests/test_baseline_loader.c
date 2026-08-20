@@ -35,8 +35,10 @@ int main(int argc, char **argv)
     CHECK(program_main != NULL);
     CHECK(cvite_host_find_function(
               "cvite_jit_add", &function, &error) == CVITE_STATUS_OK);
+    CHECK(cvite_host_storage_count() == 2U);
     CHECK(cvite_host_generation() == 0U);
     CHECK(program_main(2, program_argv) == 6);
+    CHECK(program_main(2, program_argv) == 8);
     CHECK(cvite_host_generation() == 0U);
 
     cvite_orc_loader_destroy(loader);
