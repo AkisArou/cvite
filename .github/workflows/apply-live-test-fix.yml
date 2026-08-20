@@ -1,0 +1,41 @@
+name: Apply live integration test fix
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply staged fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          script=.cvite/fix-live-test-lifetime.py
+          if [[ ! -f "$script" ]]; then
+            echo "Fix already consumed."
+            exit 0
+          fi
+
+          python3 "$script"
+          rm -- "$script"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- tests/check_run.py tests/fixtures/run_app.c
+          git rm --cached --ignore-unmatch "$script"
+          git diff --cached --check
+          git commit -m "test: allow three live refresh cycles"
+          git push origin HEAD:bootstrap/m0-runtime
