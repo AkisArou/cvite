@@ -23,7 +23,6 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 if(CVITE_BUILD_COMPILER OR CVITE_BUILD_LLVM_PASS OR CVITE_BUILD_ORC_LOADER)
     enable_language(CXX)
-
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
     set(CMAKE_CXX_EXTENSIONS OFF)
@@ -50,19 +49,15 @@ add_library(cvite_runtime STATIC
     src/protocol/protocol.c
 )
 add_library(cvite::runtime ALIAS cvite_runtime)
-
 target_include_directories(cvite_runtime
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-
 target_compile_definitions(cvite_runtime PRIVATE _POSIX_C_SOURCE=200112L)
 cvite_set_warnings(cvite_runtime)
 
-add_library(cvite_host STATIC
-    src/host/host_runtime.c
-)
+add_library(cvite_host STATIC src/host/host_runtime.c)
 add_library(cvite::host ALIAS cvite_host)
 target_include_directories(cvite_host
     PUBLIC
@@ -95,7 +90,6 @@ if(CVITE_BUILD_COMPILER)
             /usr/lib/llvm-19/lib
             /usr/local/lib
     )
-
     if(NOT CVITE_LIBCLANG_INCLUDE_DIR OR NOT CVITE_LIBCLANG_LIBRARY)
         message(FATAL_ERROR
             "CVITE_BUILD_COMPILER requires libclang headers and library. "
@@ -108,7 +102,6 @@ if(CVITE_BUILD_COMPILER)
     target_include_directories(cvite_manifest PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR})
     target_link_libraries(cvite_manifest PRIVATE ${CVITE_LIBCLANG_LIBRARY})
     cvite_set_warnings(cvite_manifest)
-
     install(TARGETS cvite_manifest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
     if(BUILD_TESTING)
@@ -126,6 +119,17 @@ if(CVITE_BUILD_COMPILER)
 endif()
 
 if(CVITE_BUILD_LLVM_PASS)
+    find_program(CVITE_CLANG_EXECUTABLE
+        NAMES clang-18 clang
+        HINTS ${LLVM_TOOLS_BINARY_DIR}
+        REQUIRED
+    )
+    find_program(CVITE_OPT_EXECUTABLE
+        NAMES opt-18 opt
+        HINTS ${LLVM_TOOLS_BINARY_DIR}
+        REQUIRED
+    )
+
     add_llvm_pass_plugin(CViteLoweringPass
         src/transform/lowering_pass.cpp
         src/transform/stable_entry_pass.cpp
@@ -134,19 +138,12 @@ if(CVITE_BUILD_LLVM_PASS)
     )
     target_include_directories(CViteLoweringPass SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
     cvite_set_warnings(CViteLoweringPass)
+    install(TARGETS CViteLoweringPass
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/cvite
+    )
 
     if(BUILD_TESTING)
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
-        find_program(CVITE_CLANG_EXECUTABLE
-            NAMES clang-18 clang
-            HINTS ${LLVM_TOOLS_BINARY_DIR}
-            REQUIRED
-        )
-        find_program(CVITE_OPT_EXECUTABLE
-            NAMES opt-18 opt
-            HINTS ${LLVM_TOOLS_BINARY_DIR}
-            REQUIRED
-        )
         add_test(
             NAME lowering-pass
             COMMAND
@@ -192,24 +189,19 @@ if(CVITE_BUILD_ORC_LOADER)
         nativecodegen
     )
 
-    add_library(cvite_orc_loader STATIC
-        src/host/orc_loader.cpp
-    )
+    add_library(cvite_orc_loader STATIC src/host/orc_loader.cpp)
     add_library(cvite::orc_loader ALIAS cvite_orc_loader)
     target_include_directories(cvite_orc_loader
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     )
-    target_include_directories(cvite_orc_loader SYSTEM PRIVATE
-        ${LLVM_INCLUDE_DIRS}
-    )
+    target_include_directories(cvite_orc_loader SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
     target_link_libraries(cvite_orc_loader
         PUBLIC cvite::host
         PRIVATE ${CVITE_ORC_LLVM_LIBS}
     )
     cvite_set_warnings(cvite_orc_loader)
-
     install(TARGETS cvite_orc_loader
         EXPORT CViteTargets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -217,19 +209,21 @@ if(CVITE_BUILD_ORC_LOADER)
     )
 
     if(BUILD_TESTING)
-        find_program(CVITE_ORC_CLANG_EXECUTABLE
-            NAMES clang-18 clang
-            HINTS ${LLVM_TOOLS_BINARY_DIR}
-            REQUIRED
-        )
+        if(CVITE_BUILD_LLVM_PASS)
+            set(CVITE_ORC_CLANG_EXECUTABLE ${CVITE_CLANG_EXECUTABLE})
+        else()
+            find_program(CVITE_ORC_CLANG_EXECUTABLE
+                NAMES clang-18 clang
+                HINTS ${LLVM_TOOLS_BINARY_DIR}
+                REQUIRED
+            )
+        endif()
 
         set(CVITE_ORC_TEST_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/orc-test")
         set(CVITE_ORC_VALID_OBJECT "${CVITE_ORC_TEST_DIRECTORY}/candidate.o")
         set(CVITE_ORC_BROKEN_OBJECT "${CVITE_ORC_TEST_DIRECTORY}/broken.o")
         add_custom_command(
-            OUTPUT
-                ${CVITE_ORC_VALID_OBJECT}
-                ${CVITE_ORC_BROKEN_OBJECT}
+            OUTPUT ${CVITE_ORC_VALID_OBJECT} ${CVITE_ORC_BROKEN_OBJECT}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${CVITE_ORC_TEST_DIRECTORY}
             COMMAND
                 ${CVITE_ORC_CLANG_EXECUTABLE}
@@ -249,7 +243,6 @@ if(CVITE_BUILD_ORC_LOADER)
         add_custom_target(cvite_orc_test_objects
             DEPENDS ${CVITE_ORC_VALID_OBJECT} ${CVITE_ORC_BROKEN_OBJECT}
         )
-
         add_executable(cvite_test_orc_loader tests/test_orc_loader.c)
         target_link_libraries(cvite_test_orc_loader PRIVATE cvite::orc_loader)
         cvite_set_warnings(cvite_test_orc_loader)
@@ -262,6 +255,31 @@ if(CVITE_BUILD_ORC_LOADER)
                 ${CVITE_ORC_BROKEN_OBJECT}
         )
     endif()
+endif()
+
+if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "The M1 cvite run loop currently requires Linux/inotify")
+    endif()
+
+    find_package(Threads REQUIRED)
+    target_sources(cvite PRIVATE
+        src/cli/run.c
+        src/cli/toolchain.c
+        src/cli/watcher.c
+    )
+    target_link_libraries(cvite PRIVATE cvite::orc_loader Threads::Threads)
+    target_compile_definitions(cvite PRIVATE
+        CVITE_RUNNER_ENABLED=1
+        _POSIX_C_SOURCE=200809L
+        _XOPEN_SOURCE=700
+        "CVITE_CLANG_PATH=\"${CVITE_CLANG_EXECUTABLE}\""
+        "CVITE_OPT_PATH=\"${CVITE_OPT_EXECUTABLE}\""
+        "CVITE_PASS_PLUGIN_BUILD_PATH=\"$<TARGET_FILE:CViteLoweringPass>\""
+        "CVITE_PASS_PLUGIN_INSTALL_PATH=\"${CMAKE_INSTALL_FULL_LIBDIR}/cvite/$<TARGET_FILE_NAME:CViteLoweringPass>\""
+    )
+    set_property(TARGET cvite PROPERTY LINKER_LANGUAGE CXX)
+    add_dependencies(cvite CViteLoweringPass)
 endif()
 
 if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
@@ -281,9 +299,7 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
         "${CVITE_STABLE_TEST_DIRECTORY}/candidate.o")
 
     add_custom_command(
-        OUTPUT
-            ${CVITE_STABLE_BASELINE_OBJECT}
-            ${CVITE_STABLE_CANDIDATE_OBJECT}
+        OUTPUT ${CVITE_STABLE_BASELINE_OBJECT} ${CVITE_STABLE_CANDIDATE_OBJECT}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CVITE_STABLE_TEST_DIRECTORY}
         COMMAND
             ${CVITE_CLANG_EXECUTABLE}
@@ -301,7 +317,7 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
             -O0 -fPIC -c ${CVITE_STABLE_BASELINE_IR}
             -o ${CVITE_STABLE_BASELINE_OBJECT}
         COMMAND
-            ${CVITE_ORC_CLANG_EXECUTABLE}
+            ${CVITE_CLANG_EXECUTABLE}
             -std=c11 -O0 -S -emit-llvm
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/stable_e2e_candidate.c
             -o ${CVITE_STABLE_CANDIDATE_RAW_IR}
@@ -312,7 +328,7 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
             -S ${CVITE_STABLE_CANDIDATE_RAW_IR}
             -o ${CVITE_STABLE_CANDIDATE_IR}
         COMMAND
-            ${CVITE_ORC_CLANG_EXECUTABLE}
+            ${CVITE_CLANG_EXECUTABLE}
             -O0 -fPIC -c ${CVITE_STABLE_CANDIDATE_IR}
             -o ${CVITE_STABLE_CANDIDATE_OBJECT}
         DEPENDS
@@ -322,15 +338,10 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
         VERBATIM
     )
     add_custom_target(cvite_stable_entry_test_objects
-        DEPENDS
-            ${CVITE_STABLE_BASELINE_OBJECT}
-            ${CVITE_STABLE_CANDIDATE_OBJECT}
+        DEPENDS ${CVITE_STABLE_BASELINE_OBJECT} ${CVITE_STABLE_CANDIDATE_OBJECT}
     )
-
     set_source_files_properties(${CVITE_STABLE_BASELINE_OBJECT}
-        PROPERTIES
-            GENERATED TRUE
-            EXTERNAL_OBJECT TRUE
+        PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE
     )
     add_executable(cvite_test_stable_entry
         tests/test_stable_entry.c
@@ -392,6 +403,16 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
         NAME baseline-loader
         COMMAND cvite_test_baseline_loader ${CVITE_BASELINE_LOADER_OBJECT}
     )
+
+    add_test(
+        NAME run-fast-refresh
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_run.py
+            $<TARGET_FILE:cvite>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/run_app.c
+    )
+    set_tests_properties(run-fast-refresh PROPERTIES TIMEOUT 45)
 endif()
 
 if(CVITE_BUILD_EXAMPLES)
@@ -431,5 +452,4 @@ install(TARGETS cvite cvite_runtime cvite_host
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
-
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

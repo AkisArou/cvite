@@ -1,5 +1,9 @@
 #include "cvite/version.h"
 
+#if defined(CVITE_RUNNER_ENABLED)
+#include "run.h"
+#endif
+
 #include <stdio.h>
 #include <string.h>
 
@@ -10,8 +14,8 @@ static void print_usage(FILE *stream)
         "Usage: cvite <command>\n"
         "\n"
         "Commands:\n"
-        "  doctor       print bootstrap capability information\n"
-        "  run <path>   start a project (compiler service not yet wired)\n"
+        "  doctor       print development-toolchain capabilities\n"
+        "  run <path>   run and watch a C source or simple project\n"
         "  version      print the CVite version\n");
 }
 
@@ -37,7 +41,11 @@ static int run_doctor(void)
 #endif
 
     (void)printf("runtime core: available\n");
-    (void)printf("compiler service: not linked in M0\n");
+#if defined(CVITE_RUNNER_ENABLED)
+    cvite_run_print_doctor(stdout);
+#else
+    (void)printf("compiler service: not linked in this build\n");
+#endif
     return 0;
 }
 
@@ -58,17 +66,20 @@ int main(int argc, char **argv)
     }
 
     if (strcmp(argv[1], "run") == 0) {
-        if (argc != 3) {
+#if defined(CVITE_RUNNER_ENABLED)
+        return cvite_run_command(argc - 2, argv + 2);
+#else
+        if (argc < 3) {
             print_usage(stderr);
             return 2;
         }
-
         (void)fprintf(
             stderr,
-            "cvite: 'run' is not available in the M0 bootstrap build yet\n"
+            "cvite: 'run' requires a build with the LLVM pass and ORC loader\n"
             "project: %s\n",
             argv[2]);
         return 3;
+#endif
     }
 
     print_usage(stderr);
