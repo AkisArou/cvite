@@ -128,6 +128,7 @@ endif()
 if(CVITE_BUILD_LLVM_PASS)
     add_llvm_pass_plugin(CViteLoweringPass
         src/transform/lowering_pass.cpp
+        src/transform/stable_entry_pass.cpp
     )
     target_include_directories(CViteLoweringPass SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
     cvite_set_warnings(CViteLoweringPass)
@@ -153,6 +154,17 @@ if(CVITE_BUILD_LLVM_PASS)
                 ${CVITE_OPT_EXECUTABLE}
                 $<TARGET_FILE:CViteLoweringPass>
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/lowering_input.c
+                ${CMAKE_CURRENT_BINARY_DIR}
+        )
+        add_test(
+            NAME stable-entry-pass
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_stable_entry.py
+                ${CVITE_CLANG_EXECUTABLE}
+                ${CVITE_OPT_EXECUTABLE}
+                $<TARGET_FILE:CViteLoweringPass>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/stable_entry_input.c
                 ${CMAKE_CURRENT_BINARY_DIR}
         )
     endif()
@@ -237,6 +249,76 @@ if(CVITE_BUILD_ORC_LOADER)
                 ${CVITE_ORC_BROKEN_OBJECT}
         )
     endif()
+endif()
+
+if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
+    set(CVITE_STABLE_TEST_DIRECTORY
+        "${CMAKE_CURRENT_BINARY_DIR}/stable-entry-test")
+    set(CVITE_STABLE_BASELINE_RAW_IR
+        "${CVITE_STABLE_TEST_DIRECTORY}/baseline.raw.ll")
+    set(CVITE_STABLE_BASELINE_IR
+        "${CVITE_STABLE_TEST_DIRECTORY}/baseline.ll")
+    set(CVITE_STABLE_BASELINE_OBJECT
+        "${CVITE_STABLE_TEST_DIRECTORY}/baseline.o")
+    set(CVITE_STABLE_CANDIDATE_OBJECT
+        "${CVITE_STABLE_TEST_DIRECTORY}/candidate.o")
+
+    add_custom_command(
+        OUTPUT
+            ${CVITE_STABLE_BASELINE_OBJECT}
+            ${CVITE_STABLE_CANDIDATE_OBJECT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CVITE_STABLE_TEST_DIRECTORY}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -std=c11 -O0 -S -emit-llvm
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/stable_e2e_baseline.c
+            -o ${CVITE_STABLE_BASELINE_RAW_IR}
+        COMMAND
+            ${CVITE_OPT_EXECUTABLE}
+            -load-pass-plugin=$<TARGET_FILE:CViteLoweringPass>
+            -passes=cvite-lowering,cvite-baseline,verify
+            -S ${CVITE_STABLE_BASELINE_RAW_IR}
+            -o ${CVITE_STABLE_BASELINE_IR}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -O0 -fPIC -c ${CVITE_STABLE_BASELINE_IR}
+            -o ${CVITE_STABLE_BASELINE_OBJECT}
+        COMMAND
+            ${CVITE_ORC_CLANG_EXECUTABLE}
+            -std=c11 -O0 -fPIC -c
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/stable_e2e_candidate.c
+            -o ${CVITE_STABLE_CANDIDATE_OBJECT}
+        DEPENDS
+            CViteLoweringPass
+            tests/fixtures/stable_e2e_baseline.c
+            tests/fixtures/stable_e2e_candidate.c
+        VERBATIM
+    )
+    add_custom_target(cvite_stable_entry_test_objects
+        DEPENDS
+            ${CVITE_STABLE_BASELINE_OBJECT}
+            ${CVITE_STABLE_CANDIDATE_OBJECT}
+    )
+
+    set_source_files_properties(${CVITE_STABLE_BASELINE_OBJECT}
+        PROPERTIES
+            GENERATED TRUE
+            EXTERNAL_OBJECT TRUE
+    )
+    add_executable(cvite_test_stable_entry
+        tests/test_stable_entry.c
+        ${CVITE_STABLE_BASELINE_OBJECT}
+    )
+    target_link_libraries(cvite_test_stable_entry PRIVATE
+        cvite::host
+        cvite::orc_loader
+    )
+    cvite_set_warnings(cvite_test_stable_entry)
+    add_dependencies(cvite_test_stable_entry cvite_stable_entry_test_objects)
+    add_test(
+        NAME stable-entry-e2e
+        COMMAND cvite_test_stable_entry ${CVITE_STABLE_CANDIDATE_OBJECT}
+    )
 endif()
 
 if(CVITE_BUILD_EXAMPLES)

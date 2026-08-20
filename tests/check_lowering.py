@@ -9,7 +9,8 @@ import tempfile
 
 
 FINGERPRINT_PATTERN = re.compile(
-    r'!\{!"(?P<name>[^"]+)", !"(?P<fingerprint>[0-9a-f]{32})", i32 [0-9]+\}'
+    r'!\{!"(?P<name>[^"]+)", !"(?P<fingerprint>[0-9a-f]{32})", '
+    r'i32 -?[0-9]+, i64 -?[0-9]+, i64 -?[0-9]+\}'
 )
 
 

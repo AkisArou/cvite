@@ -1,4 +1,6 @@
-#include "llvm/ADT/SmallString.h"
+#include "stable_entry_pass.h"
+#include "transform_support.h"
+
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
@@ -8,8 +10,6 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-#include "llvm/Support/MD5.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Config/llvm-config.h"
 
 #include <cstdint>
@@ -18,67 +18,6 @@
 namespace {
 
 constexpr llvm::StringLiteral kPassName = "cvite-lowering";
-constexpr llvm::StringLiteral kAbiSchema = "cvite.lowered-abi.v1";
-constexpr llvm::StringLiteral kFunctionMetadata = "cvite.abi";
-constexpr llvm::StringLiteral kFunctionIndex = "cvite.functions";
-
-std::string printType(const llvm::Type &type)
-{
-    std::string text;
-    llvm::raw_string_ostream output(text);
-    type.print(output);
-    return output.str();
-}
-
-void appendAttributeSet(
-    llvm::raw_ostream &output,
-    llvm::StringRef label,
-    llvm::AttributeSet attributes)
-{
-    output << label << '=';
-    output << attributes.getAsString();
-    output << '\n';
-}
-
-std::string abiSeed(const llvm::Module &module, const llvm::Function &function)
-{
-    std::string seed;
-    llvm::raw_string_ostream output(seed);
-    const llvm::AttributeList attributes = function.getAttributes();
-
-    output << kAbiSchema << '\n';
-    output << "target=" << module.getTargetTriple() << '\n';
-    output << "data-layout=" << module.getDataLayoutStr() << '\n';
-    output << "function-type=" << printType(*function.getFunctionType()) << '\n';
-    output << "calling-convention=" << function.getCallingConv() << '\n';
-    appendAttributeSet(output, "return-attributes", attributes.getRetAttrs());
-    for (unsigned index = 0U; index < function.arg_size(); ++index) {
-        output << "parameter=" << index << '\n';
-        appendAttributeSet(
-            output,
-            "parameter-attributes",
-            attributes.getParamAttrs(index));
-    }
-    return output.str();
-}
-
-std::string md5(llvm::StringRef input)
-{
-    llvm::MD5 hash;
-    llvm::MD5::MD5Result result;
-    llvm::SmallString<32> output;
-
-    hash.update(input);
-    hash.final(result);
-    llvm::MD5::stringifyResult(result, output);
-    return output.str().str();
-}
-
-bool shouldIndex(const llvm::Function &function)
-{
-    return !function.isDeclaration() && !function.isIntrinsic() &&
-        !function.getName().starts_with("__cvite_");
-}
 
 class CViteLoweringPass final
     : public llvm::PassInfoMixin<CViteLoweringPass> {
@@ -88,34 +27,45 @@ public:
         llvm::ModuleAnalysisManager &)
     {
         llvm::LLVMContext &context = module.getContext();
-        llvm::NamedMDNode *index = module.getNamedMetadata(kFunctionIndex);
+        llvm::NamedMDNode *index =
+            module.getNamedMetadata(cvite::transform::kFunctionIndex);
         if (index != nullptr) {
             index->eraseFromParent();
         }
-        index = module.getOrInsertNamedMetadata(kFunctionIndex);
+        index = module.getOrInsertNamedMetadata(
+            cvite::transform::kFunctionIndex);
 
         bool changed = false;
         for (llvm::Function &function : module) {
-            if (!shouldIndex(function)) {
+            if (!cvite::transform::shouldIndex(function)) {
                 continue;
             }
 
-            const std::string seed = abiSeed(module, function);
-            const std::string fingerprint = md5(seed);
+            const cvite::transform::Hash128 fingerprint =
+                cvite::transform::hash128(
+                    cvite::transform::abiSeed(module, function));
             llvm::Metadata *function_metadata[] = {
-                llvm::MDString::get(context, fingerprint),
-                llvm::MDString::get(context, kAbiSchema),
+                llvm::MDString::get(context, fingerprint.hex),
+                llvm::MDString::get(context, cvite::transform::kAbiSchema),
+                llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(context), fingerprint.high)),
+                llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(context), fingerprint.low)),
             };
             function.setMetadata(
-                kFunctionMetadata,
+                cvite::transform::kFunctionMetadata,
                 llvm::MDNode::get(context, function_metadata));
 
             llvm::Metadata *index_metadata[] = {
                 llvm::MDString::get(context, function.getName()),
-                llvm::MDString::get(context, fingerprint),
+                llvm::MDString::get(context, fingerprint.hex),
                 llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
                     llvm::Type::getInt32Ty(context),
                     static_cast<std::uint64_t>(function.getCallingConv()))),
+                llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(context), fingerprint.high)),
+                llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                    llvm::Type::getInt64Ty(context), fingerprint.low)),
             };
             index->addOperand(llvm::MDNode::get(context, index_metadata));
 
@@ -160,6 +110,8 @@ void registerCallbacks(llvm::PassBuilder &builder)
         [](llvm::ModulePassManager &manager, llvm::OptimizationLevel) {
             manager.addPass(CViteLoweringPass());
         });
+
+    cviteRegisterStableEntryPass(builder);
 }
 
 } // namespace
