@@ -11,8 +11,8 @@ extern "C" {
 
 /*
  * Internal host API. Ordinary C application source is not expected to include
- * this header. Candidate generations are isolated until their looked-up
- * function pointers are published through cvite_runtime_apply_patch().
+ * this header. Candidate generations are isolated until their function
+ * pointers are published through cvite_runtime_apply_patch().
  */
 
 typedef struct cvite_orc_loader cvite_orc_loader;
@@ -43,6 +43,20 @@ cvite_status cvite_orc_loader_lookup_function(
     cvite_orc_generation generation,
     const char *symbol_name,
     cvite_function_pointer *address,
+    cvite_error *error);
+
+/*
+ * Resolve and validate the compiler-generated candidate manifest, then expose
+ * a generation-owned patch view. patch->functions remains valid until the
+ * generation is discarded, the same generation is prepared again, or the
+ * loader is destroyed.
+ */
+cvite_status cvite_orc_loader_prepare_patch(
+    cvite_orc_loader *loader,
+    cvite_orc_generation generation,
+    uint64_t expected_generation,
+    uint64_t candidate_generation,
+    cvite_patch *patch,
     cvite_error *error);
 
 cvite_status cvite_orc_loader_discard_generation(

@@ -237,6 +237,62 @@ cvite_function_pointer __cvite_host_target_at(uint64_t encoded_slot)
     return target;
 }
 
+cvite_function_pointer __cvite_host_target_for(
+    uint64_t id_high,
+    uint64_t id_low,
+    uint64_t abi_high,
+    uint64_t abi_low)
+{
+    const cvite_id id = CVITE_ID(id_high, id_low);
+    const cvite_id abi = CVITE_ID(abi_high, abi_low);
+    cvite_host_function function;
+    cvite_error error;
+    size_t index = 0U;
+    size_t match = SIZE_MAX;
+    size_t match_count = 0U;
+
+    if (cvite_host_seal(&error) != CVITE_STATUS_OK) {
+        cvite_host_fatal("runtime sealing", &error);
+    }
+
+    cvite_host_lock();
+    for (index = 0U; index < cvite_host_record_count; ++index) {
+        if (cvite_id_equal(cvite_host_records[index].function.id, id)) {
+            match = index;
+            match_count += 1U;
+        }
+    }
+
+    if (match_count == 0U) {
+        cvite_host_unlock();
+        cvite_host_fail(
+            &error,
+            CVITE_STATUS_UNKNOWN_SYMBOL,
+            "candidate references an unknown stable function ID");
+        cvite_host_fatal("candidate dispatch", &error);
+    }
+    if (match_count > 1U) {
+        cvite_host_unlock();
+        cvite_host_fail(
+            &error,
+            CVITE_STATUS_DUPLICATE_SYMBOL,
+            "candidate function ID is ambiguous");
+        cvite_host_fatal("candidate dispatch", &error);
+    }
+
+    function = cvite_host_records[match].function;
+    cvite_host_unlock();
+    if (!cvite_id_equal(function.abi_fingerprint, abi)) {
+        cvite_host_fail(
+            &error,
+            CVITE_STATUS_ABI_MISMATCH,
+            "candidate call crosses an incompatible function ABI");
+        cvite_host_fatal("candidate dispatch", &error);
+    }
+
+    return __cvite_host_target_at((uint64_t)function.slot);
+}
+
 cvite_status cvite_host_find_function(
     const char *debug_name,
     cvite_host_function *function,

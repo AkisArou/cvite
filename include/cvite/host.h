@@ -33,6 +33,12 @@ uint64_t __cvite_host_register_function(
 
 cvite_function_pointer __cvite_host_target_at(uint64_t slot);
 
+cvite_function_pointer __cvite_host_target_for(
+    uint64_t id_high,
+    uint64_t id_low,
+    uint64_t abi_high,
+    uint64_t abi_low);
+
 cvite_status cvite_host_find_function(
     const char *debug_name,
     cvite_host_function *function,

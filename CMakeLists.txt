@@ -204,7 +204,7 @@ if(CVITE_BUILD_ORC_LOADER)
         ${LLVM_INCLUDE_DIRS}
     )
     target_link_libraries(cvite_orc_loader
-        PUBLIC cvite::runtime
+        PUBLIC cvite::host
         PRIVATE ${CVITE_ORC_LLVM_LIBS}
     )
     cvite_set_warnings(cvite_orc_loader)
@@ -272,6 +272,10 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
         "${CVITE_STABLE_TEST_DIRECTORY}/baseline.ll")
     set(CVITE_STABLE_BASELINE_OBJECT
         "${CVITE_STABLE_TEST_DIRECTORY}/baseline.o")
+    set(CVITE_STABLE_CANDIDATE_RAW_IR
+        "${CVITE_STABLE_TEST_DIRECTORY}/candidate.raw.ll")
+    set(CVITE_STABLE_CANDIDATE_IR
+        "${CVITE_STABLE_TEST_DIRECTORY}/candidate.ll")
     set(CVITE_STABLE_CANDIDATE_OBJECT
         "${CVITE_STABLE_TEST_DIRECTORY}/candidate.o")
 
@@ -297,8 +301,18 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
             -o ${CVITE_STABLE_BASELINE_OBJECT}
         COMMAND
             ${CVITE_ORC_CLANG_EXECUTABLE}
-            -std=c11 -O0 -fPIC -c
+            -std=c11 -O0 -S -emit-llvm
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/stable_e2e_candidate.c
+            -o ${CVITE_STABLE_CANDIDATE_RAW_IR}
+        COMMAND
+            ${CVITE_OPT_EXECUTABLE}
+            -load-pass-plugin=$<TARGET_FILE:CViteLoweringPass>
+            -passes=cvite-lowering,cvite-candidate,verify
+            -S ${CVITE_STABLE_CANDIDATE_RAW_IR}
+            -o ${CVITE_STABLE_CANDIDATE_IR}
+        COMMAND
+            ${CVITE_ORC_CLANG_EXECUTABLE}
+            -O0 -fPIC -c ${CVITE_STABLE_CANDIDATE_IR}
             -o ${CVITE_STABLE_CANDIDATE_OBJECT}
         DEPENDS
             CViteLoweringPass

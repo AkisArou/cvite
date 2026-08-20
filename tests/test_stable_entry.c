@@ -35,9 +35,7 @@ int main(int argc, char **argv)
 {
     cvite_orc_loader *loader = NULL;
     cvite_orc_generation generation = CVITE_ORC_GENERATION_INVALID;
-    cvite_function_pointer candidate = NULL;
     cvite_host_function function;
-    cvite_function_update update;
     cvite_patch patch;
     cvite_error error;
     counter_state state = {5, 0};
@@ -58,20 +56,18 @@ int main(int argc, char **argv)
               &error) == CVITE_STATUS_OK);
     CHECK(cvite_orc_loader_stage_object(
               loader, argv[1], &generation, &error) == CVITE_STATUS_OK);
-    CHECK(cvite_orc_loader_lookup_function(
+    CHECK(cvite_orc_loader_prepare_patch(
               loader,
               generation,
-              "__cvite_e2e_candidate_update",
-              &candidate,
+              0U,
+              1U,
+              &patch,
               &error) == CVITE_STATUS_OK);
-
-    update.id = function.id;
-    update.abi_fingerprint = function.abi_fingerprint;
-    update.target = candidate;
-    patch.expected_generation = 0U;
-    patch.candidate_generation = 1U;
-    patch.functions = &update;
-    patch.function_count = 1U;
+    CHECK(patch.function_count == 1U);
+    CHECK(cvite_id_equal(patch.functions[0].id, function.id));
+    CHECK(cvite_id_equal(
+        patch.functions[0].abi_fingerprint, function.abi_fingerprint));
+    CHECK(patch.functions[0].target != NULL);
     CHECK(cvite_host_apply_patch(&patch, &error) == CVITE_STATUS_OK);
 
     CHECK(cvite_e2e_update == stable_address);

@@ -1,5 +1,8 @@
 #include "cvite/orc_loader.h"
 
+#include "cvite/candidate.h"
+#include "cvite/host.h"
+
 #include "llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -9,6 +12,8 @@
 #include "llvm/Support/TargetSelect.h"
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -20,6 +25,9 @@
 
 namespace {
 
+constexpr const char *kTargetForSymbol = "__cvite_host_target_for";
+constexpr std::uint64_t kMaxCandidateFunctions = UINT64_C(1048576);
+
 struct HostFunction final {
     std::string name;
     cvite_function_pointer address = nullptr;
@@ -28,6 +36,7 @@ struct HostFunction final {
 struct Generation final {
     llvm::orc::JITDylib *dylib = nullptr;
     llvm::orc::ResourceTrackerSP resources;
+    std::vector<cvite_function_update> updates;
 };
 
 struct NativeTargetState final {
@@ -100,6 +109,18 @@ llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> createJITLinkLayer(
             std::move(*memory_manager)));
 }
 
+bool hasDuplicateUpdate(
+    const std::vector<cvite_function_update> &updates,
+    cvite_id id)
+{
+    for (const cvite_function_update &update : updates) {
+        if (cvite_id_equal(update.id, id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 struct cvite_orc_loader {
@@ -143,6 +164,10 @@ extern "C" cvite_status cvite_orc_loader_create(
     }
 
     created->jit = std::move(*jit);
+    created->host_functions.push_back(HostFunction{
+        kTargetForSymbol,
+        reinterpret_cast<cvite_function_pointer>(&__cvite_host_target_for),
+    });
     *loader = created.release();
     return CVITE_STATUS_OK;
 }
@@ -261,7 +286,7 @@ extern "C" cvite_status cvite_orc_loader_stage_object(
     }
 
     loader->generations.emplace(
-        handle, Generation{&candidate_dylib, std::move(resources)});
+        handle, Generation{&candidate_dylib, std::move(resources), {}});
     *generation = handle;
     return CVITE_STATUS_OK;
 }
@@ -296,6 +321,108 @@ extern "C" cvite_status cvite_orc_loader_lookup_function(
     }
 
     *address = symbol->toPtr<void()>();
+    return CVITE_STATUS_OK;
+}
+
+extern "C" cvite_status cvite_orc_loader_prepare_patch(
+    cvite_orc_loader *loader,
+    cvite_orc_generation generation,
+    uint64_t expected_generation,
+    uint64_t candidate_generation,
+    cvite_patch *patch,
+    cvite_error *error)
+{
+    cvite_error_clear(error);
+    if (loader == nullptr || generation == CVITE_ORC_GENERATION_INVALID ||
+        patch == nullptr) {
+        return fail(error, CVITE_STATUS_INVALID_ARGUMENT, "invalid patch preparation");
+    }
+    *patch = cvite_patch{};
+
+    std::lock_guard<std::mutex> guard(loader->mutex);
+    const auto found = loader->generations.find(generation);
+    if (found == loader->generations.end()) {
+        return fail(error, CVITE_STATUS_INVALID_ARGUMENT, "unknown candidate generation");
+    }
+
+    auto symbol = loader->jit->lookup(
+        *found->second.dylib, CVITE_CANDIDATE_MANIFEST_SYMBOL);
+    if (!symbol) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_PACKET,
+            symbol.takeError(),
+            "candidate object has no readable CVite manifest");
+    }
+
+    const cvite_candidate_manifest *manifest =
+        symbol->toPtr<const cvite_candidate_manifest *>();
+    if (manifest == nullptr ||
+        manifest->schema != CVITE_CANDIDATE_MANIFEST_SCHEMA) {
+        return fail(
+            error,
+            CVITE_STATUS_UNSUPPORTED_PROTOCOL,
+            "candidate manifest schema is unsupported");
+    }
+    if (manifest->function_count == 0U) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_PACKET,
+            "candidate manifest contains no refreshable functions");
+    }
+    if (manifest->function_count > kMaxCandidateFunctions ||
+        manifest->function_count > (std::uint64_t)SIZE_MAX) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_PACKET,
+            "candidate manifest function count is unreasonable");
+    }
+    if (manifest->functions == nullptr) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_PACKET,
+            "candidate manifest has no function records");
+    }
+
+    Generation &candidate = found->second;
+    candidate.updates.clear();
+    candidate.updates.reserve(
+        static_cast<std::size_t>(manifest->function_count));
+    for (std::uint64_t index = 0U;
+         index < manifest->function_count;
+         ++index) {
+        const cvite_candidate_function &record = manifest->functions[index];
+        const cvite_id id = CVITE_ID(record.id_high, record.id_low);
+        const cvite_id abi = CVITE_ID(record.abi_high, record.abi_low);
+
+        if (cvite_id_is_zero(id) || cvite_id_is_zero(abi) ||
+            record.target == nullptr || record.debug_name == nullptr ||
+            record.debug_name[0] == '\0') {
+            candidate.updates.clear();
+            return fail(
+                error,
+                CVITE_STATUS_INVALID_PACKET,
+                "candidate manifest contains an invalid function record");
+        }
+        if (hasDuplicateUpdate(candidate.updates, id)) {
+            candidate.updates.clear();
+            return fail(
+                error,
+                CVITE_STATUS_DUPLICATE_SYMBOL,
+                "candidate manifest contains a duplicate function ID");
+        }
+
+        candidate.updates.push_back(cvite_function_update{
+            id,
+            abi,
+            record.target,
+        });
+    }
+
+    patch->expected_generation = expected_generation;
+    patch->candidate_generation = candidate_generation;
+    patch->functions = candidate.updates.data();
+    patch->function_count = candidate.updates.size();
     return CVITE_STATUS_OK;
 }
 
