@@ -1,66 +1,14 @@
-name: Apply multi-translation-unit implementation
+name: Stage incremental multi-translation-unit refresh
 
 on:
-  push:
-    branches:
-      - bootstrap/m0-runtime
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  apply:
-    if: >-
-      github.actor != 'github-actions[bot]' &&
-      (github.event_name != 'pull_request' ||
-       (github.event.pull_request.head.repo.full_name == github.repository &&
-        github.event.pull_request.head.ref == 'bootstrap/m0-runtime'))
+  waiting:
+    if: false
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: bootstrap/m0-runtime
-          fetch-depth: 0
-
-      - name: Apply verified patch and remove applicator
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive=.cvite/multitu-patch.tar.gz
-          workflow=.github/workflows/apply-multitu.yml
-          if [[ ! -f "$archive" ]]; then
-            echo "Patch already consumed."
-            exit 0
-          fi
-
-          echo "d8673f3d2cd6770c922eb00d480007a6d0a4a0389e0e87747e1b5219dbb638c7  $archive" | sha256sum --check
-          tar -xzf "$archive" -C .
-          rm -- "$archive"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- \
-            CMakeLists.txt \
-            docs/dev-server.md \
-            src/cli/compile_database.c \
-            src/cli/run.c \
-            src/cli/run_internal.h \
-            src/cli/toolchain.c \
-            src/cli/watcher.c \
-            src/cli/watch_dependencies.inc \
-            src/transform/lowering_pass.cpp \
-            src/transform/transform_support.h \
-            tests/check_run.py \
-            tests/fixtures/run_app.c \
-            tests/fixtures/run_worker.c \
-            tests/fixtures/run_step.h \
-            tests/fixtures/run_step_next.h \
-            "$archive"
-          git rm -- "$workflow"
-          git diff --cached --check
-          git commit -m "feat: add atomic multi-translation-unit refresh"
-          git push origin HEAD:bootstrap/m0-runtime
+      - run: echo "Patch parts are being staged."
