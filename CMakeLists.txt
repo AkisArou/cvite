@@ -129,6 +129,7 @@ if(CVITE_BUILD_LLVM_PASS)
     add_llvm_pass_plugin(CViteLoweringPass
         src/transform/lowering_pass.cpp
         src/transform/stable_entry_pass.cpp
+        src/transform/baseline_manifest_pass.cpp
         src/transform/candidate_pass.cpp
     )
     target_include_directories(CViteLoweringPass SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
@@ -292,7 +293,7 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
         COMMAND
             ${CVITE_OPT_EXECUTABLE}
             -load-pass-plugin=$<TARGET_FILE:CViteLoweringPass>
-            -passes=cvite-lowering,cvite-baseline,verify
+            -passes=cvite-lowering,cvite-baseline,cvite-baseline-manifest,verify
             -S ${CVITE_STABLE_BASELINE_RAW_IR}
             -o ${CVITE_STABLE_BASELINE_IR}
         COMMAND
@@ -344,6 +345,52 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
     add_test(
         NAME stable-entry-e2e
         COMMAND cvite_test_stable_entry ${CVITE_STABLE_CANDIDATE_OBJECT}
+    )
+
+    set(CVITE_BASELINE_LOADER_DIRECTORY
+        "${CMAKE_CURRENT_BINARY_DIR}/baseline-loader-test")
+    set(CVITE_BASELINE_LOADER_RAW_IR
+        "${CVITE_BASELINE_LOADER_DIRECTORY}/baseline.raw.ll")
+    set(CVITE_BASELINE_LOADER_IR
+        "${CVITE_BASELINE_LOADER_DIRECTORY}/baseline.ll")
+    set(CVITE_BASELINE_LOADER_OBJECT
+        "${CVITE_BASELINE_LOADER_DIRECTORY}/baseline.o")
+    add_custom_command(
+        OUTPUT ${CVITE_BASELINE_LOADER_OBJECT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CVITE_BASELINE_LOADER_DIRECTORY}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -std=c11 -O0 -S -emit-llvm
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/jit_baseline.c
+            -o ${CVITE_BASELINE_LOADER_RAW_IR}
+        COMMAND
+            ${CVITE_OPT_EXECUTABLE}
+            -load-pass-plugin=$<TARGET_FILE:CViteLoweringPass>
+            -passes=cvite-lowering,cvite-baseline,cvite-baseline-manifest,verify
+            -S ${CVITE_BASELINE_LOADER_RAW_IR}
+            -o ${CVITE_BASELINE_LOADER_IR}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -O0 -fPIC -c ${CVITE_BASELINE_LOADER_IR}
+            -o ${CVITE_BASELINE_LOADER_OBJECT}
+        DEPENDS
+            CViteLoweringPass
+            tests/fixtures/jit_baseline.c
+        VERBATIM
+    )
+    add_custom_target(cvite_baseline_loader_test_object
+        DEPENDS ${CVITE_BASELINE_LOADER_OBJECT}
+    )
+    add_executable(cvite_test_baseline_loader tests/test_baseline_loader.c)
+    target_link_libraries(cvite_test_baseline_loader PRIVATE cvite::orc_loader)
+    cvite_set_warnings(cvite_test_baseline_loader)
+    add_dependencies(
+        cvite_test_baseline_loader
+        cvite_baseline_loader_test_object
+    )
+    add_test(
+        NAME baseline-loader
+        COMMAND cvite_test_baseline_loader ${CVITE_BASELINE_LOADER_OBJECT}
     )
 endif()
 

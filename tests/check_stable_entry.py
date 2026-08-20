@@ -59,7 +59,7 @@ def main() -> int:
             [
                 str(opt),
                 f"-load-pass-plugin={plugin}",
-                "-passes=cvite-lowering,cvite-baseline,cvite-baseline,verify",
+                "-passes=cvite-lowering,cvite-baseline,cvite-baseline-manifest,cvite-baseline-manifest,verify",
                 "-S",
                 str(raw_ir),
                 "-o",
@@ -70,19 +70,30 @@ def main() -> int:
 
         if "cvite.baseline.schema" not in ir:
             fail("baseline module flag is missing")
+        if "cvite.baseline.manifest.schema" not in ir:
+            fail("baseline manifest module flag is missing")
         if "@llvm.global_ctors" not in ir:
             fail("registration constructor is missing")
         if "@__cvite_host_register_function" not in ir:
             fail("generated constructor does not register functions")
         if "@__cvite_host_target_at" not in ir:
             fail("stable entries do not resolve the active target")
+        if "@__cvite_baseline_manifest" not in ir:
+            fail("JIT baseline manifest is missing")
+        if "@__cvite_baseline_records" not in ir:
+            fail("JIT baseline records are missing")
+        if not re.search(r"define [^{@]*@__cvite_program_main\(i32", ir):
+            fail("canonical program main wrapper is missing")
 
         implementations = re.findall(rf"@__cvite_impl\.({ID})", ir)
         slots = re.findall(rf"@__cvite_slot\.({ID})", ir)
+        baseline_names = re.findall(rf"@__cvite_baseline_name\.({ID})", ir)
         if len(set(implementations)) != 2:
             fail(f"expected two versioned implementations: {implementations!r}")
         if set(implementations) != set(slots):
             fail("every implementation must have one stable dispatch slot")
+        if set(implementations) != set(baseline_names):
+            fail("baseline manifest records do not match stable implementations")
 
         if not re.search(r"define [^{@]*@app_update\(", ir):
             fail("app_update stable entry is missing")

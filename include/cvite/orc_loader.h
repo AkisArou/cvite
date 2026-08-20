@@ -3,17 +3,14 @@
 
 #include <stdint.h>
 
+#include "cvite/baseline.h"
 #include "cvite/runtime.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/*
- * Internal host API. Ordinary C application source is not expected to include
- * this header. Candidate generations are isolated until their function
- * pointers are published through cvite_runtime_apply_patch().
- */
+/* Internal host API. Ordinary C application source never includes it. */
 
 typedef struct cvite_orc_loader cvite_orc_loader;
 typedef uint64_t cvite_orc_generation;
@@ -43,6 +40,13 @@ cvite_status cvite_orc_loader_lookup_function(
     cvite_orc_generation generation,
     const char *symbol_name,
     cvite_function_pointer *address,
+    cvite_error *error);
+
+/* Register a JIT baseline manifest and return its canonical C main entry. */
+cvite_status cvite_orc_loader_prepare_baseline(
+    cvite_orc_loader *loader,
+    cvite_orc_generation generation,
+    cvite_program_main *program_main,
     cvite_error *error);
 
 /*

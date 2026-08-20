@@ -1,5 +1,6 @@
 #include "cvite/orc_loader.h"
 
+#include "cvite/baseline.h"
 #include "cvite/candidate.h"
 #include "cvite/host.h"
 
@@ -26,6 +27,8 @@
 namespace {
 
 constexpr const char *kTargetForSymbol = "__cvite_host_target_for";
+constexpr const char *kRegisterFunctionSymbol = "__cvite_host_register_function";
+constexpr const char *kTargetAtSymbol = "__cvite_host_target_at";
 constexpr std::uint64_t kMaxCandidateFunctions = UINT64_C(1048576);
 
 struct HostFunction final {
@@ -37,6 +40,7 @@ struct Generation final {
     llvm::orc::JITDylib *dylib = nullptr;
     llvm::orc::ResourceTrackerSP resources;
     std::vector<cvite_function_update> updates;
+    bool baseline_prepared = false;
 };
 
 struct NativeTargetState final {
@@ -168,6 +172,14 @@ extern "C" cvite_status cvite_orc_loader_create(
         kTargetForSymbol,
         reinterpret_cast<cvite_function_pointer>(&__cvite_host_target_for),
     });
+    created->host_functions.push_back(HostFunction{
+        kRegisterFunctionSymbol,
+        reinterpret_cast<cvite_function_pointer>(&__cvite_host_register_function),
+    });
+    created->host_functions.push_back(HostFunction{
+        kTargetAtSymbol,
+        reinterpret_cast<cvite_function_pointer>(&__cvite_host_target_at),
+    });
     *loader = created.release();
     return CVITE_STATUS_OK;
 }
@@ -286,7 +298,7 @@ extern "C" cvite_status cvite_orc_loader_stage_object(
     }
 
     loader->generations.emplace(
-        handle, Generation{&candidate_dylib, std::move(resources), {}});
+        handle, Generation{&candidate_dylib, std::move(resources), {}, false});
     *generation = handle;
     return CVITE_STATUS_OK;
 }
@@ -321,6 +333,137 @@ extern "C" cvite_status cvite_orc_loader_lookup_function(
     }
 
     *address = symbol->toPtr<void()>();
+    return CVITE_STATUS_OK;
+}
+
+extern "C" cvite_status cvite_orc_loader_prepare_baseline(
+    cvite_orc_loader *loader,
+    cvite_orc_generation generation,
+    cvite_program_main *program_main,
+    cvite_error *error)
+{
+    cvite_error_clear(error);
+    if (loader == nullptr || generation == CVITE_ORC_GENERATION_INVALID ||
+        program_main == nullptr) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_ARGUMENT,
+            "invalid baseline preparation");
+    }
+    *program_main = nullptr;
+
+    std::lock_guard<std::mutex> guard(loader->mutex);
+    const auto found = loader->generations.find(generation);
+    if (found == loader->generations.end()) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_ARGUMENT,
+            "unknown baseline generation");
+    }
+    Generation &baseline = found->second;
+    if (baseline.baseline_prepared) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "baseline generation was already prepared");
+    }
+
+    auto manifest_symbol = loader->jit->lookup(
+        *baseline.dylib, CVITE_BASELINE_MANIFEST_SYMBOL);
+    if (!manifest_symbol) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_PACKET,
+            manifest_symbol.takeError(),
+            "baseline object has no readable CVite manifest");
+    }
+    const cvite_baseline_manifest *manifest =
+        manifest_symbol->toPtr<const cvite_baseline_manifest *>();
+    if (manifest == nullptr ||
+        manifest->schema != CVITE_BASELINE_MANIFEST_SCHEMA) {
+        return fail(
+            error,
+            CVITE_STATUS_UNSUPPORTED_PROTOCOL,
+            "baseline manifest schema is unsupported");
+    }
+    if (manifest->function_count > kMaxCandidateFunctions ||
+        manifest->function_count > static_cast<std::uint64_t>(SIZE_MAX)) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_PACKET,
+            "baseline manifest function count is unreasonable");
+    }
+    if (manifest->function_count != 0U && manifest->functions == nullptr) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_PACKET,
+            "baseline manifest has no function records");
+    }
+
+    std::vector<cvite_id> identities;
+    identities.reserve(static_cast<std::size_t>(manifest->function_count));
+    for (std::uint64_t index = 0U;
+         index < manifest->function_count;
+         ++index) {
+        const cvite_baseline_function &record = manifest->functions[index];
+        const cvite_id id{record.id_high, record.id_low};
+        const cvite_id abi{record.abi_high, record.abi_low};
+        if (cvite_id_is_zero(id) || cvite_id_is_zero(abi) ||
+            record.initial_target == nullptr || record.slot == nullptr ||
+            record.debug_name == nullptr || record.debug_name[0] == '\0') {
+            return fail(
+                error,
+                CVITE_STATUS_INVALID_PACKET,
+                "baseline manifest contains an invalid function record");
+        }
+        for (const cvite_id existing : identities) {
+            if (cvite_id_equal(existing, id)) {
+                return fail(
+                    error,
+                    CVITE_STATUS_DUPLICATE_SYMBOL,
+                    "baseline manifest contains a duplicate function ID");
+            }
+        }
+        identities.push_back(id);
+    }
+
+    for (std::uint64_t index = 0U;
+         index < manifest->function_count;
+         ++index) {
+        const cvite_baseline_function &record = manifest->functions[index];
+        const cvite_function_definition definition = {
+            cvite_id{record.id_high, record.id_low},
+            cvite_id{record.abi_high, record.abi_low},
+            record.initial_target,
+            record.debug_name,
+        };
+        cvite_host_function registered;
+        const cvite_status register_status = cvite_host_register_function(
+            &definition, &registered, error);
+        if (register_status != CVITE_STATUS_OK) {
+            return register_status;
+        }
+        if (registered.slot > static_cast<std::size_t>(UINT64_MAX)) {
+            return fail(
+                error,
+                CVITE_STATUS_INVALID_STATE,
+                "baseline dispatch slot does not fit the compiler ABI");
+        }
+        *record.slot = static_cast<std::uint64_t>(registered.slot);
+    }
+
+    auto main_symbol = loader->jit->lookup(
+        *baseline.dylib, CVITE_PROGRAM_MAIN_SYMBOL);
+    if (!main_symbol) {
+        return fail(
+            error,
+            CVITE_STATUS_UNKNOWN_SYMBOL,
+            main_symbol.takeError(),
+            "baseline has no supported C main entry point");
+    }
+
+    *program_main = main_symbol->toPtr<int(int, char **)>();
+    baseline.baseline_prepared = true;
     return CVITE_STATUS_OK;
 }
 

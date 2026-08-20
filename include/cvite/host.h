@@ -23,6 +23,11 @@ typedef struct cvite_host_function {
     const char *debug_name;
 } cvite_host_function;
 
+cvite_status cvite_host_register_function(
+    const cvite_function_definition *definition,
+    cvite_host_function *function,
+    cvite_error *error);
+
 uint64_t __cvite_host_register_function(
     uint64_t id_high,
     uint64_t id_low,

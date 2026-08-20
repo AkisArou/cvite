@@ -128,6 +128,70 @@ static cvite_status cvite_host_seal(cvite_error *error)
     return status;
 }
 
+cvite_status cvite_host_register_function(
+    const cvite_function_definition *definition,
+    cvite_host_function *function,
+    cvite_error *error)
+{
+    cvite_runtime *runtime = NULL;
+    cvite_status status = CVITE_STATUS_OK;
+    size_t slot = SIZE_MAX;
+
+    cvite_error_clear(error);
+    if (definition == NULL || function == NULL ||
+        cvite_id_is_zero(definition->id) ||
+        cvite_id_is_zero(definition->abi_fingerprint) ||
+        definition->initial_target == NULL ||
+        definition->debug_name == NULL ||
+        definition->debug_name[0] == '\0') {
+        return cvite_host_fail(
+            error,
+            CVITE_STATUS_INVALID_ARGUMENT,
+            "invalid host function definition");
+    }
+
+    cvite_host_lock();
+    if (atomic_load_explicit(&cvite_host_is_sealed, memory_order_relaxed)) {
+        cvite_host_unlock();
+        return cvite_host_fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "a module tried to register after the host was sealed");
+    }
+
+    runtime = cvite_host_ensure_runtime_locked(error);
+    if (runtime == NULL) {
+        cvite_host_unlock();
+        return error != NULL ? error->status : CVITE_STATUS_OUT_OF_MEMORY;
+    }
+
+    if (cvite_host_record_count == cvite_host_record_capacity) {
+        status = cvite_host_grow_records_locked(error);
+        if (status != CVITE_STATUS_OK) {
+            cvite_host_unlock();
+            return status;
+        }
+    }
+
+    status = cvite_runtime_register_function(
+        runtime, definition, &slot, error);
+    if (status != CVITE_STATUS_OK) {
+        cvite_host_unlock();
+        return status;
+    }
+
+    *function = (cvite_host_function){
+        definition->id,
+        definition->abi_fingerprint,
+        slot,
+        definition->debug_name,
+    };
+    cvite_host_records[cvite_host_record_count].function = *function;
+    cvite_host_record_count += 1U;
+    cvite_host_unlock();
+    return CVITE_STATUS_OK;
+}
+
 uint64_t __cvite_host_register_function(
     uint64_t id_high,
     uint64_t id_low,
@@ -136,73 +200,27 @@ uint64_t __cvite_host_register_function(
     cvite_function_pointer initial_target,
     const char *debug_name)
 {
-    cvite_function_definition definition;
-    cvite_runtime *runtime = NULL;
+    const cvite_function_definition definition = {
+        CVITE_ID(id_high, id_low),
+        CVITE_ID(abi_high, abi_low),
+        initial_target,
+        debug_name,
+    };
+    cvite_host_function function;
     cvite_error error;
-    cvite_status status = CVITE_STATUS_OK;
-    size_t slot = SIZE_MAX;
 
-    if (initial_target == NULL || debug_name == NULL || debug_name[0] == '\0') {
-        cvite_host_fail(
-            &error,
-            CVITE_STATUS_INVALID_ARGUMENT,
-            "compiler emitted an invalid function descriptor");
+    if (cvite_host_register_function(&definition, &function, &error) !=
+        CVITE_STATUS_OK) {
         cvite_host_fatal("function registration", &error);
     }
-
-    cvite_host_lock();
-    if (atomic_load_explicit(&cvite_host_is_sealed, memory_order_relaxed)) {
-        cvite_host_fail(
-            &error,
-            CVITE_STATUS_INVALID_STATE,
-            "a module tried to register after the host was sealed");
-        cvite_host_unlock();
-        cvite_host_fatal("function registration", &error);
-    }
-
-    runtime = cvite_host_ensure_runtime_locked(&error);
-    if (runtime == NULL) {
-        cvite_host_unlock();
-        cvite_host_fatal("runtime creation", &error);
-    }
-
-    if (cvite_host_record_count == cvite_host_record_capacity) {
-        status = cvite_host_grow_records_locked(&error);
-        if (status != CVITE_STATUS_OK) {
-            cvite_host_unlock();
-            cvite_host_fatal("function registry growth", &error);
-        }
-    }
-
-    definition.id = CVITE_ID(id_high, id_low);
-    definition.abi_fingerprint = CVITE_ID(abi_high, abi_low);
-    definition.initial_target = initial_target;
-    definition.debug_name = debug_name;
-    status = cvite_runtime_register_function(
-        runtime, &definition, &slot, &error);
-    if (status != CVITE_STATUS_OK) {
-        cvite_host_unlock();
-        cvite_host_fatal("function registration", &error);
-    }
-
-    cvite_host_records[cvite_host_record_count].function =
-        (cvite_host_function){
-            definition.id,
-            definition.abi_fingerprint,
-            slot,
-            debug_name,
-        };
-    cvite_host_record_count += 1U;
-    cvite_host_unlock();
-
-    if (slot > (size_t)UINT64_MAX) {
+    if (function.slot > (size_t)UINT64_MAX) {
         cvite_host_fail(
             &error,
             CVITE_STATUS_INVALID_STATE,
             "function slot does not fit the compiler ABI");
         cvite_host_fatal("function registration", &error);
     }
-    return (uint64_t)slot;
+    return (uint64_t)function.slot;
 }
 
 cvite_function_pointer __cvite_host_target_at(uint64_t encoded_slot)
