@@ -113,6 +113,17 @@ int cvite_build_path(
     return cvite_join_path(output, PATH_MAX, state->build_directory, name);
 }
 
+int cvite_dependency_path(
+    const cvite_run_state *state,
+    cvite_build_kind kind,
+    char output[PATH_MAX])
+{
+    return cvite_build_path(
+        state,
+        kind == CVITE_BUILD_BASELINE ? "baseline.d" : "candidate.d",
+        output);
+}
+
 void cvite_remove_if_present(const char *path)
 {
     if (path != NULL) {
@@ -141,6 +152,7 @@ int cvite_compile_translation_unit(
 {
     char raw_ir_path[PATH_MAX];
     char transformed_ir_path[PATH_MAX];
+    char dependency_path[PATH_MAX];
     char plugin_argument[PATH_MAX + 32U];
     const char *passes = kind == CVITE_BUILD_BASELINE
         ? "-passes=cvite-lowering,cvite-baseline,cvite-baseline-manifest,verify"
@@ -158,6 +170,11 @@ int cvite_compile_translation_unit(
         (char *)"-fno-discard-value-names",
         (char *)"-Xclang",
         (char *)"-disable-O0-optnone",
+        (char *)"-MMD",
+        (char *)"-MF",
+        dependency_path,
+        (char *)"-MT",
+        (char *)"cvite-translation",
         (char *)"-S",
         (char *)"-emit-llvm",
         (char *)state->source_path,
@@ -189,7 +206,8 @@ int cvite_compile_translation_unit(
 
     if (cvite_build_path(state, "translation.raw.ll", raw_ir_path) != 0 ||
         cvite_build_path(state, "translation.ll", transformed_ir_path) != 0 ||
-        cvite_build_path(state, "translation.o", object_path) != 0) {
+        cvite_build_path(state, "translation.o", object_path) != 0 ||
+        cvite_dependency_path(state, kind, dependency_path) != 0) {
         (void)fprintf(stderr, "[cvite] temporary build path is too long\n");
         return -1;
     }
@@ -207,6 +225,7 @@ int cvite_compile_translation_unit(
     cvite_remove_if_present(raw_ir_path);
     cvite_remove_if_present(transformed_ir_path);
     cvite_remove_if_present(object_path);
+    cvite_remove_if_present(dependency_path);
 
     status = run_process(clang_to_ir);
     if (status != 0) {
@@ -232,6 +251,7 @@ cleanup_failure:
     cvite_remove_if_present(raw_ir_path);
     cvite_remove_if_present(transformed_ir_path);
     cvite_remove_if_present(object_path);
+    cvite_remove_if_present(dependency_path);
     return -1;
 }
 

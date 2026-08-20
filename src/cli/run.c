@@ -197,6 +197,12 @@ static void cleanup_build_directory(const cvite_run_state *state)
     if (cvite_build_path(state, "translation.o", path) == 0) {
         cvite_remove_if_present(path);
     }
+    if (cvite_dependency_path(state, CVITE_BUILD_BASELINE, path) == 0) {
+        cvite_remove_if_present(path);
+    }
+    if (cvite_dependency_path(state, CVITE_BUILD_CANDIDATE, path) == 0) {
+        cvite_remove_if_present(path);
+    }
     (void)rmdir(state->build_directory);
 }
 
@@ -299,7 +305,9 @@ void cvite_run_print_doctor(FILE *stream)
     (void)fprintf(stream, "clang: %s\n", clang_path);
     (void)fprintf(stream, "opt: %s\n", opt_path);
     (void)fprintf(stream, "pass plugin: %s\n", plugin_path);
-    (void)fprintf(stream, "project mode: single translation unit (M1)\n");
+    (void)fprintf(
+        stream,
+        "project mode: single translation unit + header graph (M1)\n");
 }
 
 int cvite_run_command(int argc, char **argv)
@@ -317,7 +325,6 @@ int cvite_run_command(int argc, char **argv)
 
     (void)memset(&state, 0, sizeof(state));
     state.watch_descriptor = -1;
-    state.watch_handle = -1;
     atomic_init(&state.stop_requested, false);
 
     if (argc < 1) {
@@ -390,8 +397,7 @@ int cvite_run_command(int argc, char **argv)
 
     (void)fprintf(
         stderr,
-        "[cvite] application started; watching %s\n",
-        state.source_path);
+        "[cvite] application started; watching Clang dependency graph\n");
     application_started = true;
     result = program_main(
         application_argument_count + 1,

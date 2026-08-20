@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
 #include <time.h>
@@ -16,6 +17,15 @@
 #define CVITE_WATCH_DEBOUNCE_NS UINT64_C(50000000)
 #define CVITE_WATCH_POLL_MS 100
 #define CVITE_EVENT_BUFFER_SIZE (16U * 1024U)
+#define CVITE_MAX_DEPFILE_SIZE (8U * 1024U * 1024U)
+#define CVITE_INITIAL_DIRECTORY_CAPACITY 4U
+#define CVITE_INITIAL_FILE_CAPACITY 4U
+
+#define CVITE_WATCH_MASK                                                        \
+    (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_ATTRIB | IN_DELETE |        \
+     IN_DELETE_SELF | IN_MOVE_SELF)
+
+#include "watch_dependencies.inc"
 
 static double elapsed_milliseconds(struct timespec start, struct timespec finish)
 {
@@ -92,6 +102,12 @@ static int publish_candidate(cvite_run_state *state)
         return -1;
     }
 
+    if (cvite_refresh_source_watcher(state, CVITE_BUILD_CANDIDATE) != 0) {
+        (void)fprintf(
+            stderr,
+            "[cvite] refreshed code, but dependency watches could not be updated\n");
+    }
+
     (void)clock_gettime(CLOCK_MONOTONIC, &finished);
     (void)fprintf(
         stderr,
@@ -104,19 +120,33 @@ static int publish_candidate(cvite_run_state *state)
 }
 
 static bool watch_event_matches(
+    const cvite_run_state *state,
     const struct inotify_event *event,
-    const char *file_name)
+    bool *watch_lost)
 {
     const uint32_t interesting = IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE |
-        IN_ATTRIB;
+        IN_ATTRIB | IN_DELETE;
+    const cvite_watch_directory *directory;
 
     if ((event->mask & IN_Q_OVERFLOW) != 0U) {
         return true;
     }
+    directory = find_directory_by_handle(state, event->wd);
+    if (directory == NULL) {
+        return false;
+    }
+    if ((event->mask & (IN_DELETE_SELF | IN_MOVE_SELF)) != 0U) {
+        (void)fprintf(
+            stderr,
+            "[cvite] dependency directory disappeared: %s\n",
+            directory->path);
+        *watch_lost = true;
+        return false;
+    }
     if ((event->mask & interesting) == 0U || event->len == 0U) {
         return false;
     }
-    return strcmp(event->name, file_name) == 0;
+    return directory_contains_file(directory, event->name);
 }
 
 static void sleep_nanoseconds(uint64_t nanoseconds)
@@ -131,7 +161,7 @@ static void sleep_nanoseconds(uint64_t nanoseconds)
 
 static void drain_watch_events(int descriptor)
 {
-    char buffer[CVITE_EVENT_BUFFER_SIZE];
+    _Alignas(struct inotify_event) char buffer[CVITE_EVENT_BUFFER_SIZE];
     ssize_t count;
 
     do {
@@ -149,18 +179,7 @@ int cvite_initialize_source_watcher(cvite_run_state *state)
             strerror(errno));
         return -1;
     }
-
-    state->watch_handle = inotify_add_watch(
-        state->watch_descriptor,
-        state->watch_directory,
-        IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_ATTRIB |
-            IN_DELETE_SELF | IN_MOVE_SELF);
-    if (state->watch_handle < 0) {
-        (void)fprintf(
-            stderr,
-            "[cvite] could not watch %s: %s\n",
-            state->watch_directory,
-            strerror(errno));
+    if (cvite_refresh_source_watcher(state, CVITE_BUILD_BASELINE) != 0) {
         (void)close(state->watch_descriptor);
         state->watch_descriptor = -1;
         return -1;
@@ -170,22 +189,34 @@ int cvite_initialize_source_watcher(cvite_run_state *state)
 
 void cvite_close_source_watcher(cvite_run_state *state)
 {
-    if (state->watch_descriptor < 0) {
+    size_t index;
+
+    if (state == NULL) {
         return;
     }
-    if (state->watch_handle >= 0) {
-        (void)inotify_rm_watch(state->watch_descriptor, state->watch_handle);
+    if (state->watch_descriptor >= 0) {
+        for (index = 0U; index < state->watch_directory_count; ++index) {
+            if (state->watch_directories[index].handle >= 0) {
+                (void)inotify_rm_watch(
+                    state->watch_descriptor,
+                    state->watch_directories[index].handle);
+            }
+        }
+        (void)close(state->watch_descriptor);
     }
-    (void)close(state->watch_descriptor);
     state->watch_descriptor = -1;
-    state->watch_handle = -1;
+    free_watch_directories(
+        state->watch_directories,
+        state->watch_directory_count);
+    state->watch_directories = NULL;
+    state->watch_directory_count = 0U;
 }
 
 void *cvite_watch_source(void *opaque)
 {
     cvite_run_state *state = opaque;
     struct pollfd poll_descriptor;
-    char buffer[CVITE_EVENT_BUFFER_SIZE];
+    _Alignas(struct inotify_event) char buffer[CVITE_EVENT_BUFFER_SIZE];
 
     poll_descriptor.fd = state->watch_descriptor;
     poll_descriptor.events = POLLIN;
@@ -196,6 +227,7 @@ void *cvite_watch_source(void *opaque)
         memory_order_acquire)) {
         int poll_status = poll(&poll_descriptor, 1U, CVITE_WATCH_POLL_MS);
         bool rebuild = false;
+        bool watch_lost = false;
 
         if (poll_status < 0) {
             if (errno == EINTR) {
@@ -233,7 +265,6 @@ void *cvite_watch_source(void *opaque)
                     stderr,
                     "[cvite] source watcher read failed: %s\n",
                     strerror(errno));
-                rebuild = false;
                 goto watcher_done;
             }
             if (count == 0) {
@@ -247,25 +278,19 @@ void *cvite_watch_source(void *opaque)
 
                 if (remaining < sizeof(struct inotify_event)) {
                     (void)fprintf(stderr, "[cvite] malformed inotify event\n");
-                    rebuild = false;
                     goto watcher_done;
                 }
                 event = (const struct inotify_event *)(const void *)(buffer + offset);
                 event_size = sizeof(*event) + (size_t)event->len;
                 if (event_size > remaining) {
                     (void)fprintf(stderr, "[cvite] malformed inotify event\n");
-                    rebuild = false;
                     goto watcher_done;
                 }
-                if ((event->mask & (IN_DELETE_SELF | IN_MOVE_SELF)) != 0U) {
-                    (void)fprintf(
-                        stderr,
-                        "[cvite] watched project directory disappeared\n");
-                    rebuild = false;
-                    goto watcher_done;
-                }
-                if (watch_event_matches(event, state->watch_name)) {
+                if (watch_event_matches(state, event, &watch_lost)) {
                     rebuild = true;
+                }
+                if (watch_lost) {
+                    goto watcher_done;
                 }
                 offset += event_size;
             }

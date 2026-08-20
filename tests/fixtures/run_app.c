@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "run_step.h"
+
 #include <stdio.h>
 #include <time.h>
 
@@ -7,7 +9,7 @@ static int total = 0;
 
 static int step(void)
 {
-    total += 1;
+    total += CVITE_STEP;
     return total;
 }
 

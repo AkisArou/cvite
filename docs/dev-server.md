@@ -26,19 +26,29 @@ macros, annotations, state APIs, allocators, or lifecycle callbacks.
 
 On startup, CVite:
 
-1. invokes the configured Clang 18 compiler to emit LLVM IR;
+1. invokes the configured Clang 18 compiler to emit LLVM IR and a Make-style
+   dependency file;
 2. applies `cvite-lowering`, `cvite-baseline`, and
    `cvite-baseline-manifest`;
 3. emits a position-independent object;
 4. links that object into the CVite process with LLVM ORC/JITLink;
 5. registers compiler-generated stable functions and persistent storage;
 6. calls the transformed program's real C `main` on the process main thread;
-7. watches the source directory with Linux `inotify`.
+7. watches the source file and every non-system header reported by Clang.
+
+CVite watches dependency **directories** and filters events by file name. This
+continues to work when an editor saves through an atomic rename instead of
+writing the original inode in place.
 
 On save, the watcher compiles a candidate through `cvite-candidate`, stages it
 in an isolated JIT generation, validates its function and storage manifest, and
 publishes one immutable dispatch snapshot. The previous generation remains
 active unless every stage succeeds.
+
+After a candidate is published, its Clang dependency file atomically replaces
+the active watch graph. A header introduced by the edit therefore becomes
+refreshable immediately; a header no longer used by the translation unit is
+removed from the graph.
 
 A successful edit looks like:
 
@@ -46,7 +56,8 @@ A successful edit looks like:
 [cvite] refreshed 3 functions → generation 4 (31.7 ms)
 ```
 
-A syntax error is reported by Clang and followed by:
+A syntax error in either the source or a watched header is reported by Clang and
+followed by:
 
 ```text
 [cvite] candidate compilation failed; previous code remains active
@@ -79,15 +90,15 @@ The current command is intentionally narrow:
 - Linux with `inotify`;
 - Clang/LLVM 18;
 - one C11 translation unit;
-- one watched `.c` file;
+- the translation unit's Clang-reported non-system header graph;
 - debug/`-O0` development compilation;
 - exactly one supported C `main` entry;
-- no build-system flags, link libraries, or header dependency watcher yet;
+- no build-system compile flags, link libraries, or multi-translation-unit
+  invalidation yet;
 - JIT generations are retained until process exit.
 
-Included headers are compiled normally, but edits to them do not yet trigger a
-refresh. Multi-translation-unit projects, `compile_commands.json`, dependency
-invalidation, custom link inputs, and process-restart fallback are the next
+`compile_commands.json`, multiple translation units, custom link inputs,
+smallest-boundary process restart, and generation reclamation are the next
 orchestration milestones.
 
 ## Lifetime policy

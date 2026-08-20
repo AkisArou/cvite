@@ -19,15 +19,15 @@ def fail(message: str, output: list[str]) -> None:
     diagnostics = [line for line in output if VALUE.match(line.rstrip("\n")) is None]
     values = [line for line in output if VALUE.match(line.rstrip("\n")) is not None]
     joined = "".join(
-        diagnostics[-120:]
+        diagnostics[-160:]
         + (["\n--- recent application values ---\n"] if values else [])
-        + values[-40:]
+        + values[-60:]
     )
     raise AssertionError(f"{message}\n\n--- cvite output ---\n{joined}")
 
 
 def atomic_write(path: Path, content: str) -> None:
-    replacement = path.with_suffix(".new.c")
+    replacement = path.with_name(f".{path.name}.cvite-new")
     replacement.write_text(content, encoding="utf-8")
     os.replace(replacement, path)
 
@@ -38,15 +38,40 @@ def main() -> int:
 
     cvite = Path(sys.argv[1]).resolve()
     fixture = Path(sys.argv[2]).resolve()
+    fixture_header = fixture.with_name("run_step.h")
+    fixture_next_header = fixture.with_name("run_step_next.h")
     output: list[str] = []
 
     with tempfile.TemporaryDirectory(prefix="cvite-run-test-") as directory:
         source = Path(directory) / "main.c"
+        header = Path(directory) / "run_step.h"
+        next_header = Path(directory) / "run_step_next.h"
         shutil.copyfile(fixture, source)
-        original = source.read_text(encoding="utf-8")
-        broken = original.replace("total += 1;", "total += ;", 1)
-        fixed = original.replace("total += 1;", "total += 10;", 1)
-        if broken == original or fixed == original:
+        shutil.copyfile(fixture_header, header)
+        shutil.copyfile(fixture_next_header, next_header)
+
+        original_header = header.read_text(encoding="utf-8")
+        original_next_header = next_header.read_text(encoding="utf-8")
+        broken_header = original_header.replace(
+            "#define CVITE_STEP 1",
+            "#define CVITE_STEP",
+            1,
+        )
+        fixed_header = original_header.replace(
+            "#define CVITE_STEP 1",
+            '#include "run_step_next.h"\n#define CVITE_STEP CVITE_NEXT_STEP',
+            1,
+        )
+        updated_next_header = original_next_header.replace(
+            "#define CVITE_NEXT_STEP 10",
+            "#define CVITE_NEXT_STEP 20",
+            1,
+        )
+        if (
+            broken_header == original_header
+            or fixed_header == original_header
+            or updated_next_header == original_next_header
+        ):
             fail("fixture edit marker was not found", output)
 
         environment = os.environ.copy()
@@ -66,10 +91,13 @@ def main() -> int:
         compile_error_seen = False
         values_at_error = 0
         fixed_written = False
-        refreshed = False
-        preserved_jump = False
+        refresh_count = 0
+        first_refresh_behavior = False
+        next_header_written = False
+        second_refresh_behavior = False
         old_code_after_error = False
-        deadline = time.monotonic() + 35.0
+        dynamic_graph_seen = False
+        deadline = time.monotonic() + 40.0
 
         try:
             while time.monotonic() < deadline:
@@ -91,21 +119,46 @@ def main() -> int:
                     values_at_error = len(values)
 
                 if "[cvite] refreshed" in line:
-                    refreshed = True
+                    refresh_count += 1
+
+                if "[cvite] watching 3 files" in line:
+                    dynamic_graph_seen = True
 
                 match = VALUE.match(line.rstrip("\n"))
                 if match:
                     current = int(match.group(1))
-                    if values:
-                        difference = current - values[-1]
-                        if compile_error_seen and not fixed_written and difference == 1:
-                            old_code_after_error = True
-                        if fixed_written and difference >= 10:
-                            preserved_jump = True
+                    difference = current - values[-1] if values else 0
+
+                    if compile_error_seen and not fixed_written and difference == 1:
+                        old_code_after_error = True
+
+                    if (
+                        fixed_written
+                        and refresh_count >= 1
+                        and not first_refresh_behavior
+                        and difference >= 10
+                    ):
+                        first_refresh_behavior = True
+
+                    if (
+                        first_refresh_behavior
+                        and dynamic_graph_seen
+                        and not next_header_written
+                    ):
+                        atomic_write(next_header, updated_next_header)
+                        next_header_written = True
+
+                    if (
+                        next_header_written
+                        and refresh_count >= 2
+                        and difference >= 20
+                    ):
+                        second_refresh_behavior = True
+
                     values.append(current)
 
                     if len(values) >= 4 and not broken_written:
-                        atomic_write(source, broken)
+                        atomic_write(header, broken_header)
                         broken_written = True
 
                     if (
@@ -113,25 +166,36 @@ def main() -> int:
                         and not fixed_written
                         and len(values) >= values_at_error + 2
                     ):
-                        atomic_write(source, fixed)
+                        atomic_write(header, fixed_header)
                         fixed_written = True
 
                 if (
                     compile_error_seen
                     and old_code_after_error
-                    and refreshed
-                    and preserved_jump
-                    and len(values) >= 10
+                    and refresh_count >= 2
+                    and first_refresh_behavior
+                    and dynamic_graph_seen
+                    and second_refresh_behavior
+                    and len(values) >= 12
                 ):
                     break
 
             if not compile_error_seen:
-                fail("did not observe candidate compile-error recovery", output)
+                fail("did not observe header compile-error recovery", output)
             if not old_code_after_error:
-                fail("old code did not keep running after the compile error", output)
-            if not refreshed or not preserved_jump:
+                fail("old code did not keep running after the header error", output)
+            if refresh_count < 1 or not first_refresh_behavior:
                 fail(
-                    "did not observe a successful refresh with preserved state",
+                    "did not observe a header-triggered refresh with preserved state",
+                    output,
+                )
+            if not dynamic_graph_seen:
+                fail("candidate dependency graph was not installed", output)
+            if not next_header_written:
+                fail("test never edited the newly introduced header", output)
+            if refresh_count < 2 or not second_refresh_behavior:
+                fail(
+                    "newly introduced header did not trigger a second refresh",
                     output,
                 )
         finally:
@@ -148,8 +212,8 @@ def main() -> int:
         if return_code != 0:
             fail(f"cvite exited with status {return_code}", output)
         if not broken_written or not fixed_written:
-            fail("test did not complete both source edits", output)
-        if len(values) < 10:
+            fail("test did not complete both primary-header edits", output)
+        if len(values) < 12:
             fail(f"too few application observations: {values!r}", output)
 
     return 0

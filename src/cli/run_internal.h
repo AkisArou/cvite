@@ -4,6 +4,7 @@
 #include "cvite/orc_loader.h"
 
 #include <limits.h>
+#include <stddef.h>
 #include <stdatomic.h>
 
 #ifndef NAME_MAX
@@ -15,6 +16,14 @@ typedef enum cvite_build_kind {
     CVITE_BUILD_CANDIDATE = 1
 } cvite_build_kind;
 
+typedef struct cvite_watch_directory {
+    int handle;
+    char *path;
+    char **file_names;
+    size_t file_count;
+    size_t file_capacity;
+} cvite_watch_directory;
+
 typedef struct cvite_run_state {
     char source_path[PATH_MAX];
     char watch_directory[PATH_MAX];
@@ -25,7 +34,8 @@ typedef struct cvite_run_state {
     const char *plugin_path;
     cvite_orc_loader *loader;
     int watch_descriptor;
-    int watch_handle;
+    cvite_watch_directory *watch_directories;
+    size_t watch_directory_count;
     atomic_bool stop_requested;
 } cvite_run_state;
 
@@ -40,6 +50,11 @@ int cvite_build_path(
     const char *name,
     char output[PATH_MAX]);
 
+int cvite_dependency_path(
+    const cvite_run_state *state,
+    cvite_build_kind kind,
+    char output[PATH_MAX]);
+
 void cvite_remove_if_present(const char *path);
 
 int cvite_compile_translation_unit(
@@ -50,6 +65,9 @@ int cvite_compile_translation_unit(
 void cvite_print_runtime_error(const char *stage, const cvite_error *error);
 
 int cvite_initialize_source_watcher(cvite_run_state *state);
+int cvite_refresh_source_watcher(
+    cvite_run_state *state,
+    cvite_build_kind kind);
 void cvite_close_source_watcher(cvite_run_state *state);
 void *cvite_watch_source(void *opaque);
 
