@@ -392,8 +392,8 @@ extern "C" cvite_status cvite_orc_loader_prepare_patch(
          index < manifest->function_count;
          ++index) {
         const cvite_candidate_function &record = manifest->functions[index];
-        const cvite_id id = CVITE_ID(record.id_high, record.id_low);
-        const cvite_id abi = CVITE_ID(record.abi_high, record.abi_low);
+        const cvite_id id{record.id_high, record.id_low};
+        const cvite_id abi{record.abi_high, record.abi_low};
 
         if (cvite_id_is_zero(id) || cvite_id_is_zero(abi) ||
             record.target == nullptr || record.debug_name == nullptr ||
