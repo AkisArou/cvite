@@ -56,14 +56,24 @@ bool parseHash(llvm::StringRef hex, Hash128 &hash)
         return false;
     }
 
-    std::uint64_t high = 0U;
-    std::uint64_t low = 0U;
-    if (hex.take_front(16U).getAsInteger(16U, high) ||
-        hex.drop_front(16U).getAsInteger(16U, low)) {
-        return false;
+    /*
+     * MD5::stringifyResult prints the digest bytes in array order, while
+     * MD5Result::words() interprets each 64-bit half as little-endian. Function
+     * identities are created from words(), so reconstruct those exact numeric
+     * values instead of treating the two printed halves as big-endian numbers.
+     */
+    std::uint64_t words[2] = {0U, 0U};
+    for (unsigned index = 0U; index < 16U; ++index) {
+        unsigned byte = 0U;
+        if (hex.substr(index * 2U, 2U).getAsInteger(16U, byte) ||
+            byte > 0xffU) {
+            return false;
+        }
+        words[index / 8U] |=
+            static_cast<std::uint64_t>(byte) << ((index % 8U) * 8U);
     }
 
-    hash = Hash128{high, low, hex.str()};
+    hash = Hash128{words[1], words[0], hex.str()};
     return true;
 }
 
