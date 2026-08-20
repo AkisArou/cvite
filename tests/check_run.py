@@ -16,7 +16,13 @@ VALUE = re.compile(r"^value=(\d+)$")
 
 
 def fail(message: str, output: list[str]) -> None:
-    joined = "".join(output[-250:])
+    diagnostics = [line for line in output if VALUE.match(line.rstrip("\n")) is None]
+    values = [line for line in output if VALUE.match(line.rstrip("\n")) is not None]
+    joined = "".join(
+        diagnostics[-120:]
+        + (["\n--- recent application values ---\n"] if values else [])
+        + values[-40:]
+    )
     raise AssertionError(f"{message}\n\n--- cvite output ---\n{joined}")
 
 
@@ -43,8 +49,11 @@ def main() -> int:
         if broken == original or fixed == original:
             fail("fixture edit marker was not found", output)
 
+        environment = os.environ.copy()
+        environment["CVITE_VERBOSE"] = "1"
         process = subprocess.Popen(
             [str(cvite), "run", str(source)],
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
