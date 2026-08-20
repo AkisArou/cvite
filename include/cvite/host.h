@@ -23,9 +23,29 @@ typedef struct cvite_host_function {
     const char *debug_name;
 } cvite_host_function;
 
+typedef struct cvite_host_storage {
+    cvite_id id;
+    cvite_id layout_fingerprint;
+    void *address;
+    size_t size;
+    size_t alignment;
+    const char *debug_name;
+} cvite_host_storage;
+
 cvite_status cvite_host_register_function(
     const cvite_function_definition *definition,
     cvite_host_function *function,
+    cvite_error *error);
+
+cvite_status cvite_host_register_storage(
+    const cvite_storage_definition *definition,
+    void *address,
+    cvite_host_storage *storage,
+    cvite_error *error);
+
+cvite_status cvite_host_require_storage(
+    const cvite_storage_definition *definition,
+    cvite_host_storage *storage,
     cvite_error *error);
 
 uint64_t __cvite_host_register_function(
@@ -36,6 +56,16 @@ uint64_t __cvite_host_register_function(
     cvite_function_pointer initial_target,
     const char *debug_name);
 
+void *__cvite_host_register_storage(
+    uint64_t id_high,
+    uint64_t id_low,
+    uint64_t layout_high,
+    uint64_t layout_low,
+    uint64_t size,
+    uint64_t alignment,
+    void *address,
+    const char *debug_name);
+
 cvite_function_pointer __cvite_host_target_at(uint64_t slot);
 
 cvite_function_pointer __cvite_host_target_for(
@@ -44,9 +74,25 @@ cvite_function_pointer __cvite_host_target_for(
     uint64_t abi_high,
     uint64_t abi_low);
 
+void *__cvite_host_storage_for(
+    uint64_t id_high,
+    uint64_t id_low,
+    uint64_t layout_high,
+    uint64_t layout_low,
+    uint64_t size,
+    uint64_t alignment,
+    const char *debug_name);
+
 cvite_status cvite_host_find_function(
     const char *debug_name,
     cvite_host_function *function,
+    cvite_error *error);
+
+size_t cvite_host_storage_count(void);
+
+cvite_status cvite_host_storage_at(
+    size_t index,
+    cvite_host_storage *storage,
     cvite_error *error);
 
 cvite_status cvite_host_apply_patch(
