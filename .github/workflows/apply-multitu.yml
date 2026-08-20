@@ -1,14 +1,63 @@
-name: Stage incremental multi-translation-unit refresh
+name: Apply incremental multi-translation-unit refresh
 
 on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  waiting:
-    if: false
+  apply:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
-      - run: echo "Patch parts are being staged."
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply verified implementation and remove applicator
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=/tmp/cvite-next-issues.tar.gz
+          workflow=.github/workflows/apply-multitu.yml
+
+          cat .cvite/next-patch/part-* | base64 --decode > "$archive"
+          echo "f2081dc6f0aaa0cf49ebbae56018059dcb0b81779ee38d637dae8fec699cbc6e  $archive" | sha256sum --check
+          tar -xzf "$archive" -C .
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            .github/workflows/ci.yml \
+            CMakeLists.txt \
+            docs/dev-server.md \
+            src/cli/compile_database.c \
+            src/cli/dependencies.c \
+            src/cli/run.c \
+            src/cli/run_internal.h \
+            src/cli/toolchain.c \
+            src/cli/watch_dependencies.inc \
+            src/cli/watcher.c \
+            src/transform/lowering_pass.cpp \
+            src/transform/transform_support.h \
+            tests/check_multi_tu.py \
+            tests/fixtures/run_multi_main.c \
+            tests/fixtures/run_multi_shared.h \
+            tests/fixtures/run_multi_worker.c
+
+          git rm -rf --ignore-unmatch -- \
+            .cvite/next-patch \
+            .cvite/export-snapshot-trigger \
+            .cvite/multitu-patch.tar.gz \
+            .github/workflows/export-source-snapshot.yml \
+            "$workflow"
+
+          git diff --cached --check
+          git commit -m "feat: add incremental multi-translation-unit refresh"
+          git push origin HEAD:bootstrap/m0-runtime
