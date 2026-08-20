@@ -60,6 +60,18 @@ target_include_directories(cvite_runtime
 target_compile_definitions(cvite_runtime PRIVATE _POSIX_C_SOURCE=200112L)
 cvite_set_warnings(cvite_runtime)
 
+add_library(cvite_host STATIC
+    src/host/host_runtime.c
+)
+add_library(cvite::host ALIAS cvite_host)
+target_include_directories(cvite_host
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_link_libraries(cvite_host PUBLIC cvite::runtime)
+cvite_set_warnings(cvite_host)
+
 add_executable(cvite src/cli/main.c)
 target_link_libraries(cvite PRIVATE cvite::runtime)
 cvite_set_warnings(cvite)
@@ -241,6 +253,11 @@ if(BUILD_TESTING)
     cvite_set_warnings(cvite_test_runtime)
     add_test(NAME runtime COMMAND cvite_test_runtime)
 
+    add_executable(cvite_test_host tests/test_host.c)
+    target_link_libraries(cvite_test_host PRIVATE cvite::host)
+    cvite_set_warnings(cvite_test_host)
+    add_test(NAME host COMMAND cvite_test_host)
+
     add_executable(cvite_test_protocol tests/test_protocol.c)
     target_link_libraries(cvite_test_protocol PRIVATE cvite::runtime)
     cvite_set_warnings(cvite_test_protocol)
@@ -253,7 +270,7 @@ if(BUILD_TESTING)
     set_tests_properties(concurrency PROPERTIES TIMEOUT 30)
 endif()
 
-install(TARGETS cvite cvite_runtime
+install(TARGETS cvite cvite_runtime cvite_host
     EXPORT CViteTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
