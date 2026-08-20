@@ -13,6 +13,7 @@ include(cmake/CViteWarnings.cmake)
 
 option(CVITE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(CVITE_BUILD_EXAMPLES "Build CVite examples" ON)
+option(CVITE_BUILD_COMPILER "Build the libclang semantic-manifest tool" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -40,6 +41,61 @@ cvite_set_warnings(cvite_runtime)
 add_executable(cvite src/cli/main.c)
 target_link_libraries(cvite PRIVATE cvite::runtime)
 cvite_set_warnings(cvite)
+
+if(CVITE_BUILD_COMPILER)
+    enable_language(CXX)
+
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+
+    set(CVITE_LIBCLANG_ROOT "" CACHE PATH "Optional libclang installation prefix")
+    find_path(CVITE_LIBCLANG_INCLUDE_DIR
+        NAMES clang-c/Index.h
+        HINTS
+            ${CVITE_LIBCLANG_ROOT}/include
+            /usr/lib/llvm-18/include
+            /usr/lib/llvm-19/include
+            /usr/local/include
+    )
+    find_library(CVITE_LIBCLANG_LIBRARY
+        NAMES clang libclang clang-18 clang-19
+        HINTS
+            ${CVITE_LIBCLANG_ROOT}/lib
+            ${CVITE_LIBCLANG_ROOT}/lib64
+            /usr/lib/llvm-18/lib
+            /usr/lib/llvm-19/lib
+            /usr/local/lib
+    )
+
+    if(NOT CVITE_LIBCLANG_INCLUDE_DIR OR NOT CVITE_LIBCLANG_LIBRARY)
+        message(FATAL_ERROR
+            "CVITE_BUILD_COMPILER requires libclang headers and library. "
+            "Install libclang-dev or set CVITE_LIBCLANG_ROOT, "
+            "CVITE_LIBCLANG_INCLUDE_DIR, and CVITE_LIBCLANG_LIBRARY.")
+    endif()
+
+    add_executable(cvite_manifest src/compiler/manifest_main.cpp)
+    set_target_properties(cvite_manifest PROPERTIES OUTPUT_NAME cvite-manifest)
+    target_include_directories(cvite_manifest PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR})
+    target_link_libraries(cvite_manifest PRIVATE ${CVITE_LIBCLANG_LIBRARY})
+    cvite_set_warnings(cvite_manifest)
+
+    install(TARGETS cvite_manifest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+    if(BUILD_TESTING)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_test(
+            NAME manifest
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_manifest.py
+                $<TARGET_FILE:cvite_manifest>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/manifest_input.c
+                ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+    endif()
+endif()
 
 if(CVITE_BUILD_EXAMPLES)
     add_executable(cvite_runtime_transaction examples/runtime_transaction.c)

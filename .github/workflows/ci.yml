@@ -63,3 +63,34 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-sanitize --output-on-failure
+
+  semantic-manifest:
+    name: libclang semantic manifest
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clang 18 development libraries
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          libclang-18-dev
+          python3
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-compiler -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-compiler --verbose
+
+      - name: Test
+        run: ctest --test-dir build-compiler --output-on-failure

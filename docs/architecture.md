@@ -1,83 +1,195 @@
 # Architecture
 
-## Decision: CVite owns a version-matched Clang/LLVM toolchain boundary
+## Product boundary
 
-CVite will use Clang's frontend libraries and LLVM's transformation/JIT layers as
-one tested compiler service. It will not implement a C parser, and it will not
-make its primary distribution depend on loading an ABI-fragile plugin into an
-arbitrary system Clang.
+CVite is a development tool around ordinary C. Application source does not use a
+CVite framework API. A development build is produced through a compiler-driver
+wrapper; a production build remains a normal native build.
 
-A standalone `cvite` process reads the project's compilation database, launches
-isolated compiler workers, and produces a semantic manifest plus relocatable code
-for each candidate generation. The application host receives only validated,
-versioned patch packages.
+Clang is the only C parser and semantic authority. CVite never tokenizes C into a
+parallel AST and never guesses layouts from source text.
 
-Dynamic Clang and LLVM pass plugins remain useful during development and for
-integration experiments, but the product boundary is a pinned compiler service.
+## Decision: hybrid native baseline plus JIT-linked patches
 
-## Execution model
+The baseline application remains a normal instrumented native executable. CVite
+does **not** require the whole program, including `main`, to run under a JIT.
+Only candidate patch objects are loaded into the existing process through LLVM
+ORC/JITLink.
 
-The long-term host executes application code through LLVM ORC/JITLink. User
-`main` is a JIT symbol invoked by a small native host. External libraries and
-process symbols are exposed to the JIT through an explicit symbol policy.
+```text
+ordinary source + existing build flags
+                 │
+                 ▼
+        cvite compiler wrapper
+                 │
+       ┌─────────┴──────────┐
+       │                    │
+       ▼                    ▼
+ normal native link    semantic manifest
+       │                    │
+       ▼                    │
+instrumented baseline       │
+       │                    │
+       └─────────┬──────────┘
+                 │
+          running process
+                 │
+source edit ─► candidate object ─► ORC/JITLink ─► staged generation
+                                                   │
+                                      compatibility + resolution
+                                                   │
+                                                   ▼
+                                      atomic dispatch publication
+```
+
+This preserves native startup, existing static/dynamic-library integration,
+debugger behavior, operating-system resources, and the project's linker model.
+ORC supplies the patch-object linker, symbol namespaces, resource tracking, and
+process/library symbol reflection; it is not the application runtime model.
+
+## Compiler-service boundary
+
+CVite ships and tests a version-matched Clang/LLVM toolchain boundary. It must not
+silently load a binary plugin into an arbitrary incompatible system compiler.
+There are two compiler-side stages:
+
+1. **Semantic indexing.** The bootstrap implementation uses libclang's stable C
+   API to obtain Clang USRs, canonical types, target layouts, source locations,
+   dependencies, and diagnostics. If the stable API proves insufficient for a
+   required feature, a version-matched LibTooling frontend action can enrich the
+   same manifest without changing the product boundary.
+2. **IR transformation and ABI extraction.** A version-matched LLVM pass creates
+   stable call entries, versioned implementations, persistent-storage symbols,
+   and machine-accurate ABI fingerprints after Clang code generation.
+
+The semantic manifest's `semantic_fingerprint` is useful for dependency and
+schema comparison but is deliberately not called an ABI fingerprint. The final
+ABI gate must include the lowered LLVM function type, calling convention,
+parameter/return attributes, data layout, target triple, and CVite ABI-schema
+version.
+
+Compiler work runs outside the application process. A syntax error, compiler
+crash, or malformed candidate cannot destroy the active generation.
+
+## Stable function identity
 
 Each refreshable function has two identities:
 
-- a stable callable entry whose address never changes;
-- a versioned implementation that may be added for each successful build.
+- a stable callable entry whose address never changes during the process;
+- a versioned implementation supplied by the baseline or a later patch.
 
-The LLVM transform rewrites function definitions into versioned implementation
-symbols. Calls and function-address expressions resolve to stable entries. A
-runtime-owned immutable dispatch table maps stable function slots to the active
-implementations.
+Conceptually:
 
-A patch is published by creating a complete new dispatch table and replacing one
-atomic root pointer. Readers therefore observe either the old table or the new
-table, never a partially updated set. Old code and old dispatch snapshots remain
-alive until a later epoch/quiescence mechanism proves they can be reclaimed.
+```text
+foo                    stable public address
+  └─ dispatch slot 17
+       ├─ generation 5 ─► foo.__cvite_impl.5
+       └─ generation 6 ─► foo.__cvite_impl.6
+```
 
-The M0 runtime in this repository implements that transaction model without the
-ORC object layer. It is the host-side contract the compiler pipeline will target.
+The LLVM transform splits original definitions into stable entries and versioned
+implementations. Direct calls and function-address expressions resolve to the
+stable entry. Function pointers passed to uninstrumented libraries therefore
+retain identity across compatible refreshes.
 
-## Semantic manifests
+Inlining across a refresh boundary is disabled initially. Later optimized
+development builds may record inlining dependencies and rebuild every affected
+caller before publication.
 
-Clang owns all source-language interpretation. The semantic manifest contains
-stable 128-bit identities and fingerprints for:
+## Transactional dispatch
 
-- functions and their target ABI;
-- globals, internal-linkage globals, and static locals;
-- record, union, and enum layouts;
-- fields and layout-relevant attributes;
-- translation-unit and header dependencies;
-- implementation symbols and required external symbols.
+A patch never mutates function slots one by one. It builds an immutable dispatch
+snapshot, validates the complete candidate, and publishes one atomic root
+pointer. The M0 runtime implements this contract now.
 
-Stable IDs must derive from canonical declaration identity, project identity,
-target triple, and CVite schema version. Source line numbers alone are not stable
-enough. The exact hash algorithm and canonical serialization are protocol
-choices, not C parsing.
+A thread can pin one snapshot for an outermost refreshable call chain. Nested
+calls then remain on one generation even if publication occurs concurrently.
+Generation pinning and epoch-based reclamation are later runtime work; M0
+conservatively retains old snapshots and code.
+
+## Patch staging
+
+A candidate generation is publishable only after all of these steps succeed:
+
+1. compile every invalidated translation unit;
+2. build semantic and lowered-ABI manifests;
+3. compare declarations, storage layouts, and dependencies;
+4. add candidate objects to an isolated ORC resource tracker;
+5. resolve all stable application and external-library symbols;
+6. run link-time validation and finalize executable memory;
+7. construct the complete dispatch snapshot;
+8. publish the snapshot with one release operation.
+
+Failure before step 8 removes or abandons the staged resources and leaves the
+last known-good generation active.
+
+## Symbol resolution
+
+The baseline transform records addresses for stable entries and persistent data.
+The runtime defines these for ORC as explicit absolute symbols. Exported process
+and dynamic-library symbols may be exposed through a filtered dynamic-library
+search generator. Internal application symbols are never assumed to be visible
+through the platform dynamic symbol table; CVite registers them from its own
+manifest.
+
+This also gives the runtime a place to enforce symbol policy rather than exposing
+every process symbol to candidate code by default.
 
 ## Persistent storage
 
-The LLVM transform externalizes refresh-persistent globals and statics. The host
-allocates their storage once and defines stable symbols at those addresses. A
-compatible refresh reuses storage and does not rerun initializers.
+Global variables, internal-linkage globals, and static locals have stable storage
+identities. The baseline owns or registers their initial addresses. Candidate
+code resolves those same identities and does not rerun initializers during a
+compatible body refresh.
 
-M0 accepts only exact layout fingerprints. Future append-only or explicit
-migrations must pass a compatibility proof before publication. Heap objects are
-naturally preserved while their layouts stay unchanged. CVite rejects uncertain
-layout-changing refreshes rather than attempting universal pointer relocation.
+M0 accepts only exact storage-layout fingerprints. A changed initializer does
+not overwrite live state. A changed size, alignment, field layout, TLS model, or
+other storage contract rejects the refresh until a migration strategy can be
+proved safe.
 
-## Compiler failures
+Ordinary heap allocations survive because the process does not restart. Layout
+changes that may describe live heap objects are rejected in the first releases.
+Transparent allocation/pointer analysis may later permit narrower decisions, but
+universal relocation of arbitrary C pointer graphs is not a prerequisite and is
+not promised.
 
-Compilation occurs out of process. A compiler diagnostic or worker crash cannot
-invalidate the running generation. Only a complete patch that passes protocol,
-symbol-resolution, and compatibility checks becomes publishable.
+## Stable identities and collision handling
 
-## Native runtime failures
+Semantic entities use versioned 128-bit IDs derived from Clang USRs plus project
+and source identity where linkage requires it. The bootstrap hash is explicitly
+non-cryptographic. Manifests retain the complete canonical identity input, and a
+single generation must reject two different identities that map to one ID.
 
-React can recover many render errors because it controls component execution.
-Unrestricted C may corrupt process memory or receive a fatal signal. CVite's
-first releases do not claim transparent recovery from arbitrary native faults.
-The development server can supervise and restart the host, and later versions
-may add optional checkpoints, but compile-time last-known-good behavior is the
-initial guarantee.
+A future hash change increments the manifest/identity schema. Stable source DX
+does not depend on a particular hashing algorithm.
+
+## Error behavior
+
+### Candidate compile or link errors
+
+The running process keeps executing the previous generation. Diagnostics are
+reported by the development server. Fixing the source produces a new candidate;
+there is no need to restart merely because an intermediate edit did not compile.
+
+### Native runtime faults
+
+React can recover many render exceptions because React controls component
+execution. Unrestricted C can corrupt memory or receive a fatal signal. CVite's
+initial contract does not claim transparent recovery from arbitrary native
+faults. The development server may supervise and restart the host, and later
+versions may add optional checkpoints, but this is distinct from compile-time
+last-known-good behavior.
+
+## Current vertical slice
+
+The repository currently contains:
+
+- a runtime registry for stable function and storage IDs;
+- exact ABI/layout compatibility gates;
+- immutable generation snapshots and atomic publication;
+- a versioned binary patch-envelope parser;
+- concurrency, transaction, protocol, and state-preservation tests;
+- an opt-in `cvite-manifest` semantic indexer backed by libclang.
+
+The next execution milestone is an LLVM pass that emits baseline stable entries
+and versioned implementations, followed by an in-process ORC patch loader.
