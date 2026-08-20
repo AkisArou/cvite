@@ -50,11 +50,6 @@ NativeTargetState &nativeTargetState()
         if (llvm::InitializeNativeTargetAsmPrinter()) {
             target.failed = true;
             target.message = "LLVM could not initialize the native assembly printer";
-            return;
-        }
-        if (llvm::InitializeNativeTargetAsmParser()) {
-            target.failed = true;
-            target.message = "LLVM could not initialize the native assembly parser";
         }
     });
 
