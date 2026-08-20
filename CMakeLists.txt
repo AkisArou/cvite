@@ -105,7 +105,13 @@ if(CVITE_BUILD_LLVM_PASS)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
     set(CMAKE_CXX_EXTENSIONS OFF)
 
-    find_package(LLVM 18 REQUIRED CONFIG)
+    find_package(LLVM REQUIRED CONFIG)
+    if(LLVM_PACKAGE_VERSION VERSION_LESS 18 OR
+       LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL 19)
+        message(FATAL_ERROR
+            "CVITE_BUILD_LLVM_PASS currently requires LLVM 18.x; "
+            "found ${LLVM_PACKAGE_VERSION}.")
+    endif()
     list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
     include(AddLLVM)
 
