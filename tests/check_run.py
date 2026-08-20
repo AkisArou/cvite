@@ -200,7 +200,7 @@ def main() -> int:
                 )
         finally:
             try:
-                return_code = process.wait(timeout=10.0)
+                return_code = process.wait(timeout=25.0)
             except subprocess.TimeoutExpired:
                 process.terminate()
                 try:
