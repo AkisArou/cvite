@@ -190,8 +190,9 @@ The repository currently contains:
 - a versioned binary patch-envelope parser;
 - concurrency, transaction, protocol, and state-preservation tests;
 - an opt-in `cvite-manifest` semantic indexer backed by libclang;
-- an LLVM 18 lowering pass that emits machine-facing ABI fingerprints and protects refresh boundaries from inlining.
+- an LLVM 18 lowering pass that emits machine-facing ABI fingerprints and protects refresh boundaries from inlining;
+- an ORC/JITLink candidate loader with isolated generation namespaces, explicit host-symbol reflection, resource tracking, and a live object-to-runtime integration test.
 
 The next execution milestone is extending the LLVM pass to emit baseline stable
-entries and versioned implementations, followed by an in-process ORC patch
-loader.
+entries and versioned implementations, then connecting those descriptors to the
+existing loader and runtime automatically.

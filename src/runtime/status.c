@@ -27,6 +27,10 @@ const char *cvite_status_string(cvite_status status)
         return "unsupported protocol";
     case CVITE_STATUS_CHECKSUM_MISMATCH:
         return "checksum mismatch";
+    case CVITE_STATUS_IO_ERROR:
+        return "I/O error";
+    case CVITE_STATUS_LINK_ERROR:
+        return "link error";
     case CVITE_STATUS_NOT_IMPLEMENTED:
         return "not implemented";
     }

@@ -89,6 +89,7 @@ jobs:
           -DCMAKE_CXX_COMPILER=clang++-18
           -DCVITE_BUILD_COMPILER=ON
           -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
           -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
           -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
           -DCVITE_WARNINGS_AS_ERRORS=ON

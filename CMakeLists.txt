@@ -15,10 +15,31 @@ option(CVITE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(CVITE_BUILD_EXAMPLES "Build CVite examples" ON)
 option(CVITE_BUILD_COMPILER "Build the libclang semantic-manifest tool" OFF)
 option(CVITE_BUILD_LLVM_PASS "Build the version-matched LLVM lowering pass" OFF)
+option(CVITE_BUILD_ORC_LOADER "Build the LLVM ORC/JITLink object loader" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+
+if(CVITE_BUILD_COMPILER OR CVITE_BUILD_LLVM_PASS OR CVITE_BUILD_ORC_LOADER)
+    enable_language(CXX)
+
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
+
+if(CVITE_BUILD_LLVM_PASS OR CVITE_BUILD_ORC_LOADER)
+    find_package(LLVM REQUIRED CONFIG)
+    if(LLVM_PACKAGE_VERSION VERSION_LESS 18 OR
+       LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL 19)
+        message(FATAL_ERROR
+            "CVite's LLVM components currently require LLVM 18.x; "
+            "found ${LLVM_PACKAGE_VERSION}.")
+    endif()
+    list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+    include(AddLLVM)
+endif()
 
 add_library(cvite_runtime STATIC
     src/runtime/runtime_core.c
@@ -44,12 +65,6 @@ target_link_libraries(cvite PRIVATE cvite::runtime)
 cvite_set_warnings(cvite)
 
 if(CVITE_BUILD_COMPILER)
-    enable_language(CXX)
-
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    set(CMAKE_CXX_EXTENSIONS OFF)
-
     set(CVITE_LIBCLANG_ROOT "" CACHE PATH "Optional libclang installation prefix")
     find_path(CVITE_LIBCLANG_INCLUDE_DIR
         NAMES clang-c/Index.h
@@ -99,22 +114,6 @@ if(CVITE_BUILD_COMPILER)
 endif()
 
 if(CVITE_BUILD_LLVM_PASS)
-    enable_language(CXX)
-
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    set(CMAKE_CXX_EXTENSIONS OFF)
-
-    find_package(LLVM REQUIRED CONFIG)
-    if(LLVM_PACKAGE_VERSION VERSION_LESS 18 OR
-       LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL 19)
-        message(FATAL_ERROR
-            "CVITE_BUILD_LLVM_PASS currently requires LLVM 18.x; "
-            "found ${LLVM_PACKAGE_VERSION}.")
-    endif()
-    list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
-    include(AddLLVM)
-
     add_llvm_pass_plugin(CViteLoweringPass
         src/transform/lowering_pass.cpp
     )
@@ -143,6 +142,86 @@ if(CVITE_BUILD_LLVM_PASS)
                 $<TARGET_FILE:CViteLoweringPass>
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/lowering_input.c
                 ${CMAKE_CURRENT_BINARY_DIR}
+        )
+    endif()
+endif()
+
+if(CVITE_BUILD_ORC_LOADER)
+    llvm_map_components_to_libnames(CVITE_ORC_LLVM_LIBS
+        Core
+        JITLink
+        OrcJIT
+        Support
+        nativecodegen
+    )
+
+    add_library(cvite_orc_loader STATIC
+        src/host/orc_loader.cpp
+    )
+    add_library(cvite::orc_loader ALIAS cvite_orc_loader)
+    target_include_directories(cvite_orc_loader
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        SYSTEM PRIVATE
+            ${LLVM_INCLUDE_DIRS}
+    )
+    target_link_libraries(cvite_orc_loader
+        PUBLIC cvite::runtime
+        PRIVATE ${CVITE_ORC_LLVM_LIBS}
+    )
+    cvite_set_warnings(cvite_orc_loader)
+
+    install(TARGETS cvite_orc_loader
+        EXPORT CViteTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+
+    if(BUILD_TESTING)
+        find_program(CVITE_ORC_CLANG_EXECUTABLE
+            NAMES clang-18 clang
+            HINTS ${LLVM_TOOLS_BINARY_DIR}
+            REQUIRED
+        )
+
+        set(CVITE_ORC_TEST_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/orc-test")
+        set(CVITE_ORC_VALID_OBJECT "${CVITE_ORC_TEST_DIRECTORY}/candidate.o")
+        set(CVITE_ORC_BROKEN_OBJECT "${CVITE_ORC_TEST_DIRECTORY}/broken.o")
+        add_custom_command(
+            OUTPUT
+                ${CVITE_ORC_VALID_OBJECT}
+                ${CVITE_ORC_BROKEN_OBJECT}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CVITE_ORC_TEST_DIRECTORY}
+            COMMAND
+                ${CVITE_ORC_CLANG_EXECUTABLE}
+                -std=c11 -O0 -fPIC -c
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/orc_candidate.c
+                -o ${CVITE_ORC_VALID_OBJECT}
+            COMMAND
+                ${CVITE_ORC_CLANG_EXECUTABLE}
+                -std=c11 -O0 -fPIC -c
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/orc_broken_candidate.c
+                -o ${CVITE_ORC_BROKEN_OBJECT}
+            DEPENDS
+                tests/fixtures/orc_candidate.c
+                tests/fixtures/orc_broken_candidate.c
+            VERBATIM
+        )
+        add_custom_target(cvite_orc_test_objects
+            DEPENDS ${CVITE_ORC_VALID_OBJECT} ${CVITE_ORC_BROKEN_OBJECT}
+        )
+
+        add_executable(cvite_test_orc_loader tests/test_orc_loader.c)
+        target_link_libraries(cvite_test_orc_loader PRIVATE cvite::orc_loader)
+        cvite_set_warnings(cvite_test_orc_loader)
+        add_dependencies(cvite_test_orc_loader cvite_orc_test_objects)
+        add_test(
+            NAME orc-loader
+            COMMAND
+                cvite_test_orc_loader
+                ${CVITE_ORC_VALID_OBJECT}
+                ${CVITE_ORC_BROKEN_OBJECT}
         )
     endif()
 endif()
