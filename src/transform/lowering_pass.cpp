@@ -1,3 +1,4 @@
+#include "candidate_pass.h"
 #include "stable_entry_pass.h"
 #include "transform_support.h"
 
@@ -112,6 +113,7 @@ void registerCallbacks(llvm::PassBuilder &builder)
         });
 
     cviteRegisterStableEntryPass(builder);
+    cviteRegisterCandidatePass(builder);
 }
 
 } // namespace

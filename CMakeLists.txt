@@ -129,6 +129,7 @@ if(CVITE_BUILD_LLVM_PASS)
     add_llvm_pass_plugin(CViteLoweringPass
         src/transform/lowering_pass.cpp
         src/transform/stable_entry_pass.cpp
+        src/transform/candidate_pass.cpp
     )
     target_include_directories(CViteLoweringPass SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
     cvite_set_warnings(CViteLoweringPass)
@@ -165,6 +166,17 @@ if(CVITE_BUILD_LLVM_PASS)
                 ${CVITE_OPT_EXECUTABLE}
                 $<TARGET_FILE:CViteLoweringPass>
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/stable_entry_input.c
+                ${CMAKE_CURRENT_BINARY_DIR}
+        )
+        add_test(
+            NAME candidate-pass
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_candidate.py
+                ${CVITE_CLANG_EXECUTABLE}
+                ${CVITE_OPT_EXECUTABLE}
+                $<TARGET_FILE:CViteLoweringPass>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/candidate_input.c
                 ${CMAKE_CURRENT_BINARY_DIR}
         )
     endif()
