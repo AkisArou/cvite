@@ -11,7 +11,9 @@
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 namespace cvite::transform {
@@ -152,9 +154,24 @@ inline std::string storageLayoutSeed(
     return output.str();
 }
 
+inline std::string canonicalHex(const Hash128 &value)
+{
+    char output[33];
+    const int length = std::snprintf(
+        output,
+        sizeof(output),
+        "%016" PRIx64 "%016" PRIx64,
+        value.high,
+        value.low);
+    if (length != 32) {
+        return std::string();
+    }
+    return std::string(output, 32U);
+}
+
 inline std::string storageSymbolName(const Hash128 &identity)
 {
-    return kStorageSymbolPrefix.str() + identity.hex;
+    return kStorageSymbolPrefix.str() + canonicalHex(identity);
 }
 
 inline Hash128 hash128(llvm::StringRef input)

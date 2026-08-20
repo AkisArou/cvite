@@ -15,6 +15,13 @@ def fail(message: str) -> None:
     raise AssertionError(message)
 
 
+def canonical_numeric_id(digest: str) -> str:
+    raw = bytes.fromhex(digest)
+    low = int.from_bytes(raw[:8], "little")
+    high = int.from_bytes(raw[8:], "little")
+    return f"{high:016x}{low:016x}"
+
+
 def run(command: list[str]) -> None:
     completed = subprocess.run(command, text=True, capture_output=True, check=False)
     if completed.returncode != 0:
@@ -97,16 +104,18 @@ def main() -> int:
             fail(f"expected two candidate implementations: {implementations!r}")
 
         storage_symbols = set(re.findall(rf"@__cvite_storage\.({ID})", ir))
-        storage_records = set(
-            re.findall(rf"@__cvite_candidate_storage_name\.({ID})", ir)
-        )
+        storage_records = {
+            canonical_numeric_id(value)
+            for value in re.findall(rf"@__cvite_candidate_storage_name\.({ID})", ir)
+        }
         if len(storage_symbols) != 2:
             fail(f"expected global and static-local storage proxies: {storage_symbols!r}")
         if storage_symbols != storage_records:
             fail("storage manifest records do not match generated proxies")
-        baseline_storage = set(
-            re.findall(rf"@__cvite_baseline_storage_name\.({ID})", baseline_ir)
-        )
+        baseline_storage = {
+            canonical_numeric_id(value)
+            for value in re.findall(rf"@__cvite_baseline_storage_name\.({ID})", baseline_ir)
+        }
         if storage_symbols != baseline_storage:
             fail(
                 "baseline and candidate transforms disagree on stable storage IDs: "
