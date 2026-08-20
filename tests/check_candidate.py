@@ -15,11 +15,43 @@ def fail(message: str) -> None:
     raise AssertionError(message)
 
 
-def canonical_numeric_id(digest: str) -> str:
+def canonical_numeric_words(digest: str) -> tuple[int, int]:
     raw = bytes.fromhex(digest)
     low = int.from_bytes(raw[:8], "little")
     high = int.from_bytes(raw[8:], "little")
+    return high, low
+
+
+def canonical_numeric_id(digest: str) -> str:
+    high, low = canonical_numeric_words(digest)
     return f"{high:016x}{low:016x}"
+
+
+def llvm_i64_pattern(value: int) -> str:
+    signed = value if value < (1 << 63) else value - (1 << 64)
+    if signed == value:
+        return str(value)
+    return rf"(?:{value}|{signed})"
+
+
+def assert_numeric_function_record(
+    ir: str,
+    digest: str,
+    implementation_prefix: str,
+    description: str,
+) -> None:
+    high, low = canonical_numeric_words(digest)
+    pattern = re.compile(
+        rf"\{{\s*i64\s+{llvm_i64_pattern(high)},\s*"
+        rf"i64\s+{llvm_i64_pattern(low)},.*?"
+        rf"@{re.escape(implementation_prefix)}\.{digest}",
+        re.DOTALL,
+    )
+    if pattern.search(ir) is None:
+        fail(
+            f"{description} manifest does not encode the numeric ID "
+            f"for {digest} in MD5 word order"
+        )
 
 
 def run(command: list[str]) -> None:
@@ -102,6 +134,31 @@ def main() -> int:
         implementations = re.findall(rf"@__cvite_patch\.({ID})", ir)
         if len(set(implementations)) != 2:
             fail(f"expected two candidate implementations: {implementations!r}")
+
+        baseline_function_ids = set(
+            re.findall(rf"@__cvite_baseline_name\.({ID})", baseline_ir)
+        )
+        candidate_function_ids = set(
+            re.findall(rf"@__cvite_candidate_name\.({ID})", ir)
+        )
+        if baseline_function_ids != candidate_function_ids:
+            fail(
+                "baseline and candidate transforms disagree on function identities: "
+                f"{baseline_function_ids!r} != {candidate_function_ids!r}"
+            )
+        for digest in baseline_function_ids:
+            assert_numeric_function_record(
+                baseline_ir,
+                digest,
+                "__cvite_impl",
+                "baseline",
+            )
+            assert_numeric_function_record(
+                ir,
+                digest,
+                "__cvite_patch",
+                "candidate",
+            )
 
         storage_symbols = set(re.findall(rf"@__cvite_storage\.({ID})", ir))
         storage_records = {
