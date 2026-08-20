@@ -6,55 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply-scoped-patch:
-    name: Apply scoped implementation patch
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'bootstrap/m0-runtime'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 0
-
-      - name: Apply patch when staged
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive=.cvite/compile-db-patch.tar.gz.b64
-          if [[ ! -f "$archive" ]]; then
-            echo "No staged patch."
-            exit 0
-          fi
-
-          cp -- "$archive" /tmp/cvite-compile-db-patch.tar.gz
-          echo "a9d1432a8064c56e4f4200d2da092c6e3e8fc2a72b94a1216ea2e582ab34fe4e  /tmp/cvite-compile-db-patch.tar.gz" | sha256sum --check
-          tar -xzf /tmp/cvite-compile-db-patch.tar.gz -C .
-          rm -- "$archive"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- \
-            CMakeLists.txt \
-            docs/dev-server.md \
-            src/cli/compile_database.c \
-            src/cli/run.c \
-            src/cli/run_internal.h \
-            src/cli/toolchain.c \
-            src/cli/watcher.c \
-            src/cli/watch_dependencies.inc \
-            tests/check_run.py \
-            tests/fixtures/run_app.c \
-            .cvite/compile-db-patch.tar.gz.b64
-          git diff --cached --check
-          git commit -m "feat: ingest compile_commands for live builds"
-          git push origin HEAD:bootstrap/m0-runtime
-
   build:
     name: ${{ matrix.compiler }}
     runs-on: ubuntu-latest
