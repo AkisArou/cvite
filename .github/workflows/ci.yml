@@ -32,7 +32,7 @@ jobs:
             exit 0
           fi
 
-          base64 --decode "$archive" > /tmp/cvite-compile-db-patch.tar.gz
+          cp -- "$archive" /tmp/cvite-compile-db-patch.tar.gz
           echo "a9d1432a8064c56e4f4200d2da092c6e3e8fc2a72b94a1216ea2e582ab34fe4e  /tmp/cvite-compile-db-patch.tar.gz" | sha256sum --check
           tar -xzf /tmp/cvite-compile-db-patch.tar.gz -C .
           rm -- "$archive"
