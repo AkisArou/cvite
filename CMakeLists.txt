@@ -163,8 +163,9 @@ if(CVITE_BUILD_ORC_LOADER)
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        SYSTEM PRIVATE
-            ${LLVM_INCLUDE_DIRS}
+    )
+    target_include_directories(cvite_orc_loader SYSTEM PRIVATE
+        ${LLVM_INCLUDE_DIRS}
     )
     target_link_libraries(cvite_orc_loader
         PUBLIC cvite::runtime
