@@ -97,7 +97,7 @@ def main() -> int:
         second_refresh_behavior = False
         old_code_after_error = False
         dynamic_graph_seen = False
-        deadline = time.monotonic() + 40.0
+        deadline = time.monotonic() + 50.0
 
         try:
             while time.monotonic() < deadline:

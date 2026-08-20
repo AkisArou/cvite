@@ -20,7 +20,7 @@ int main(int argc, char **argv)
 
     (void)argc;
     (void)argv;
-    for (iteration = 0; iteration < 350; ++iteration) {
+    for (iteration = 0; iteration < 600; ++iteration) {
         (void)printf("value=%d\n", step());
         (void)fflush(stdout);
         (void)nanosleep(&pause, NULL);
