@@ -189,7 +189,9 @@ The repository currently contains:
 - immutable generation snapshots and atomic publication;
 - a versioned binary patch-envelope parser;
 - concurrency, transaction, protocol, and state-preservation tests;
-- an opt-in `cvite-manifest` semantic indexer backed by libclang.
+- an opt-in `cvite-manifest` semantic indexer backed by libclang;
+- an LLVM 18 lowering pass that emits machine-facing ABI fingerprints and protects refresh boundaries from inlining.
 
-The next execution milestone is an LLVM pass that emits baseline stable entries
-and versioned implementations, followed by an in-process ORC patch loader.
+The next execution milestone is extending the LLVM pass to emit baseline stable
+entries and versioned implementations, followed by an in-process ORC patch
+loader.

@@ -14,6 +14,7 @@ include(cmake/CViteWarnings.cmake)
 option(CVITE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(CVITE_BUILD_EXAMPLES "Build CVite examples" ON)
 option(CVITE_BUILD_COMPILER "Build the libclang semantic-manifest tool" OFF)
+option(CVITE_BUILD_LLVM_PASS "Build the version-matched LLVM lowering pass" OFF)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -93,6 +94,48 @@ if(CVITE_BUILD_COMPILER)
                 $<TARGET_FILE:cvite_manifest>
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/manifest_input.c
                 ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+    endif()
+endif()
+
+if(CVITE_BUILD_LLVM_PASS)
+    enable_language(CXX)
+
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+
+    find_package(LLVM 18 REQUIRED CONFIG)
+    list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+    include(AddLLVM)
+
+    add_llvm_pass_plugin(CViteLoweringPass
+        src/transform/lowering_pass.cpp
+    )
+    cvite_set_warnings(CViteLoweringPass)
+
+    if(BUILD_TESTING)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        find_program(CVITE_CLANG_EXECUTABLE
+            NAMES clang-18 clang
+            HINTS ${LLVM_TOOLS_BINARY_DIR}
+            REQUIRED
+        )
+        find_program(CVITE_OPT_EXECUTABLE
+            NAMES opt-18 opt
+            HINTS ${LLVM_TOOLS_BINARY_DIR}
+            REQUIRED
+        )
+        add_test(
+            NAME lowering-pass
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_lowering.py
+                ${CVITE_CLANG_EXECUTABLE}
+                ${CVITE_OPT_EXECUTABLE}
+                $<TARGET_FILE:CViteLoweringPass>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/lowering_input.c
+                ${CMAKE_CURRENT_BINARY_DIR}
         )
     endif()
 endif()

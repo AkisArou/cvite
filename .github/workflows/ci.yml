@@ -64,8 +64,8 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-sanitize --output-on-failure
 
-  semantic-manifest:
-    name: libclang semantic manifest
+  compiler-pipeline:
+    name: Clang/LLVM compiler pipeline
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -76,6 +76,8 @@ jobs:
           sudo apt-get install -y
           ninja-build
           clang-18
+          llvm-18
+          llvm-18-dev
           libclang-18-dev
           python3
 
@@ -86,7 +88,9 @@ jobs:
           -DCMAKE_C_COMPILER=clang-18
           -DCMAKE_CXX_COMPILER=clang++-18
           -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
           -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
           -DCVITE_WARNINGS_AS_ERRORS=ON
 
       - name: Build
