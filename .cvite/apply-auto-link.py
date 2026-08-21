@@ -1384,6 +1384,10 @@ run_header = ROOT / "src/cli/run_internal.h"
 run_header_text = run_header.read_text(encoding="utf-8")
 if "cvite_native_link_prepare" not in run_header_text:
     insertion = r'''
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 int cvite_native_link_prepare(
     cvite_orc_loader *loader,
     const char *source_path,
@@ -1398,6 +1402,10 @@ int cvite_native_link_poll(
     cvite_orc_loader *loader,
     const char *source_path,
     const char *clang_path);
+
+#ifdef __cplusplus
+}
+#endif
 
 '''
     insert_before_last("src/cli/run_internal.h", "#endif", insertion)
