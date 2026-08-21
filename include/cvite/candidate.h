@@ -13,14 +13,17 @@ extern "C" {
  * Internal compiler/loader ABI. A candidate object emits exactly one manifest
  * with this symbol. Ordinary application source never includes this header.
  */
-#define CVITE_CANDIDATE_MANIFEST_SCHEMA UINT64_C(2)
+#define CVITE_CANDIDATE_MANIFEST_SCHEMA UINT64_C(3)
 #define CVITE_CANDIDATE_MANIFEST_SYMBOL "__cvite_candidate_manifest"
+#define CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES UINT64_C(1)
 
 typedef struct cvite_candidate_function {
     uint64_t id_high;
     uint64_t id_low;
     uint64_t abi_high;
     uint64_t abi_low;
+    uint64_t implementation_high;
+    uint64_t implementation_low;
     cvite_function_pointer target;
     const char *debug_name;
 } cvite_candidate_function;
@@ -37,6 +40,7 @@ typedef struct cvite_candidate_storage {
 
 typedef struct cvite_candidate_manifest {
     uint64_t schema;
+    uint64_t flags;
     uint64_t function_count;
     const cvite_candidate_function *functions;
     uint64_t storage_count;

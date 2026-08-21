@@ -1,4 +1,5 @@
 #include "candidate_pass.h"
+#include "cvite/candidate.h"
 #include "transform_support.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -27,18 +28,22 @@ constexpr llvm::StringLiteral kPassName = "cvite-candidate";
 constexpr llvm::StringLiteral kCandidateFlag = "cvite.candidate.schema";
 constexpr llvm::StringLiteral kBaselineFlag = "cvite.baseline.schema";
 constexpr llvm::StringLiteral kTargetFor = "__cvite_host_target_for";
+constexpr llvm::StringLiteral kCallEnter = "__cvite_host_call_enter";
+constexpr llvm::StringLiteral kCallLeave = "__cvite_host_call_leave";
 constexpr llvm::StringLiteral kManifestSymbol = "__cvite_candidate_manifest";
 constexpr llvm::StringLiteral kFunctionRecordsSymbol =
     "__cvite_candidate_records";
 constexpr llvm::StringLiteral kStorageRecordsSymbol =
     "__cvite_candidate_storage_records";
-constexpr unsigned kCandidateSchema = 2U;
+constexpr unsigned kCandidateSchema = 3U;
 
 struct CandidateFunction final {
     llvm::Function *implementation = nullptr;
     llvm::Function *entry = nullptr;
     Hash128 identity;
     Hash128 abi;
+    Hash128 implementation_fingerprint;
+    bool entry_address_escapes = false;
     std::string debug_name;
 };
 
@@ -55,6 +60,25 @@ bool hasBlockAddressUse(const llvm::Function &function)
 {
     for (const llvm::User *user : function.users()) {
         if (llvm::isa<llvm::BlockAddress>(user)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isDirectCallUse(
+    const llvm::User &user,
+    const llvm::Function &function)
+{
+    const auto *call = llvm::dyn_cast<llvm::CallBase>(&user);
+    return call != nullptr &&
+        call->getCalledOperand()->stripPointerCasts() == &function;
+}
+
+bool hasAddressEscape(const llvm::Function &function)
+{
+    for (const llvm::User *user : function.users()) {
+        if (user == nullptr || !isDirectCallUse(*user, function)) {
             return true;
         }
     }
@@ -92,6 +116,15 @@ llvm::AttributeList abiAttributes(const llvm::Function &function)
         llvm::AttributeSet(),
         source.getRetAttrs(),
         argument_attributes);
+}
+
+llvm::FunctionCallee getCallScopeFunction(
+    llvm::Module &module,
+    llvm::StringRef name)
+{
+    llvm::FunctionType *type = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(module.getContext()), false);
+    return module.getOrInsertFunction(name, type);
 }
 
 llvm::FunctionCallee getTargetFunction(llvm::Module &module)
@@ -214,6 +247,9 @@ CandidateFunction transformFunction(
         cvite::transform::identitySeed(module, function, original_name));
     const Hash128 abi = cvite::transform::hash128(
         cvite::transform::abiSeed(module, function));
+    const Hash128 implementation_fingerprint = cvite::transform::hash128(
+        cvite::transform::implementationSeed(function));
+    const bool entry_address_escapes = hasAddressEscape(function);
     const llvm::GlobalValue::LinkageTypes original_linkage = function.getLinkage();
     const llvm::GlobalValue::VisibilityTypes original_visibility =
         function.getVisibility();
@@ -269,6 +305,7 @@ CandidateFunction transformFunction(
     llvm::BasicBlock *entry_block =
         llvm::BasicBlock::Create(context, "entry", entry);
     llvm::IRBuilder<> builder(entry_block);
+    builder.CreateCall(getCallScopeFunction(module, kCallEnter));
     llvm::CallInst *target = builder.CreateCall(
         getTargetFunction(module),
         {
@@ -289,7 +326,7 @@ CandidateFunction transformFunction(
         function.getFunctionType(), target, arguments);
     call->setCallingConv(function.getCallingConv());
     call->setAttributes(call_attributes);
-    call->setTailCallKind(llvm::CallInst::TCK_Tail);
+    builder.CreateCall(getCallScopeFunction(module, kCallLeave));
     if (function.getReturnType()->isVoidTy()) {
         builder.CreateRetVoid();
     } else {
@@ -298,7 +335,17 @@ CandidateFunction transformFunction(
 
     setRefreshMetadata(function, identity, abi);
     setRefreshMetadata(*entry, identity, abi);
-    return {&function, entry, identity, abi, original_name};
+    cvite::transform::setImplementationMetadata(
+        function, implementation_fingerprint);
+    return {
+        &function,
+        entry,
+        identity,
+        abi,
+        implementation_fingerprint,
+        entry_address_escapes,
+        original_name,
+    };
 }
 
 llvm::GlobalVariable *createDebugName(
@@ -330,7 +377,7 @@ llvm::GlobalVariable *createFunctionRecords(
     llvm::Type *pointer = llvm::PointerType::getUnqual(context);
     llvm::StructType *record_type = llvm::StructType::get(
         context,
-        {i64, i64, i64, i64, pointer, pointer},
+        {i64, i64, i64, i64, i64, i64, pointer, pointer},
         false);
 
     llvm::SmallVector<llvm::Constant *, 32> records;
@@ -348,6 +395,10 @@ llvm::GlobalVariable *createFunctionRecords(
                 llvm::ConstantInt::get(i64, function.identity.low),
                 llvm::ConstantInt::get(i64, function.abi.high),
                 llvm::ConstantInt::get(i64, function.abi.low),
+                llvm::ConstantInt::get(
+                    i64, function.implementation_fingerprint.high),
+                llvm::ConstantInt::get(
+                    i64, function.implementation_fingerprint.low),
                 function.implementation,
                 debug_name,
             }));
@@ -425,12 +476,20 @@ void createManifest(
     llvm::GlobalVariable *storage_records =
         createStorageRecords(module, storages);
 
+    std::uint64_t flags = 0U;
+    for (const CandidateFunction &function : functions) {
+        if (function.entry_address_escapes) {
+            flags |= CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES;
+        }
+    }
+
     llvm::StructType *manifest_type = llvm::StructType::get(
-        context, {i64, i64, pointer, i64, pointer}, false);
+        context, {i64, i64, i64, pointer, i64, pointer}, false);
     llvm::Constant *manifest_initializer = llvm::ConstantStruct::get(
         manifest_type,
         {
             llvm::ConstantInt::get(i64, kCandidateSchema),
+            llvm::ConstantInt::get(i64, flags),
             llvm::ConstantInt::get(
                 i64, static_cast<std::uint64_t>(functions.size())),
             function_records,

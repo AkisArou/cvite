@@ -1,6 +1,7 @@
 #ifndef CVITE_HOST_H
 #define CVITE_HOST_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -66,6 +67,9 @@ void *__cvite_host_register_storage(
     void *address,
     const char *debug_name);
 
+void __cvite_host_call_enter(void);
+void __cvite_host_call_leave(void);
+
 cvite_function_pointer __cvite_host_target_at(uint64_t slot);
 
 cvite_function_pointer __cvite_host_target_for(
@@ -100,6 +104,11 @@ cvite_status cvite_host_apply_patch(
     cvite_error *error);
 
 uint64_t cvite_host_generation(void);
+
+/* Internal stop-the-world gate used only while retired JIT code is removed. */
+bool cvite_host_try_begin_quiescence(void);
+void cvite_host_end_quiescence(void);
+uint64_t cvite_host_active_call_count(void);
 
 #ifdef __cplusplus
 }

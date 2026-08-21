@@ -142,6 +142,7 @@ if(CVITE_BUILD_LLVM_PASS)
         src/transform/candidate_pass.cpp
     )
     target_include_directories(CViteLoweringPass SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+    target_include_directories(CViteLoweringPass PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     cvite_set_warnings(CViteLoweringPass)
     install(TARGETS CViteLoweringPass
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/cvite
@@ -354,13 +355,7 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
     add_custom_target(cvite_stable_entry_test_objects
         DEPENDS ${CVITE_STABLE_BASELINE_OBJECT} ${CVITE_STABLE_CANDIDATE_OBJECT}
     )
-    set_source_files_properties(${CVITE_STABLE_BASELINE_OBJECT}
-        PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE
-    )
-    add_executable(cvite_test_stable_entry
-        tests/test_stable_entry.c
-        ${CVITE_STABLE_BASELINE_OBJECT}
-    )
+    add_executable(cvite_test_stable_entry tests/test_stable_entry.c)
     target_link_libraries(cvite_test_stable_entry PRIVATE
         cvite::host
         cvite::orc_loader
@@ -369,7 +364,114 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
     add_dependencies(cvite_test_stable_entry cvite_stable_entry_test_objects)
     add_test(
         NAME stable-entry-e2e
-        COMMAND cvite_test_stable_entry ${CVITE_STABLE_CANDIDATE_OBJECT}
+        COMMAND
+            cvite_test_stable_entry
+            ${CVITE_STABLE_BASELINE_OBJECT}
+            ${CVITE_STABLE_CANDIDATE_OBJECT}
+    )
+
+    set(CVITE_FILTER_TEST_DIRECTORY
+        "${CMAKE_CURRENT_BINARY_DIR}/candidate-filter-test")
+    set(CVITE_FILTER_BASELINE_RAW_IR
+        "${CVITE_FILTER_TEST_DIRECTORY}/baseline.raw.ll")
+    set(CVITE_FILTER_BASELINE_IR
+        "${CVITE_FILTER_TEST_DIRECTORY}/baseline.ll")
+    set(CVITE_FILTER_BASELINE_OBJECT
+        "${CVITE_FILTER_TEST_DIRECTORY}/baseline.o")
+    set(CVITE_FILTER_CANDIDATE_ONE_RAW_IR
+        "${CVITE_FILTER_TEST_DIRECTORY}/candidate-one.raw.ll")
+    set(CVITE_FILTER_CANDIDATE_ONE_IR
+        "${CVITE_FILTER_TEST_DIRECTORY}/candidate-one.ll")
+    set(CVITE_FILTER_CANDIDATE_ONE_OBJECT
+        "${CVITE_FILTER_TEST_DIRECTORY}/candidate-one.o")
+    set(CVITE_FILTER_CANDIDATE_TWO_RAW_IR
+        "${CVITE_FILTER_TEST_DIRECTORY}/candidate-two.raw.ll")
+    set(CVITE_FILTER_CANDIDATE_TWO_IR
+        "${CVITE_FILTER_TEST_DIRECTORY}/candidate-two.ll")
+    set(CVITE_FILTER_CANDIDATE_TWO_OBJECT
+        "${CVITE_FILTER_TEST_DIRECTORY}/candidate-two.o")
+
+    add_custom_command(
+        OUTPUT
+            ${CVITE_FILTER_BASELINE_OBJECT}
+            ${CVITE_FILTER_CANDIDATE_ONE_OBJECT}
+            ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CVITE_FILTER_TEST_DIRECTORY}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -std=c11 -O0 -S -emit-llvm
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/filter_baseline.c
+            -o ${CVITE_FILTER_BASELINE_RAW_IR}
+        COMMAND
+            ${CVITE_OPT_EXECUTABLE}
+            -load-pass-plugin=$<TARGET_FILE:CViteLoweringPass>
+            -passes=cvite-lowering,cvite-baseline,cvite-baseline-manifest,verify
+            -S ${CVITE_FILTER_BASELINE_RAW_IR}
+            -o ${CVITE_FILTER_BASELINE_IR}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -O0 -fPIC -c ${CVITE_FILTER_BASELINE_IR}
+            -o ${CVITE_FILTER_BASELINE_OBJECT}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -std=c11 -O0 -S -emit-llvm
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/filter_candidate_one.c
+            -o ${CVITE_FILTER_CANDIDATE_ONE_RAW_IR}
+        COMMAND
+            ${CVITE_OPT_EXECUTABLE}
+            -load-pass-plugin=$<TARGET_FILE:CViteLoweringPass>
+            -passes=cvite-lowering,cvite-candidate,verify
+            -S ${CVITE_FILTER_CANDIDATE_ONE_RAW_IR}
+            -o ${CVITE_FILTER_CANDIDATE_ONE_IR}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -O0 -fPIC -c ${CVITE_FILTER_CANDIDATE_ONE_IR}
+            -o ${CVITE_FILTER_CANDIDATE_ONE_OBJECT}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -std=c11 -O0 -S -emit-llvm
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/filter_candidate_two.c
+            -o ${CVITE_FILTER_CANDIDATE_TWO_RAW_IR}
+        COMMAND
+            ${CVITE_OPT_EXECUTABLE}
+            -load-pass-plugin=$<TARGET_FILE:CViteLoweringPass>
+            -passes=cvite-lowering,cvite-candidate,verify
+            -S ${CVITE_FILTER_CANDIDATE_TWO_RAW_IR}
+            -o ${CVITE_FILTER_CANDIDATE_TWO_IR}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -O0 -fPIC -c ${CVITE_FILTER_CANDIDATE_TWO_IR}
+            -o ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
+        DEPENDS
+            CViteLoweringPass
+            tests/fixtures/filter_baseline.c
+            tests/fixtures/filter_candidate_one.c
+            tests/fixtures/filter_candidate_two.c
+        VERBATIM
+    )
+    add_custom_target(cvite_candidate_filter_test_objects
+        DEPENDS
+            ${CVITE_FILTER_BASELINE_OBJECT}
+            ${CVITE_FILTER_CANDIDATE_ONE_OBJECT}
+            ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
+    )
+    add_executable(cvite_test_candidate_filter tests/test_candidate_filter.c)
+    target_link_libraries(cvite_test_candidate_filter PRIVATE
+        cvite::host
+        cvite::orc_loader
+    )
+    cvite_set_warnings(cvite_test_candidate_filter)
+    add_dependencies(
+        cvite_test_candidate_filter
+        cvite_candidate_filter_test_objects
+    )
+    add_test(
+        NAME candidate-filter-and-reclaim
+        COMMAND
+            cvite_test_candidate_filter
+            ${CVITE_FILTER_BASELINE_OBJECT}
+            ${CVITE_FILTER_CANDIDATE_ONE_OBJECT}
+            ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
     )
 
     set(CVITE_BASELINE_LOADER_DIRECTORY

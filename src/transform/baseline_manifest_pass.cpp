@@ -31,13 +31,14 @@ constexpr llvm::StringLiteral kFunctionRecordsSymbol =
 constexpr llvm::StringLiteral kStorageRecordsSymbol =
     "__cvite_baseline_storage_records";
 constexpr llvm::StringLiteral kProgramMainSymbol = "__cvite_program_main";
-constexpr unsigned kManifestSchema = 2U;
+constexpr unsigned kManifestSchema = 3U;
 
 struct BaselineFunction final {
     llvm::Function *implementation = nullptr;
     llvm::GlobalVariable *slot = nullptr;
     Hash128 identity;
     Hash128 abi;
+    Hash128 implementation_fingerprint;
     std::string debug_name;
 };
 
@@ -74,6 +75,47 @@ bool parseHash(llvm::StringRef hex, Hash128 &hash)
     }
 
     hash = Hash128{words[1], words[0], hex.str()};
+    return true;
+}
+
+bool extractImplementationFingerprint(
+    llvm::Module &module,
+    llvm::Function &implementation,
+    Hash128 &fingerprint)
+{
+    llvm::MDNode *metadata = implementation.getMetadata(
+        cvite::transform::kImplementationMetadata);
+    if (metadata == nullptr || metadata->getNumOperands() < 4U) {
+        module.getContext().emitError(
+            "CVite implementation is missing its change fingerprint");
+        return false;
+    }
+
+    const auto *schema = llvm::dyn_cast<llvm::MDString>(
+        metadata->getOperand(1U).get());
+    const auto *high_metadata = llvm::dyn_cast<llvm::ConstantAsMetadata>(
+        metadata->getOperand(2U).get());
+    const auto *low_metadata = llvm::dyn_cast<llvm::ConstantAsMetadata>(
+        metadata->getOperand(3U).get());
+    const auto *high = high_metadata == nullptr
+        ? nullptr
+        : llvm::dyn_cast<llvm::ConstantInt>(high_metadata->getValue());
+    const auto *low = low_metadata == nullptr
+        ? nullptr
+        : llvm::dyn_cast<llvm::ConstantInt>(low_metadata->getValue());
+    if (schema == nullptr ||
+        schema->getString() != cvite::transform::kImplementationSchema ||
+        high == nullptr || low == nullptr) {
+        module.getContext().emitError(
+            "CVite implementation has a malformed change fingerprint");
+        return false;
+    }
+
+    fingerprint = Hash128{
+        high->getZExtValue(),
+        low->getZExtValue(),
+        std::string(),
+    };
     return true;
 }
 
@@ -128,6 +170,12 @@ bool extractFunction(
         return false;
     }
 
+    Hash128 implementation_fingerprint;
+    if (!extractImplementationFingerprint(
+            module, *implementation, implementation_fingerprint)) {
+        return false;
+    }
+
     result = BaselineFunction{
         implementation,
         slot,
@@ -137,6 +185,7 @@ bool extractFunction(
             abi_low->getZExtValue(),
             std::string(),
         },
+        implementation_fingerprint,
         entry.getName().str(),
     };
     return true;
@@ -204,7 +253,7 @@ llvm::GlobalVariable *createFunctionRecords(
     llvm::Type *pointer = llvm::PointerType::getUnqual(context);
     llvm::StructType *record_type = llvm::StructType::get(
         context,
-        {i64, i64, i64, i64, pointer, pointer, pointer},
+        {i64, i64, i64, i64, i64, i64, pointer, pointer, pointer},
         false);
 
     llvm::SmallVector<llvm::Constant *, 32> records;
@@ -222,6 +271,10 @@ llvm::GlobalVariable *createFunctionRecords(
                 llvm::ConstantInt::get(i64, function.identity.low),
                 llvm::ConstantInt::get(i64, function.abi.high),
                 llvm::ConstantInt::get(i64, function.abi.low),
+                llvm::ConstantInt::get(
+                    i64, function.implementation_fingerprint.high),
+                llvm::ConstantInt::get(
+                    i64, function.implementation_fingerprint.low),
                 function.implementation,
                 function.slot,
                 debug_name,

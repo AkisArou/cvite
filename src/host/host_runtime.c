@@ -20,6 +20,8 @@ typedef struct cvite_host_storage_record {
 static atomic_flag cvite_host_lock_flag = ATOMIC_FLAG_INIT;
 static _Atomic(cvite_runtime *) cvite_host_active_runtime = NULL;
 static atomic_bool cvite_host_is_sealed = false;
+static atomic_bool cvite_host_quiescence_gate = false;
+static atomic_uint_fast64_t cvite_host_active_calls = 0U;
 static cvite_host_function_record *cvite_host_function_records = NULL;
 static size_t cvite_host_function_record_count = 0U;
 static size_t cvite_host_function_record_capacity = 0U;
@@ -451,6 +453,75 @@ void *__cvite_host_register_storage(
         cvite_host_fatal("storage registration", &error);
     }
     return storage.address;
+}
+
+void __cvite_host_call_enter(void)
+{
+    for (;;) {
+        while (atomic_load_explicit(
+            &cvite_host_quiescence_gate, memory_order_acquire)) {
+        }
+
+        const uint_fast64_t previous = atomic_fetch_add_explicit(
+            &cvite_host_active_calls, 1U, memory_order_acq_rel);
+        if (previous == UINT_FAST64_MAX) {
+            (void)atomic_fetch_sub_explicit(
+                &cvite_host_active_calls, 1U, memory_order_acq_rel);
+            cvite_host_fatal("call-scope entry", NULL);
+        }
+
+        if (!atomic_load_explicit(
+                &cvite_host_quiescence_gate, memory_order_acquire)) {
+            return;
+        }
+
+        (void)atomic_fetch_sub_explicit(
+            &cvite_host_active_calls, 1U, memory_order_acq_rel);
+    }
+}
+
+void __cvite_host_call_leave(void)
+{
+    const uint_fast64_t previous = atomic_fetch_sub_explicit(
+        &cvite_host_active_calls, 1U, memory_order_acq_rel);
+    if (previous == 0U) {
+        (void)atomic_fetch_add_explicit(
+            &cvite_host_active_calls, 1U, memory_order_relaxed);
+        cvite_host_fatal("call-scope exit", NULL);
+    }
+}
+
+bool cvite_host_try_begin_quiescence(void)
+{
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(
+            &cvite_host_quiescence_gate,
+            &expected,
+            true,
+            memory_order_acq_rel,
+            memory_order_acquire)) {
+        return false;
+    }
+
+    if (atomic_load_explicit(
+            &cvite_host_active_calls, memory_order_acquire) != 0U) {
+        atomic_store_explicit(
+            &cvite_host_quiescence_gate, false, memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+void cvite_host_end_quiescence(void)
+{
+    atomic_store_explicit(
+        &cvite_host_quiescence_gate, false, memory_order_release);
+}
+
+uint64_t cvite_host_active_call_count(void)
+{
+    return (uint64_t)atomic_load_explicit(
+        &cvite_host_active_calls, memory_order_acquire);
 }
 
 cvite_function_pointer __cvite_host_target_at(uint64_t encoded_slot)

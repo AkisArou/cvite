@@ -4,6 +4,7 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Attributes.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalObject.h"
@@ -25,6 +26,10 @@ inline constexpr llvm::StringLiteral kAbiSchema = "cvite.lowered-abi.v1";
 inline constexpr llvm::StringLiteral kIdentitySchema = "cvite.function-id.v1";
 inline constexpr llvm::StringLiteral kFunctionMetadata = "cvite.abi";
 inline constexpr llvm::StringLiteral kFunctionIndex = "cvite.functions";
+inline constexpr llvm::StringLiteral kImplementationSchema =
+    "cvite.implementation.v1";
+inline constexpr llvm::StringLiteral kImplementationMetadata =
+    "cvite.implementation";
 inline constexpr llvm::StringLiteral kOriginMetadata = "cvite.origin";
 inline constexpr llvm::StringLiteral kStorageIdentitySchema =
     "cvite.storage-id.v1";
@@ -121,6 +126,24 @@ inline std::string abiSeed(
             "parameter-attributes",
             attributes.getParamAttrs(index));
     }
+    return output.str();
+}
+
+inline std::string implementationSeed(const llvm::Function &function)
+{
+    std::string seed;
+    llvm::raw_string_ostream output(seed);
+
+    /*
+     * This is intentionally computed after Clang lowering but before CVite
+     * renames or wraps the function. Textual LLVM IR is conservative: an
+     * unrelated metadata renumbering may cause an extra publication, but a
+     * semantic instruction/operand/attribute change cannot be silently
+     * ignored. The 128-bit digest is a change detector, never a security
+     * boundary.
+     */
+    output << kImplementationSchema << '\n';
+    function.print(output, nullptr, false, false);
     return output.str();
 }
 
@@ -235,6 +258,25 @@ inline Hash128 hash128(llvm::StringRef input)
     llvm::MD5::stringifyResult(result, output);
     const auto words = result.words();
     return {words.first, words.second, output.str().str()};
+}
+
+inline void setImplementationMetadata(
+    llvm::Function &function,
+    const Hash128 &implementation)
+{
+    llvm::LLVMContext &context = function.getContext();
+    llvm::Type *i64 = llvm::Type::getInt64Ty(context);
+    llvm::Metadata *metadata[] = {
+        llvm::MDString::get(context, implementation.hex),
+        llvm::MDString::get(context, kImplementationSchema),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, implementation.high)),
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i64, implementation.low)),
+    };
+    function.setMetadata(
+        kImplementationMetadata,
+        llvm::MDNode::get(context, metadata));
 }
 
 inline bool shouldIndex(const llvm::Function &function)

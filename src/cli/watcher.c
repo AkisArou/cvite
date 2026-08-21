@@ -111,6 +111,34 @@ static int publish_candidate(cvite_run_state *state)
         return -1;
     }
 
+    if (patch.function_count == 0U) {
+        status = cvite_orc_loader_discard_generation(
+            state->loader, generation, &error);
+        if (status != CVITE_STATUS_OK) {
+            cvite_print_runtime_error("unchanged candidate discard", &error);
+            cvite_discard_candidate_build(state);
+            return -1;
+        }
+
+        cvite_commit_candidate_build(state);
+        if (cvite_refresh_source_watcher(state) != 0) {
+            (void)fprintf(
+                stderr,
+                "[cvite] accepted unchanged code, but dependency watches "
+                "could not be updated\n");
+        }
+        (void)clock_gettime(CLOCK_MONOTONIC, &finished);
+        (void)fprintf(
+            stderr,
+            "[cvite] no lowered implementation changes from %zu/%zu TU%s "
+            "(%.1f ms)\n",
+            state->last_recompiled_count,
+            state->translation_unit_count,
+            state->translation_unit_count == 1U ? "" : "s",
+            elapsed_milliseconds(started, finished));
+        return 0;
+    }
+
     status = cvite_host_apply_patch(&patch, &error);
     if (status != CVITE_STATUS_OK) {
         cvite_print_runtime_error("patch publication", &error);
@@ -123,11 +151,38 @@ static int publish_candidate(cvite_run_state *state)
         return -1;
     }
 
+    status = cvite_orc_loader_commit_patch(
+        state->loader, generation, &error);
+    if (status != CVITE_STATUS_OK) {
+        cvite_print_runtime_error("loader ownership commit", &error);
+        (void)fprintf(
+            stderr,
+            "[cvite] new code is active, but further refreshes are disabled "
+            "to keep JIT ownership safe\n");
+        cvite_commit_candidate_build(state);
+        atomic_store_explicit(
+            &state->stop_requested, true, memory_order_release);
+        return -1;
+    }
+
     cvite_commit_candidate_build(state);
     if (cvite_refresh_source_watcher(state) != 0) {
         (void)fprintf(
             stderr,
             "[cvite] refreshed code, but dependency watches could not be updated\n");
+    }
+
+    size_t reclaimed_generations = 0U;
+    status = cvite_orc_loader_collect_retired(
+        state->loader, &reclaimed_generations, &error);
+    if (status != CVITE_STATUS_OK) {
+        cvite_print_runtime_error("retired-code collection", &error);
+    } else if (reclaimed_generations != 0U) {
+        (void)fprintf(
+            stderr,
+            "[cvite] reclaimed %zu retired JIT generation%s\n",
+            reclaimed_generations,
+            reclaimed_generations == 1U ? "" : "s");
     }
 
     (void)clock_gettime(CLOCK_MONOTONIC, &finished);
@@ -265,8 +320,17 @@ void *cvite_watch_source(void *opaque)
             break;
         }
         if (poll_status == 0) {
+            cvite_error collection_error = {0};
+            size_t reclaimed_generations = 0U;
             (void)cvite_native_link_poll(
                 state->loader, state->source_path, state->clang_path);
+            if (cvite_orc_loader_collect_retired(
+                    state->loader,
+                    &reclaimed_generations,
+                    &collection_error) != CVITE_STATUS_OK) {
+                cvite_print_runtime_error(
+                    "retired-code collection", &collection_error);
+            }
             continue;
         }
         if ((poll_descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {

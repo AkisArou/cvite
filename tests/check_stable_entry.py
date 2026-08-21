@@ -80,6 +80,10 @@ def main() -> int:
             fail("generated constructor does not register persistent storage")
         if "@__cvite_host_target_at" not in ir:
             fail("stable entries do not resolve the active target")
+        if "@__cvite_host_call_enter" not in ir or "@__cvite_host_call_leave" not in ir:
+            fail("stable entries do not bracket JIT execution with call scopes")
+        if "!cvite.implementation" not in ir:
+            fail("baseline implementations are missing change fingerprints")
         if "@__cvite_baseline_manifest" not in ir:
             fail("JIT baseline manifest is missing")
         if "@__cvite_baseline_records" not in ir:
@@ -125,6 +129,12 @@ def main() -> int:
         )
         if app_body is None or "@__cvite_host_target_at" not in app_body.group("body"):
             fail("app_update is not a stable dispatch entry")
+        app_dispatch = app_body.group("body")
+        enter = app_dispatch.find("@__cvite_host_call_enter")
+        target = app_dispatch.find("@__cvite_host_target_at")
+        leave = app_dispatch.find("@__cvite_host_call_leave")
+        if not (0 <= enter < target < leave):
+            fail("stable dispatch call scope does not cover target resolution and call")
 
         implementation_bodies = re.findall(
             rf"define internal [^@]*@__cvite_impl\.{ID}\([^)]*\)[^{{]*\{{(.*?)^\}}",

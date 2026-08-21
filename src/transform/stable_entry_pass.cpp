@@ -32,7 +32,9 @@ constexpr llvm::StringLiteral kRegisterFunction =
 constexpr llvm::StringLiteral kRegisterStorage =
     "__cvite_host_register_storage";
 constexpr llvm::StringLiteral kTargetAt = "__cvite_host_target_at";
-constexpr unsigned kBaselineSchema = 2U;
+constexpr llvm::StringLiteral kCallEnter = "__cvite_host_call_enter";
+constexpr llvm::StringLiteral kCallLeave = "__cvite_host_call_leave";
+constexpr unsigned kBaselineSchema = 3U;
 constexpr int kRegistrationPriority = 1;
 
 struct WrappedFunction final {
@@ -41,6 +43,7 @@ struct WrappedFunction final {
     llvm::GlobalVariable *slot = nullptr;
     Hash128 identity;
     Hash128 abi;
+    Hash128 implementation_fingerprint;
     std::string debug_name;
 };
 
@@ -120,6 +123,15 @@ llvm::FunctionCallee getRegisterStorageFunction(llvm::Module &module)
     return module.getOrInsertFunction(kRegisterStorage, type);
 }
 
+llvm::FunctionCallee getCallScopeFunction(
+    llvm::Module &module,
+    llvm::StringRef name)
+{
+    llvm::FunctionType *type = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(module.getContext()), false);
+    return module.getOrInsertFunction(name, type);
+}
+
 llvm::FunctionCallee getTargetFunction(llvm::Module &module)
 {
     llvm::LLVMContext &context = module.getContext();
@@ -192,6 +204,8 @@ WrappedFunction wrapFunction(llvm::Module &module, llvm::Function &function)
         cvite::transform::identitySeed(module, function, original_name));
     const Hash128 abi = cvite::transform::hash128(
         cvite::transform::abiSeed(module, function));
+    const Hash128 implementation_fingerprint = cvite::transform::hash128(
+        cvite::transform::implementationSeed(function));
     const llvm::GlobalValue::LinkageTypes original_linkage = function.getLinkage();
     const llvm::GlobalValue::VisibilityTypes original_visibility =
         function.getVisibility();
@@ -249,6 +263,7 @@ WrappedFunction wrapFunction(llvm::Module &module, llvm::Function &function)
     llvm::BasicBlock *entry_block =
         llvm::BasicBlock::Create(context, "entry", entry);
     llvm::IRBuilder<> builder(entry_block);
+    builder.CreateCall(getCallScopeFunction(module, kCallEnter));
     llvm::LoadInst *slot_value = builder.CreateLoad(i64, slot, "cvite.slot");
     llvm::CallInst *target = builder.CreateCall(
         getTargetFunction(module), {slot_value}, "cvite.target");
@@ -263,7 +278,7 @@ WrappedFunction wrapFunction(llvm::Module &module, llvm::Function &function)
         function.getFunctionType(), target, arguments);
     call->setCallingConv(function.getCallingConv());
     call->setAttributes(call_attributes);
-    call->setTailCallKind(llvm::CallInst::TCK_Tail);
+    builder.CreateCall(getCallScopeFunction(module, kCallLeave));
     if (function.getReturnType()->isVoidTy()) {
         builder.CreateRetVoid();
     } else {
@@ -280,6 +295,8 @@ WrappedFunction wrapFunction(llvm::Module &module, llvm::Function &function)
     entry->setMetadata(
         cvite::transform::kFunctionMetadata,
         llvm::MDNode::get(context, entry_metadata));
+    cvite::transform::setImplementationMetadata(
+        function, implementation_fingerprint);
 
     return {
         &function,
@@ -287,6 +304,7 @@ WrappedFunction wrapFunction(llvm::Module &module, llvm::Function &function)
         slot,
         identity,
         abi,
+        implementation_fingerprint,
         original_name,
     };
 }

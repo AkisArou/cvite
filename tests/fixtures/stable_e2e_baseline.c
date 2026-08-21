@@ -14,3 +14,8 @@ int cvite_e2e_update(void *opaque, int delta)
     cvite_e2e_global_bias += 1;
     return state->value;
 }
+
+int main(void)
+{
+    return 0;
+}

@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 /* Internal compiler/loader ABI. Ordinary application source never includes it. */
-#define CVITE_BASELINE_MANIFEST_SCHEMA UINT64_C(2)
+#define CVITE_BASELINE_MANIFEST_SCHEMA UINT64_C(3)
 #define CVITE_BASELINE_MANIFEST_SYMBOL "__cvite_baseline_manifest"
 #define CVITE_PROGRAM_MAIN_SYMBOL "__cvite_program_main"
 
@@ -19,6 +19,8 @@ typedef struct cvite_baseline_function {
     uint64_t id_low;
     uint64_t abi_high;
     uint64_t abi_low;
+    uint64_t implementation_high;
+    uint64_t implementation_low;
     cvite_function_pointer initial_target;
     uint64_t *slot;
     const char *debug_name;

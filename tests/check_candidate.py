@@ -130,6 +130,10 @@ def main() -> int:
             fail("candidate storage requirements are missing")
         if "@__cvite_host_target_for" not in ir:
             fail("candidate entries do not resolve stable targets by ID")
+        if "@__cvite_host_call_enter" not in ir or "@__cvite_host_call_leave" not in ir:
+            fail("candidate entries do not bracket JIT execution with call scopes")
+        if "!cvite.implementation" not in ir:
+            fail("candidate implementations are missing change fingerprints")
 
         implementations = re.findall(rf"@__cvite_patch\.({ID})", ir)
         if len(set(implementations)) != 2:
@@ -203,6 +207,12 @@ def main() -> int:
         )
         if app_entry is None or "@__cvite_host_target_for" not in app_entry.group("body"):
             fail("app_update does not route through the active stable target")
+        app_dispatch = app_entry.group("body")
+        enter = app_dispatch.find("@__cvite_host_call_enter")
+        target = app_dispatch.find("@__cvite_host_target_for")
+        leave = app_dispatch.find("@__cvite_host_call_leave")
+        if not (0 <= enter < target < leave):
+            fail("candidate dispatch call scope does not cover target resolution and call")
 
         implementation_bodies = re.findall(
             rf"define internal [^@]*@__cvite_patch\.{ID}\([^)]*\)[^{{]*\{{(.*?)^\}}",

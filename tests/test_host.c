@@ -138,5 +138,18 @@ int main(void)
 
     active = restore(__cvite_host_target_at(slot));
     CHECK(active(&state, 3) == 37);
+
+    CHECK(cvite_host_active_call_count() == 0U);
+    CHECK(cvite_host_try_begin_quiescence());
+    CHECK(!cvite_host_try_begin_quiescence());
+    cvite_host_end_quiescence();
+
+    __cvite_host_call_enter();
+    CHECK(cvite_host_active_call_count() == 1U);
+    CHECK(!cvite_host_try_begin_quiescence());
+    __cvite_host_call_leave();
+    CHECK(cvite_host_active_call_count() == 0U);
+    CHECK(cvite_host_try_begin_quiescence());
+    cvite_host_end_quiescence();
     return EXIT_SUCCESS;
 }

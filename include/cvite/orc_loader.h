@@ -63,6 +63,25 @@ cvite_status cvite_orc_loader_prepare_patch(
     cvite_patch *patch,
     cvite_error *error);
 
+/*
+ * Commit loader ownership after cvite_host_apply_patch succeeds. This updates
+ * implementation fingerprints and marks generations that no longer own a
+ * dispatch target as retired. The operation performs no allocation.
+ */
+cvite_status cvite_orc_loader_commit_patch(
+    cvite_orc_loader *loader,
+    cvite_orc_generation generation,
+    cvite_error *error);
+
+/*
+ * Remove retired ORC resources only when compiler-generated call scopes prove
+ * that no thread can still execute old JIT code.
+ */
+cvite_status cvite_orc_loader_collect_retired(
+    cvite_orc_loader *loader,
+    size_t *reclaimed_generation_count,
+    cvite_error *error);
+
 cvite_status cvite_orc_loader_discard_generation(
     cvite_orc_loader *loader,
     cvite_orc_generation generation,

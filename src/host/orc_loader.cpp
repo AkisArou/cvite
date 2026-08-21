@@ -31,6 +31,8 @@ constexpr const char *kTargetForSymbol = "__cvite_host_target_for";
 constexpr const char *kRegisterFunctionSymbol = "__cvite_host_register_function";
 constexpr const char *kRegisterStorageSymbol = "__cvite_host_register_storage";
 constexpr const char *kTargetAtSymbol = "__cvite_host_target_at";
+constexpr const char *kCallEnterSymbol = "__cvite_host_call_enter";
+constexpr const char *kCallLeaveSymbol = "__cvite_host_call_leave";
 constexpr const char *kStorageForSymbol = "__cvite_host_storage_for";
 constexpr const char *kStorageSymbolPrefix = "__cvite_storage.";
 constexpr std::uint64_t kMaxManifestRecords = UINT64_C(1048576);
@@ -40,11 +42,40 @@ struct HostFunction final {
     cvite_function_pointer address = nullptr;
 };
 
+struct PreparedFingerprint final {
+    cvite_id id{};
+    cvite_id implementation{};
+    cvite_id previous_implementation{};
+    cvite_orc_generation previous_owner = CVITE_ORC_GENERATION_INVALID;
+};
+
+struct OwnerDelta final {
+    cvite_orc_generation owner = CVITE_ORC_GENERATION_INVALID;
+    std::size_t count = 0U;
+};
+
+struct ActiveFunction final {
+    cvite_id id{};
+    cvite_id abi{};
+    cvite_id implementation{};
+    cvite_orc_generation owner = CVITE_ORC_GENERATION_INVALID;
+};
+
 struct Generation final {
     llvm::orc::JITDylib *dylib = nullptr;
     llvm::orc::ResourceTrackerSP resources;
     std::vector<cvite_function_update> updates;
+    std::vector<PreparedFingerprint> prepared_fingerprints;
+    std::vector<OwnerDelta> owner_deltas;
+    std::uint64_t expected_runtime_generation = 0U;
+    std::uint64_t candidate_runtime_generation = 0U;
+    std::size_t live_function_count = 0U;
     bool baseline_prepared = false;
+    bool patch_prepared = false;
+    bool patch_committed = false;
+    bool pinned = false;
+    bool retired = false;
+    bool reclaimable = true;
 };
 
 struct NativeTargetState final {
@@ -122,18 +153,6 @@ bool isPowerOfTwo(std::uint64_t value)
     return value != 0U && (value & (value - 1U)) == 0U;
 }
 
-bool hasDuplicateUpdate(
-    const std::vector<cvite_function_update> &updates,
-    cvite_id id)
-{
-    for (const cvite_function_update &update : updates) {
-        if (cvite_id_equal(update.id, id)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool hasDuplicateId(const std::vector<cvite_id> &identities, cvite_id id)
 {
     for (const cvite_id existing : identities) {
@@ -143,6 +162,58 @@ bool hasDuplicateId(const std::vector<cvite_id> &identities, cvite_id id)
     }
     return false;
 }
+
+ActiveFunction *findActiveFunction(
+    std::vector<ActiveFunction> &functions,
+    cvite_id id)
+{
+    for (ActiveFunction &function : functions) {
+        if (cvite_id_equal(function.id, id)) {
+            return &function;
+        }
+    }
+    return nullptr;
+}
+
+cvite_status failFingerprint(
+    cvite_error *error,
+    cvite_status status,
+    cvite_id symbol,
+    cvite_id expected,
+    cvite_id actual,
+    const std::string &message)
+{
+    const cvite_status result = fail(error, status, message);
+    if (error != nullptr) {
+        error->symbol = symbol;
+        error->expected_fingerprint = expected;
+        error->actual_fingerprint = actual;
+    }
+    return result;
+}
+
+class QuiescenceScope final {
+public:
+    QuiescenceScope()
+        : acquired_(cvite_host_try_begin_quiescence())
+    {
+    }
+
+    ~QuiescenceScope()
+    {
+        if (acquired_) {
+            cvite_host_end_quiescence();
+        }
+    }
+
+    QuiescenceScope(const QuiescenceScope &) = delete;
+    QuiescenceScope &operator=(const QuiescenceScope &) = delete;
+
+    bool acquired() const { return acquired_; }
+
+private:
+    bool acquired_ = false;
+};
 
 std::string storageSymbolName(cvite_id id)
 {
@@ -169,6 +240,7 @@ struct cvite_orc_loader {
     std::mutex mutex;
     std::unique_ptr<llvm::orc::LLJIT> jit;
     std::vector<HostFunction> host_functions;
+    std::vector<ActiveFunction> active_functions;
     std::unordered_map<cvite_orc_generation, Generation> generations;
     cvite_orc_generation next_generation = 1U;
 };
@@ -223,6 +295,14 @@ extern "C" cvite_status cvite_orc_loader_create(
     created->host_functions.push_back(HostFunction{
         kTargetAtSymbol,
         reinterpret_cast<cvite_function_pointer>(&__cvite_host_target_at),
+    });
+    created->host_functions.push_back(HostFunction{
+        kCallEnterSymbol,
+        reinterpret_cast<cvite_function_pointer>(&__cvite_host_call_enter),
+    });
+    created->host_functions.push_back(HostFunction{
+        kCallLeaveSymbol,
+        reinterpret_cast<cvite_function_pointer>(&__cvite_host_call_leave),
     });
     created->host_functions.push_back(HostFunction{
         kStorageForSymbol,
@@ -320,6 +400,8 @@ extern "C" cvite_status cvite_orc_loader_stage_object(
             *native_dylib,
             llvm::orc::JITDylibLookupFlags::MatchAllSymbols);
     }
+    llvm::orc::ResourceTrackerSP resources =
+        candidate_dylib.createResourceTracker();
     llvm::orc::SymbolMap host_symbols;
     for (const HostFunction &function : loader->host_functions) {
         host_symbols[loader->jit->mangleAndIntern(function.name)] = {
@@ -350,9 +432,13 @@ extern "C" cvite_status cvite_orc_loader_stage_object(
     }
 
     if (!host_symbols.empty()) {
-        if (llvm::Error define_error =
-                candidate_dylib.define(
-                    llvm::orc::absoluteSymbols(std::move(host_symbols)))) {
+        if (llvm::Error define_error = candidate_dylib.define(
+                llvm::orc::absoluteSymbols(std::move(host_symbols)),
+                resources)) {
+            llvm::consumeError(resources->remove());
+            llvm::consumeError(
+                loader->jit->getExecutionSession().removeJITDylib(
+                    candidate_dylib));
             return fail(
                 error,
                 CVITE_STATUS_LINK_ERROR,
@@ -361,11 +447,13 @@ extern "C" cvite_status cvite_orc_loader_stage_object(
         }
     }
 
-    llvm::orc::ResourceTrackerSP resources =
-        candidate_dylib.createResourceTracker();
     if (llvm::Error add_error = loader->jit->addObjectFile(
             resources,
             std::move(*object))) {
+        llvm::consumeError(resources->remove());
+        llvm::consumeError(
+            loader->jit->getExecutionSession().removeJITDylib(
+                candidate_dylib));
         return fail(
             error,
             CVITE_STATUS_LINK_ERROR,
@@ -374,7 +462,23 @@ extern "C" cvite_status cvite_orc_loader_stage_object(
     }
 
     loader->generations.emplace(
-        handle, Generation{&candidate_dylib, std::move(resources), {}, false});
+        handle,
+        Generation{
+            &candidate_dylib,
+            std::move(resources),
+            {},
+            {},
+            {},
+            0U,
+            0U,
+            0U,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        });
     *generation = handle;
     return CVITE_STATUS_OK;
 }
@@ -442,6 +546,13 @@ extern "C" cvite_status cvite_orc_loader_prepare_baseline(
             error,
             CVITE_STATUS_INVALID_STATE,
             "baseline generation was already prepared");
+    }
+
+    if (!loader->active_functions.empty()) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "an active baseline is already registered");
     }
 
     auto manifest_symbol = loader->jit->lookup(
@@ -513,6 +624,9 @@ extern "C" cvite_status cvite_orc_loader_prepare_baseline(
         storage_identities.push_back(id);
     }
 
+    std::vector<ActiveFunction> baseline_functions;
+    baseline_functions.reserve(
+        static_cast<std::size_t>(manifest->function_count));
     std::vector<cvite_id> function_identities;
     function_identities.reserve(
         static_cast<std::size_t>(manifest->function_count));
@@ -522,7 +636,12 @@ extern "C" cvite_status cvite_orc_loader_prepare_baseline(
         const cvite_baseline_function &record = manifest->functions[index];
         const cvite_id id{record.id_high, record.id_low};
         const cvite_id abi{record.abi_high, record.abi_low};
+        const cvite_id implementation{
+            record.implementation_high,
+            record.implementation_low,
+        };
         if (cvite_id_is_zero(id) || cvite_id_is_zero(abi) ||
+            cvite_id_is_zero(implementation) ||
             record.initial_target == nullptr || record.slot == nullptr ||
             record.debug_name == nullptr || record.debug_name[0] == '\0') {
             return fail(
@@ -537,6 +656,12 @@ extern "C" cvite_status cvite_orc_loader_prepare_baseline(
                 "baseline manifest contains a duplicate function ID");
         }
         function_identities.push_back(id);
+        baseline_functions.push_back(ActiveFunction{
+            id,
+            abi,
+            implementation,
+            generation,
+        });
     }
 
     for (std::uint64_t index = 0U;
@@ -595,7 +720,10 @@ extern "C" cvite_status cvite_orc_loader_prepare_baseline(
     }
 
     *program_main = main_symbol->toPtr<int(int, char **)>();
+    baseline.live_function_count = baseline_functions.size();
     baseline.baseline_prepared = true;
+    baseline.pinned = true;
+    loader->active_functions = std::move(baseline_functions);
     return CVITE_STATUS_OK;
 }
 
@@ -619,6 +747,20 @@ extern "C" cvite_status cvite_orc_loader_prepare_patch(
     if (found == loader->generations.end()) {
         return fail(error, CVITE_STATUS_INVALID_ARGUMENT, "unknown candidate generation");
     }
+    Generation &candidate = found->second;
+    if (candidate.baseline_prepared || candidate.patch_prepared ||
+        candidate.patch_committed) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "candidate generation was already prepared");
+    }
+    if (loader->active_functions.empty()) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "candidate preparation requires an active baseline");
+    }
 
     auto symbol = loader->jit->lookup(
         *found->second.dylib, CVITE_CANDIDATE_MANIFEST_SYMBOL);
@@ -639,6 +781,16 @@ extern "C" cvite_status cvite_orc_loader_prepare_patch(
             CVITE_STATUS_UNSUPPORTED_PROTOCOL,
             "candidate manifest schema is unsupported");
     }
+    const std::uint64_t known_flags =
+        CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES;
+    if ((manifest->flags & ~known_flags) != 0U) {
+        return fail(
+            error,
+            CVITE_STATUS_UNSUPPORTED_PROTOCOL,
+            "candidate manifest contains unsupported compatibility flags");
+    }
+    candidate.reclaimable =
+        (manifest->flags & CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES) == 0U;
     if (manifest->function_count == 0U) {
         return fail(
             error,
@@ -653,6 +805,13 @@ extern "C" cvite_status cvite_orc_loader_prepare_patch(
             error,
             CVITE_STATUS_INVALID_PACKET,
             "candidate manifest record count is unreasonable");
+    }
+    if (manifest->function_count !=
+        static_cast<std::uint64_t>(loader->active_functions.size())) {
+        return fail(
+            error,
+            CVITE_STATUS_UNKNOWN_SYMBOL,
+            "candidate changed the refreshable function set");
     }
     if (manifest->functions == nullptr) {
         return fail(
@@ -710,32 +869,71 @@ extern "C" cvite_status cvite_orc_loader_prepare_patch(
         }
     }
 
-    Generation &candidate = found->second;
     candidate.updates.clear();
+    candidate.prepared_fingerprints.clear();
+    candidate.owner_deltas.clear();
     candidate.updates.reserve(
         static_cast<std::size_t>(manifest->function_count));
+    candidate.prepared_fingerprints.reserve(
+        static_cast<std::size_t>(manifest->function_count));
+    std::vector<cvite_id> candidate_identities;
+    candidate_identities.reserve(
+        static_cast<std::size_t>(manifest->function_count));
+
     for (std::uint64_t index = 0U;
          index < manifest->function_count;
          ++index) {
         const cvite_candidate_function &record = manifest->functions[index];
         const cvite_id id{record.id_high, record.id_low};
         const cvite_id abi{record.abi_high, record.abi_low};
+        const cvite_id implementation{
+            record.implementation_high,
+            record.implementation_low,
+        };
 
         if (cvite_id_is_zero(id) || cvite_id_is_zero(abi) ||
-            record.target == nullptr || record.debug_name == nullptr ||
-            record.debug_name[0] == '\0') {
+            cvite_id_is_zero(implementation) || record.target == nullptr ||
+            record.debug_name == nullptr || record.debug_name[0] == '\0') {
             candidate.updates.clear();
+            candidate.prepared_fingerprints.clear();
             return fail(
                 error,
                 CVITE_STATUS_INVALID_PACKET,
                 "candidate manifest contains an invalid function record");
         }
-        if (hasDuplicateUpdate(candidate.updates, id)) {
+        if (hasDuplicateId(candidate_identities, id)) {
             candidate.updates.clear();
+            candidate.prepared_fingerprints.clear();
             return fail(
                 error,
                 CVITE_STATUS_DUPLICATE_SYMBOL,
                 "candidate manifest contains a duplicate function ID");
+        }
+        candidate_identities.push_back(id);
+
+        const ActiveFunction *active =
+            findActiveFunction(loader->active_functions, id);
+        if (active == nullptr) {
+            candidate.updates.clear();
+            candidate.prepared_fingerprints.clear();
+            return fail(
+                error,
+                CVITE_STATUS_UNKNOWN_SYMBOL,
+                "candidate references an unknown function identity");
+        }
+        if (!cvite_id_equal(active->abi, abi)) {
+            candidate.updates.clear();
+            candidate.prepared_fingerprints.clear();
+            return failFingerprint(
+                error,
+                CVITE_STATUS_ABI_MISMATCH,
+                id,
+                active->abi,
+                abi,
+                "candidate function changed its lowered ABI");
+        }
+        if (cvite_id_equal(active->implementation, implementation)) {
+            continue;
         }
 
         candidate.updates.push_back(cvite_function_update{
@@ -743,12 +941,179 @@ extern "C" cvite_status cvite_orc_loader_prepare_patch(
             abi,
             record.target,
         });
+        candidate.prepared_fingerprints.push_back(PreparedFingerprint{
+            id,
+            implementation,
+            active->implementation,
+            active->owner,
+        });
+        OwnerDelta *delta = nullptr;
+        for (OwnerDelta &existing : candidate.owner_deltas) {
+            if (existing.owner == active->owner) {
+                delta = &existing;
+                break;
+            }
+        }
+        if (delta == nullptr) {
+            candidate.owner_deltas.push_back(OwnerDelta{active->owner, 1U});
+        } else {
+            delta->count += 1U;
+        }
     }
 
+    candidate.expected_runtime_generation = expected_generation;
+    candidate.candidate_runtime_generation = candidate_generation;
+    candidate.patch_prepared = true;
     patch->expected_generation = expected_generation;
     patch->candidate_generation = candidate_generation;
     patch->functions = candidate.updates.data();
     patch->function_count = candidate.updates.size();
+    return CVITE_STATUS_OK;
+}
+
+extern "C" cvite_status cvite_orc_loader_commit_patch(
+    cvite_orc_loader *loader,
+    cvite_orc_generation generation,
+    cvite_error *error)
+{
+    cvite_error_clear(error);
+    if (loader == nullptr || generation == CVITE_ORC_GENERATION_INVALID) {
+        return fail(error, CVITE_STATUS_INVALID_ARGUMENT, "invalid patch commit");
+    }
+
+    std::lock_guard<std::mutex> guard(loader->mutex);
+    const auto found = loader->generations.find(generation);
+    if (found == loader->generations.end()) {
+        return fail(error, CVITE_STATUS_INVALID_ARGUMENT, "unknown candidate generation");
+    }
+
+    Generation &candidate = found->second;
+    if (!candidate.patch_prepared || candidate.patch_committed ||
+        candidate.baseline_prepared || candidate.updates.empty() ||
+        candidate.updates.size() != candidate.prepared_fingerprints.size() ||
+        candidate.live_function_count != 0U) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "candidate generation is not ready to commit");
+    }
+    if (cvite_host_generation() != candidate.candidate_runtime_generation) {
+        return fail(
+            error,
+            CVITE_STATUS_STALE_GENERATION,
+            "runtime did not publish the prepared candidate generation");
+    }
+
+    for (const PreparedFingerprint &prepared :
+         candidate.prepared_fingerprints) {
+        const ActiveFunction *active =
+            findActiveFunction(loader->active_functions, prepared.id);
+        if (active == nullptr || active->owner != prepared.previous_owner ||
+            !cvite_id_equal(
+                active->implementation,
+                prepared.previous_implementation)) {
+            return fail(
+                error,
+                CVITE_STATUS_STALE_GENERATION,
+                "active implementation ownership changed after preparation");
+        }
+    }
+    for (const OwnerDelta &delta : candidate.owner_deltas) {
+        const auto owner = loader->generations.find(delta.owner);
+        if (owner == loader->generations.end() || delta.count == 0U ||
+            owner->second.live_function_count < delta.count) {
+            return fail(
+                error,
+                CVITE_STATUS_INVALID_STATE,
+                "candidate ownership accounting is inconsistent");
+        }
+    }
+
+    for (const OwnerDelta &delta : candidate.owner_deltas) {
+        Generation &previous = loader->generations.find(delta.owner)->second;
+        previous.live_function_count -= delta.count;
+        if (previous.live_function_count == 0U && !previous.pinned) {
+            previous.retired = true;
+        }
+    }
+    for (const PreparedFingerprint &prepared :
+         candidate.prepared_fingerprints) {
+        ActiveFunction *active =
+            findActiveFunction(loader->active_functions, prepared.id);
+        active->implementation = prepared.implementation;
+        active->owner = generation;
+    }
+
+    candidate.live_function_count = candidate.prepared_fingerprints.size();
+    candidate.patch_committed = true;
+    candidate.pinned = !candidate.reclaimable;
+    candidate.retired = false;
+    return CVITE_STATUS_OK;
+}
+
+extern "C" cvite_status cvite_orc_loader_collect_retired(
+    cvite_orc_loader *loader,
+    size_t *reclaimed_generation_count,
+    cvite_error *error)
+{
+    cvite_error_clear(error);
+    if (loader == nullptr) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_ARGUMENT,
+            "invalid retired-generation collection");
+    }
+    if (reclaimed_generation_count != nullptr) {
+        *reclaimed_generation_count = 0U;
+    }
+
+    QuiescenceScope quiescence;
+    if (!quiescence.acquired()) {
+        return CVITE_STATUS_OK;
+    }
+
+    std::size_t reclaimed = 0U;
+    {
+        std::lock_guard<std::mutex> guard(loader->mutex);
+        for (auto current = loader->generations.begin();
+             current != loader->generations.end();) {
+            Generation &generation = current->second;
+            if (!generation.retired || generation.pinned ||
+                generation.live_function_count != 0U) {
+                ++current;
+                continue;
+            }
+
+            if (generation.resources) {
+                if (llvm::Error remove_error = generation.resources->remove()) {
+                    return fail(
+                        error,
+                        CVITE_STATUS_LINK_ERROR,
+                        std::move(remove_error),
+                        "could not reclaim a retired candidate generation");
+                }
+                generation.resources = nullptr;
+            }
+            if (generation.dylib != nullptr) {
+                if (llvm::Error remove_error =
+                        loader->jit->getExecutionSession().removeJITDylib(
+                            *generation.dylib)) {
+                    return fail(
+                        error,
+                        CVITE_STATUS_LINK_ERROR,
+                        std::move(remove_error),
+                        "could not remove a retired candidate namespace");
+                }
+                generation.dylib = nullptr;
+            }
+            current = loader->generations.erase(current);
+            reclaimed += 1U;
+        }
+    }
+
+    if (reclaimed_generation_count != nullptr) {
+        *reclaimed_generation_count = reclaimed;
+    }
     return CVITE_STATUS_OK;
 }
 
@@ -767,6 +1132,13 @@ extern "C" cvite_status cvite_orc_loader_discard_generation(
     if (found == loader->generations.end()) {
         return fail(error, CVITE_STATUS_INVALID_ARGUMENT, "unknown candidate generation");
     }
+    if (found->second.baseline_prepared || found->second.patch_committed ||
+        found->second.live_function_count != 0U) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "an active generation cannot be discarded directly");
+    }
 
     if (found->second.resources) {
         if (llvm::Error remove_error = found->second.resources->remove()) {
@@ -776,6 +1148,19 @@ extern "C" cvite_status cvite_orc_loader_discard_generation(
                 std::move(remove_error),
                 "could not discard candidate generation");
         }
+        found->second.resources = nullptr;
+    }
+    if (found->second.dylib != nullptr) {
+        if (llvm::Error remove_error =
+                loader->jit->getExecutionSession().removeJITDylib(
+                    *found->second.dylib)) {
+            return fail(
+                error,
+                CVITE_STATUS_LINK_ERROR,
+                std::move(remove_error),
+                "could not remove a discarded candidate namespace");
+        }
+        found->second.dylib = nullptr;
     }
     loader->generations.erase(found);
     return CVITE_STATUS_OK;
