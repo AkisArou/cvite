@@ -31,7 +31,10 @@ jobs:
         run: |
           set -euo pipefail
           cat \
-            .cvite/state-lifecycle.part-00 \
+            .cvite/state-lifecycle.part-00s0 \
+            .cvite/state-lifecycle.part-00s1 \
+            .cvite/state-lifecycle.part-00s2 \
+            .cvite/state-lifecycle.part-00s3 \
             .cvite/state-lifecycle.part-01 \
             .cvite/state-lifecycle.part-02a \
             .cvite/state-lifecycle.part-02b \
@@ -158,6 +161,10 @@ jobs:
 
           git rm -- \
             .cvite/state-lifecycle.part-00 \
+            .cvite/state-lifecycle.part-00s0 \
+            .cvite/state-lifecycle.part-00s1 \
+            .cvite/state-lifecycle.part-00s2 \
+            .cvite/state-lifecycle.part-00s3 \
             .cvite/state-lifecycle.part-01 \
             .cvite/state-lifecycle.part-02a \
             .cvite/state-lifecycle.part-02b \
