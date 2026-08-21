@@ -1,9 +1,6 @@
 name: Diagnose semantic tooling
 
 on:
-  push:
-    branches:
-      - bootstrap/m0-runtime
   pull_request:
     branches:
       - main
@@ -20,9 +17,8 @@ jobs:
   diagnose:
     if: >-
       github.actor != 'github-actions[bot]' &&
-      (github.event_name != 'pull_request' ||
-       (github.event.pull_request.head.repo.full_name == github.repository &&
-        github.event.pull_request.head.ref == 'bootstrap/m0-runtime'))
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'bootstrap/m0-runtime'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -30,37 +26,11 @@ jobs:
           ref: bootstrap/m0-runtime
           fetch-depth: 0
 
-      - name: Activate semantic targets
+      - name: Apply transactional semantic integration
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          cmake = Path('CMakeLists.txt')
-          text = cmake.read_text(encoding='utf-8')
-          marker = '''if(CVITE_BUILD_EXAMPLES)\n    add_executable(cvite_runtime_transaction examples/runtime_transaction.c)\n'''
-          insertion = '''# Clang-backed semantic analysis, conservative managed-layout planning,\n# and opt-in development stress tests are declared after the core/compiler\n# targets they extend.\ninclude(cmake/CViteSemantic.cmake)\ninclude(cmake/CViteExperimental.cmake)\n\n'''
-          if insertion not in text:
-              if marker not in text:
-                  raise SystemExit('root CMake insertion marker is missing')
-              cmake.write_text(text.replace(marker, insertion + marker, 1), encoding='utf-8')
-
-          experimental = Path('cmake/CViteExperimental.cmake')
-          text = experimental.read_text(encoding='utf-8')
-          old = '''        target_link_libraries(\n            cvite_test_runtime_stress\n            PRIVATE cvite::runtime Threads::Threads\n        )\n        cvite_set_warnings(cvite_test_runtime_stress)\n'''
-          new = '''        target_link_libraries(\n            cvite_test_runtime_stress\n            PRIVATE cvite::runtime Threads::Threads\n        )\n        target_compile_definitions(\n            cvite_test_runtime_stress\n            PRIVATE _POSIX_C_SOURCE=200809L\n        )\n        cvite_set_warnings(cvite_test_runtime_stress)\n'''
-          if new not in text:
-              if old not in text:
-                  raise SystemExit('runtime-stress target marker is missing')
-              experimental.write_text(text.replace(old, new, 1), encoding='utf-8')
-
-          stress = Path('tests/test_runtime_stress.c')
-          text = stress.read_text(encoding='utf-8')
-          text = text.replace('CVITE_ID(UINT64_C(0xA100),', 'CVITE_ID_INITIALIZER(UINT64_C(0xA100),')
-          text = text.replace('CVITE_ID(UINT64_C(0xB200),', 'CVITE_ID_INITIALIZER(UINT64_C(0xB200),')
-          stress.write_text(text, encoding='utf-8')
-          PY
+          python3 .cvite/apply-semantic-cache-transaction.py
           git diff --check
 
       - name: Install LLVM 18 toolchain
@@ -76,7 +46,6 @@ jobs:
           cmake
 
       - name: Configure, build, and test with transcript
-        id: verify
         shell: bash
         run: |
           set +e
@@ -119,9 +88,7 @@ jobs:
             fi
             exit "${test_status}"
           } 2>&1 | tee /tmp/cvite-semantic-transcript.txt
-          status=${PIPESTATUS[0]}
-          echo "status=${status}" >> "$GITHUB_OUTPUT"
-          exit "${status}"
+          exit ${PIPESTATUS[0]}
 
       - name: Upload diagnostic transcript
         if: always()
