@@ -103,6 +103,10 @@ cvite_status cvite_host_apply_patch(
     const cvite_patch *patch,
     cvite_error *error);
 
+cvite_status cvite_host_collect_retired_snapshots(
+    size_t *reclaimed_count,
+    cvite_error *error);
+
 uint64_t cvite_host_generation(void);
 
 /* Internal stop-the-world gate used only while retired JIT code is removed. */

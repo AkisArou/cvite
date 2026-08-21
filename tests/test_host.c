@@ -151,5 +151,11 @@ int main(void)
     CHECK(cvite_host_active_call_count() == 0U);
     CHECK(cvite_host_try_begin_quiescence());
     cvite_host_end_quiescence();
+    {
+        size_t reclaimed_snapshots = 0U;
+        CHECK(cvite_host_collect_retired_snapshots(
+            &reclaimed_snapshots, &error) == CVITE_STATUS_OK);
+        CHECK(reclaimed_snapshots >= 1U);
+    }
     return EXIT_SUCCESS;
 }

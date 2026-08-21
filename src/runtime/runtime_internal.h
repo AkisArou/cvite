@@ -39,6 +39,8 @@ typedef struct cvite_dispatch_snapshot {
 
 struct cvite_runtime {
     atomic_flag writer_lock;
+    atomic_bool snapshot_collection_gate;
+    atomic_uint_fast64_t active_snapshot_readers;
     _Atomic(cvite_dispatch_snapshot *) active_snapshot;
     cvite_dispatch_snapshot *retired_snapshots;
 
@@ -55,6 +57,8 @@ struct cvite_runtime {
 
 void cvite_internal_lock(cvite_runtime *runtime);
 void cvite_internal_unlock(cvite_runtime *runtime);
+void cvite_internal_snapshot_reader_enter(cvite_runtime *runtime);
+void cvite_internal_snapshot_reader_leave(cvite_runtime *runtime);
 
 CVITE_PRINTF_LIKE(6, 7)
 cvite_status cvite_internal_fail(

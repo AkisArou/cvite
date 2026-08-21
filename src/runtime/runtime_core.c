@@ -21,6 +21,41 @@ void cvite_internal_unlock(cvite_runtime *runtime)
     atomic_flag_clear_explicit(&runtime->writer_lock, memory_order_release);
 }
 
+void cvite_internal_snapshot_reader_enter(cvite_runtime *runtime)
+{
+    for (;;) {
+        while (atomic_load_explicit(
+            &runtime->snapshot_collection_gate, memory_order_seq_cst)) {
+            atomic_signal_fence(memory_order_seq_cst);
+        }
+
+        (void)atomic_fetch_add_explicit(
+            &runtime->active_snapshot_readers,
+            UINT64_C(1),
+            memory_order_seq_cst);
+        if (!atomic_load_explicit(
+                &runtime->snapshot_collection_gate, memory_order_seq_cst)) {
+            return;
+        }
+
+        (void)atomic_fetch_sub_explicit(
+            &runtime->active_snapshot_readers,
+            UINT64_C(1),
+            memory_order_seq_cst);
+    }
+}
+
+void cvite_internal_snapshot_reader_leave(cvite_runtime *runtime)
+{
+    const uint_fast64_t previous = atomic_fetch_sub_explicit(
+        &runtime->active_snapshot_readers,
+        UINT64_C(1),
+        memory_order_seq_cst);
+    if (previous == 0U) {
+        abort();
+    }
+}
+
 void cvite_error_clear(cvite_error *error)
 {
     if (error == NULL) {
@@ -247,6 +282,8 @@ cvite_status cvite_runtime_create(cvite_runtime **runtime, cvite_error *error)
     }
 
     created->writer_lock = (atomic_flag)ATOMIC_FLAG_INIT;
+    atomic_init(&created->snapshot_collection_gate, false);
+    atomic_init(&created->active_snapshot_readers, UINT64_C(0));
     atomic_init(&created->active_snapshot, initial);
     *runtime = created;
     return CVITE_STATUS_OK;
@@ -302,16 +339,83 @@ cvite_status cvite_runtime_seal(cvite_runtime *runtime, cvite_error *error)
     return CVITE_STATUS_OK;
 }
 
-uint64_t cvite_runtime_generation(const cvite_runtime *runtime)
+cvite_status cvite_runtime_collect_retired(
+    cvite_runtime *runtime,
+    size_t *reclaimed_count,
+    cvite_error *error)
 {
     cvite_dispatch_snapshot *snapshot = NULL;
+    size_t reclaimed = 0U;
+    bool expected = false;
+
+    cvite_error_clear(error);
+    if (runtime == NULL || reclaimed_count == NULL) {
+        return cvite_internal_fail(
+            error,
+            CVITE_STATUS_INVALID_ARGUMENT,
+            CVITE_ID_ZERO,
+            CVITE_ID_ZERO,
+            CVITE_ID_ZERO,
+            "invalid retired-snapshot collection request");
+    }
+
+    *reclaimed_count = 0U;
+    cvite_internal_lock(runtime);
+    if (!atomic_compare_exchange_strong_explicit(
+            &runtime->snapshot_collection_gate,
+            &expected,
+            true,
+            memory_order_seq_cst,
+            memory_order_seq_cst)) {
+        cvite_internal_unlock(runtime);
+        return CVITE_STATUS_OK;
+    }
+
+    if (atomic_load_explicit(
+            &runtime->active_snapshot_readers,
+            memory_order_seq_cst) != UINT64_C(0)) {
+        atomic_store_explicit(
+            &runtime->snapshot_collection_gate,
+            false,
+            memory_order_seq_cst);
+        cvite_internal_unlock(runtime);
+        return CVITE_STATUS_OK;
+    }
+
+    snapshot = runtime->retired_snapshots;
+    runtime->retired_snapshots = NULL;
+    while (snapshot != NULL) {
+        cvite_dispatch_snapshot *next = snapshot->retired_next;
+        free(snapshot);
+        snapshot = next;
+        reclaimed += 1U;
+    }
+
+    atomic_store_explicit(
+        &runtime->snapshot_collection_gate,
+        false,
+        memory_order_seq_cst);
+    cvite_internal_unlock(runtime);
+    *reclaimed_count = reclaimed;
+    return CVITE_STATUS_OK;
+}
+
+uint64_t cvite_runtime_generation(const cvite_runtime *runtime)
+{
+    cvite_runtime *mutable_runtime = (cvite_runtime *)runtime;
+    cvite_dispatch_snapshot *snapshot = NULL;
+    uint64_t generation = 0U;
 
     if (runtime == NULL) {
         return 0U;
     }
+
+    cvite_internal_snapshot_reader_enter(mutable_runtime);
     snapshot = atomic_load_explicit(
         &runtime->active_snapshot, memory_order_acquire);
-    return snapshot->generation;
+    generation = snapshot->generation;
+    cvite_internal_snapshot_reader_leave(mutable_runtime);
+    return generation;
 }
 
 size_t cvite_runtime_function_count(const cvite_runtime *runtime)

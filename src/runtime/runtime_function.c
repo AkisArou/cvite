@@ -144,14 +144,22 @@ cvite_function_pointer cvite_runtime_target_at(
     const cvite_runtime *runtime,
     size_t slot)
 {
+    cvite_runtime *mutable_runtime = (cvite_runtime *)runtime;
     cvite_dispatch_snapshot *snapshot = NULL;
+    cvite_function_pointer target = NULL;
 
     if (runtime == NULL) {
         return NULL;
     }
+
+    cvite_internal_snapshot_reader_enter(mutable_runtime);
     snapshot = atomic_load_explicit(
         &runtime->active_snapshot, memory_order_acquire);
-    return slot < snapshot->slot_count ? snapshot->targets[slot] : NULL;
+    if (slot < snapshot->slot_count) {
+        target = snapshot->targets[slot];
+    }
+    cvite_internal_snapshot_reader_leave(mutable_runtime);
+    return target;
 }
 
 cvite_status cvite_runtime_acquire_view(
@@ -172,9 +180,11 @@ cvite_status cvite_runtime_acquire_view(
             "invalid dispatch view request");
     }
 
+    cvite_internal_snapshot_reader_enter((cvite_runtime *)runtime);
     snapshot = atomic_load_explicit(
         &runtime->active_snapshot, memory_order_acquire);
     *view = (cvite_dispatch_view){
+        runtime,
         snapshot,
         snapshot->generation,
         snapshot->slot_count,
@@ -193,4 +203,20 @@ cvite_function_pointer cvite_dispatch_view_target(
     }
     snapshot = (const cvite_dispatch_snapshot *)view->snapshot;
     return snapshot->targets[slot];
+}
+
+void cvite_runtime_release_view(cvite_dispatch_view *view)
+{
+    cvite_runtime *runtime = NULL;
+
+    if (view == NULL || view->runtime == NULL || view->snapshot == NULL) {
+        return;
+    }
+
+    runtime = (cvite_runtime *)view->runtime;
+    view->runtime = NULL;
+    view->snapshot = NULL;
+    view->generation = 0U;
+    view->slot_count = 0U;
+    cvite_internal_snapshot_reader_leave(runtime);
 }

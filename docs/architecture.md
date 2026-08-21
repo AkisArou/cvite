@@ -196,3 +196,24 @@ The repository currently contains:
 The next execution milestone is extending the LLVM pass to emit baseline stable
 entries and versioned implementations, then connecting those descriptors to the
 existing loader and runtime automatically.
+
+
+## Dispatch snapshot reclamation
+
+Every compatible refresh publishes a new immutable runtime dispatch snapshot.
+Readers acquire a lightweight snapshot scope before dereferencing the active
+snapshot; explicit `cvite_dispatch_view` users hold that scope until
+`cvite_runtime_release_view`.
+
+Retired snapshots are reclaimed through a non-blocking writer gate. Collection
+raises the gate, verifies that no snapshot reader is active, detaches the full
+retired list while holding the runtime writer lock, and frees it. A reader that
+races with the gate either completes before collection or backs out and retries
+against the active snapshot. If a long-lived view is still active, collection
+returns successfully with zero reclaimed snapshots and the watcher retries on a
+later idle poll.
+
+This lifecycle is independent from ORC machine-code reclamation. ORC generation
+ownership protects executable targets; the runtime reader gate protects the
+immutable table that stores those targets. Both must be safe before their
+respective memory can be released.

@@ -58,6 +58,7 @@ static void *reader_main(void *opaque)
         second = restore(cvite_dispatch_view_target(&view, context->second_slot));
         if (first == NULL || second == NULL) {
             atomic_fetch_add_explicit(&context->failures, 1, memory_order_relaxed);
+            cvite_runtime_release_view(&view);
             continue;
         }
 
@@ -65,6 +66,7 @@ static void *reader_main(void *opaque)
         if (sum != 30 && sum != 300) {
             atomic_fetch_add_explicit(&context->failures, 1, memory_order_relaxed);
         }
+        cvite_runtime_release_view(&view);
     }
 
     return NULL;
@@ -92,6 +94,8 @@ int main(void)
     pthread_t readers[reader_count];
     test_context context;
     uint64_t generation = 0U;
+    size_t reclaimed = 0U;
+    size_t total_reclaimed = 0U;
     int index = 0;
 
     CHECK(cvite_runtime_create(&runtime, &error) == CVITE_STATUS_OK);
@@ -134,6 +138,11 @@ int main(void)
         patch.candidate_generation = generation + 1U;
         CHECK(cvite_runtime_apply_patch(runtime, &patch, &error) == CVITE_STATUS_OK);
         generation += 1U;
+        if ((index & 127) == 0) {
+            CHECK(cvite_runtime_collect_retired(
+                runtime, &reclaimed, &error) == CVITE_STATUS_OK);
+            total_reclaimed += reclaimed;
+        }
     }
 
     atomic_store_explicit(&context.stop, true, memory_order_relaxed);
@@ -143,6 +152,10 @@ int main(void)
 
     CHECK(atomic_load_explicit(&context.failures, memory_order_relaxed) == 0);
     CHECK(cvite_runtime_generation(runtime) == generation);
+    CHECK(cvite_runtime_collect_retired(
+        runtime, &reclaimed, &error) == CVITE_STATUS_OK);
+    total_reclaimed += reclaimed;
+    CHECK(total_reclaimed >= (size_t)patch_count);
 
     cvite_runtime_destroy(runtime);
     return 0;

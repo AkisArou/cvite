@@ -58,6 +58,7 @@ typedef struct cvite_storage_definition {
 } cvite_storage_definition;
 
 typedef struct cvite_dispatch_view {
+    const cvite_runtime *runtime;
     const void *snapshot;
     uint64_t generation;
     size_t slot_count;
@@ -105,6 +106,10 @@ cvite_function_pointer cvite_runtime_target_at(
     const cvite_runtime *runtime,
     size_t slot);
 
+/*
+ * A dispatch view pins its immutable snapshot until release. Views must not
+ * be copied or used after cvite_runtime_release_view.
+ */
 cvite_status cvite_runtime_acquire_view(
     const cvite_runtime *runtime,
     cvite_dispatch_view *view,
@@ -113,6 +118,17 @@ cvite_status cvite_runtime_acquire_view(
 cvite_function_pointer cvite_dispatch_view_target(
     const cvite_dispatch_view *view,
     size_t slot);
+
+void cvite_runtime_release_view(cvite_dispatch_view *view);
+
+/*
+ * Non-blocking collection. If a view or short target lookup is active, the
+ * call succeeds with reclaimed_count set to zero and may be retried later.
+ */
+cvite_status cvite_runtime_collect_retired(
+    cvite_runtime *runtime,
+    size_t *reclaimed_count,
+    cvite_error *error);
 
 void cvite_error_clear(cvite_error *error);
 

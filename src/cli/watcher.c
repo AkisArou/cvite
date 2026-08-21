@@ -173,6 +173,7 @@ static int publish_candidate(cvite_run_state *state)
     }
 
     size_t reclaimed_generations = 0U;
+    size_t reclaimed_snapshots = 0U;
     status = cvite_orc_loader_collect_retired(
         state->loader, &reclaimed_generations, &error);
     if (status != CVITE_STATUS_OK) {
@@ -183,6 +184,18 @@ static int publish_candidate(cvite_run_state *state)
             "[cvite] reclaimed %zu retired JIT generation%s\n",
             reclaimed_generations,
             reclaimed_generations == 1U ? "" : "s");
+    }
+
+    status = cvite_host_collect_retired_snapshots(
+        &reclaimed_snapshots, &error);
+    if (status != CVITE_STATUS_OK) {
+        cvite_print_runtime_error("dispatch-snapshot collection", &error);
+    } else if (reclaimed_snapshots != 0U) {
+        (void)fprintf(
+            stderr,
+            "[cvite] reclaimed %zu retired dispatch snapshot%s\n",
+            reclaimed_snapshots,
+            reclaimed_snapshots == 1U ? "" : "s");
     }
 
     (void)clock_gettime(CLOCK_MONOTONIC, &finished);
@@ -322,6 +335,7 @@ void *cvite_watch_source(void *opaque)
         if (poll_status == 0) {
             cvite_error collection_error = {0};
             size_t reclaimed_generations = 0U;
+            size_t reclaimed_snapshots = 0U;
             (void)cvite_native_link_poll(
                 state->loader, state->source_path, state->clang_path);
             if (cvite_orc_loader_collect_retired(
@@ -330,6 +344,12 @@ void *cvite_watch_source(void *opaque)
                     &collection_error) != CVITE_STATUS_OK) {
                 cvite_print_runtime_error(
                     "retired-code collection", &collection_error);
+            }
+            if (cvite_host_collect_retired_snapshots(
+                    &reclaimed_snapshots,
+                    &collection_error) != CVITE_STATUS_OK) {
+                cvite_print_runtime_error(
+                    "dispatch-snapshot collection", &collection_error);
             }
             continue;
         }

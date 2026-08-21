@@ -100,6 +100,8 @@ int main(void)
     cvite_patch valid_patch;
     cvite_function_update mixed_updates[2];
     cvite_patch mixed_patch;
+    cvite_dispatch_view held_view = {0};
+    size_t reclaimed_snapshots = 0U;
 
     status = cvite_runtime_create(&runtime, &error);
     CHECK(status == CVITE_STATUS_OK);
@@ -176,9 +178,23 @@ int main(void)
     valid_patch.functions = &valid_update;
     valid_patch.function_count = 1U;
 
+    status = cvite_runtime_acquire_view(runtime, &held_view, &error);
+    CHECK(status == CVITE_STATUS_OK);
+    CHECK(held_view.generation == 0U);
+
     status = cvite_runtime_apply_patch(runtime, &valid_patch, &error);
     CHECK(status == CVITE_STATUS_OK);
     CHECK(cvite_runtime_generation(runtime) == 1U);
+    CHECK(cvite_runtime_collect_retired(
+        runtime, &reclaimed_snapshots, &error) == CVITE_STATUS_OK);
+    CHECK(reclaimed_snapshots == 0U);
+    CHECK(restore_update(
+        cvite_dispatch_view_target(&held_view, update_slot)) == update_v1);
+    cvite_runtime_release_view(&held_view);
+    cvite_runtime_release_view(&held_view);
+    CHECK(cvite_runtime_collect_retired(
+        runtime, &reclaimed_snapshots, &error) == CVITE_STATUS_OK);
+    CHECK(reclaimed_snapshots >= 1U);
 
     update = restore_update(cvite_runtime_target_at(runtime, update_slot));
     CHECK(update(state, 2) == 30);
@@ -207,6 +223,9 @@ int main(void)
     update = restore_update(cvite_runtime_target_at(runtime, update_slot));
     CHECK(update(state, 1) == 40);
     CHECK(state->updates == 3);
+
+    status = cvite_runtime_collect_retired(runtime, NULL, &error);
+    CHECK(status == CVITE_STATUS_INVALID_ARGUMENT);
 
     cvite_runtime_destroy(runtime);
     return 0;

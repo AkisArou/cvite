@@ -755,3 +755,18 @@ uint64_t cvite_host_generation(void)
         &cvite_host_active_runtime, memory_order_acquire);
     return runtime != NULL ? cvite_runtime_generation(runtime) : 0U;
 }
+
+cvite_status cvite_host_collect_retired_snapshots(
+    size_t *reclaimed_count,
+    cvite_error *error)
+{
+    cvite_runtime *runtime = NULL;
+    cvite_status status = cvite_host_seal(error);
+
+    if (status != CVITE_STATUS_OK) {
+        return status;
+    }
+    runtime = atomic_load_explicit(
+        &cvite_host_active_runtime, memory_order_acquire);
+    return cvite_runtime_collect_retired(runtime, reclaimed_count, error);
+}
