@@ -1,0 +1,75 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CVITE_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "llvm18",
+      "displayName": "CVite development with Clang/LLVM 18",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-18",
+        "CMAKE_CXX_COMPILER": "clang++-18",
+        "CVITE_BUILD_COMPILER": "ON",
+        "CVITE_BUILD_LLVM_PASS": "ON",
+        "CVITE_BUILD_ORC_LOADER": "ON",
+        "CVITE_LIBCLANG_ROOT": "/usr/lib/llvm-18",
+        "LLVM_DIR": "/usr/lib/llvm-18/lib/cmake/llvm"
+      }
+    },
+    {
+      "name": "sanitize",
+      "displayName": "Runtime ASan and UBSan",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "llvm18",
+      "configurePreset": "llvm18"
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "llvm18",
+      "configurePreset": "llvm18",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize",
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1:strict_string_checks=1",
+        "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"
+      },
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
