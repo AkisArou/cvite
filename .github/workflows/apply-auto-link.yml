@@ -1,0 +1,69 @@
+name: Apply automatic native link discovery
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.ref == 'bootstrap/m0-runtime'))
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply scoped implementation patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          encoded=.cvite/auto-link-patch.tar.gz.b64
+          workflow=.github/workflows/apply-auto-link.yml
+          test -f "$encoded"
+          base64 --decode "$encoded" > /tmp/cvite-auto-link-patch.tar.gz
+          echo "cca5c4966def126a39bf36559277a55aa32acfcd5a8533093c73e0f0390080d0  /tmp/cvite-auto-link-patch.tar.gz" | sha256sum --check
+          tar -xzf /tmp/cvite-auto-link-patch.tar.gz -C .
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            CMakeLists.txt \
+            README.md \
+            docs/dev-server.md \
+            include/cvite/orc_loader.h \
+            include/cvite/status.h \
+            src/cli/compile_database.c \
+            src/cli/native_links.c \
+            src/cli/run.c \
+            src/cli/run_internal.h \
+            src/cli/toolchain.c \
+            src/cli/watch_dependencies.inc \
+            src/host/orc_loader.cpp \
+            src/runtime/status.c \
+            tests/check_native_links.py \
+            tests/test_orc_loader.c
+          git rm -f --ignore-unmatch -- \
+            "$encoded" \
+            "$workflow" \
+            .github/workflows/export-auto-link-source.yml \
+            .github/workflows/apply-changed-filter.yml \
+            .cvite/apply-changed-filter.py \
+            .cvite/changed-functions/part-00 \
+            .cvite/changed-functions/part-01 \
+            .cvite/changed-functions/part-03
+          git diff --cached --check
+          git commit -m "feat: discover native targets and link inputs"
+          git push origin HEAD:bootstrap/m0-runtime
