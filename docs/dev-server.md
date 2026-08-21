@@ -183,14 +183,14 @@ The current command remains an experimental Linux/Clang vertical slice:
 - one supported C `main` across the linked translation units;
 - incremental per-TU compilation with a whole-program LLVM relink;
 - compilation-database C commands under one project root;
-- no automatic external library/archive ingestion yet;
+- CMake File API, CMake `link.txt`, and Ninja command discovery for native
+  support inputs;
 - no automatic layout-changing state migration;
 - JIT generations retained until process exit.
 
-Changed-function filtering, target-aware compile-command selection, custom
-link inputs, smallest-boundary restart, and generation reclamation are the next
-orchestration layers. The current TU cache already narrows compilation while
-retaining atomic project-wide publication.
+The current TU cache narrows compilation while retaining atomic project-wide
+publication. Changed-function filtering, smallest-boundary restart, and safe
+old-generation reclamation remain later orchestration layers.
 
 ## Lifetime policy
 
@@ -199,3 +199,56 @@ returns. This keeps JIT code available while normal process-exit and `atexit`
 handling runs, and avoids unloading code that a surviving application thread
 could still be executing. Epoch/quiescence-based reclamation will eventually
 replace this conservative process-lifetime retention.
+
+## Automatic native link discovery
+
+CVite reconstructs the native support environment of the selected executable
+without requiring application source changes. Discovery is backend-based and
+uses the first unambiguous source of target metadata:
+
+1. **CMake File API.** CVite reads the newest codemodel-v2 reply, matches an
+   executable target against the selected translation units, and consumes its
+   `link.commandFragments`.
+2. **CMake `link.txt`.** Older or non-queried CMake builds fall back to the
+   matching `CMakeFiles/<target>.dir/link.txt` command.
+3. **Ninja command tool.** Standalone Ninja projects are inspected through
+   `ninja -C <build> -t commands`; CVite scores executable link commands against
+   the compilation-database sources.
+
+The discovery layer recognizes `-L`, `-l`, `-l:filename`, direct shared-library
+paths, static archives, standalone support objects, and rpath search hints.
+Dynamic libraries are loaded into an LLVM ORC platform JITDylib. Static archives
+and support objects are linked into dedicated ORC namespaces. Every baseline
+and candidate generation receives the same namespaces in its link order, so
+external symbol addresses remain stable across compatible refreshes.
+
+CMake File API index, codemodel, and target reply files are watched. Ninja's
+`build.ninja`, recursively referenced `include`/`subninja` files, compilation
+database, and every resolved native input are also part of the active native
+plan. A successful rediscovery replaces these watches as one set.
+
+CVite reads explicit target options from the Clang compilation database and,
+when none are present, asks the selected Clang driver for its default target.
+A target whose architecture or operating-system family differs from the host JIT
+is rejected before native code is published. One in-process CVite session cannot
+execute a foreign architecture.
+
+The native plan fingerprints the normalized target, selected backend, target
+name, link tokens, resolved input kinds and paths, and the **contents** of native
+inputs. This catches replacement of a shared library, archive, or support object
+at the same pathname—even when an editor or build tool swaps the inode
+atomically. Metadata-only timestamp changes that resolve to an identical plan do
+not restart the application.
+
+A native input or link-plan change is a red refresh. CVite re-executes itself so
+the edited program starts from a fresh baseline and coherent native symbol
+graph:
+
+```text
+[cvite] a native link input changed; restarting the process
+```
+
+Set `CVITE_DISABLE_AUTO_RESTART=1` to inspect the rejection without restarting.
+`CVITE_PRELOAD` remains available as an explicit override for plugin systems,
+unusual build systems, and libraries whose ownership cannot be inferred.
+`CVITE_NINJA` can override the Ninja executable used by the discovery backend.

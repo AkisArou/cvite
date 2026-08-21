@@ -35,6 +35,11 @@ static double elapsed_milliseconds(struct timespec start, struct timespec finish
 
 static int publish_candidate(cvite_run_state *state)
 {
+    if (cvite_native_link_check(
+            state->loader, state->source_path, state->clang_path) != 0) {
+        return -1;
+    }
+
     char object_path[PATH_MAX];
     cvite_orc_generation generation = CVITE_ORC_GENERATION_INVALID;
     cvite_patch patch = {0};
@@ -260,6 +265,8 @@ void *cvite_watch_source(void *opaque)
             break;
         }
         if (poll_status == 0) {
+            (void)cvite_native_link_poll(
+                state->loader, state->source_path, state->clang_path);
             continue;
         }
         if ((poll_descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {

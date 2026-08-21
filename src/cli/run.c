@@ -264,6 +264,12 @@ static int prepare_baseline(
         return -1;
     }
 
+    if (cvite_native_link_prepare(
+            state->loader, state->source_path, state->clang_path) != 0) {
+        cvite_remove_if_present(object_path);
+        return -1;
+    }
+
     status = cvite_orc_loader_stage_object(
         state->loader,
         object_path,

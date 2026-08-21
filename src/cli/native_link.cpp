@@ -1,43 +1,13 @@
-from __future__ import annotations
-
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def fail(message: str) -> None:
-    raise SystemExit(message)
-
-
-def write(path: str, content: str) -> None:
-    destination = ROOT / path
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(content, encoding="utf-8")
-
-
-def replace_once(path: str, old: str, new: str) -> None:
-    destination = ROOT / path
-    text = destination.read_text(encoding="utf-8")
-    count = text.count(old)
-    if count != 1:
-        fail(f"{path}: expected one occurrence of marker, found {count}: {old!r}")
-    destination.write_text(text.replace(old, new, 1), encoding="utf-8")
-
-
-def insert_before_last(path: str, marker: str, insertion: str) -> None:
-    destination = ROOT / path
-    text = destination.read_text(encoding="utf-8")
-    position = text.rfind(marker)
-    if position < 0:
-        fail(f"{path}: marker not found: {marker!r}")
-    destination.write_text(text[:position] + insertion + text[position:], encoding="utf-8")
-
-
-native_link_cpp = r'''#include "run_internal.h"
+#include "run_internal.h"
 
 #include "cvite/orc_loader.h"
 
+#if CVITE_COMPILE_DATABASE_ENABLED
 #include <clang-c/CXCompilationDatabase.h>
+#endif
+
+#include "llvm/Support/Error.h"
+#include "llvm/Support/JSON.h"
 
 #include <algorithm>
 #include <array>
@@ -48,8 +18,11 @@ native_link_cpp = r'''#include "run_internal.h"
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
+#include <iterator>
 #include <optional>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -57,6 +30,7 @@ native_link_cpp = r'''#include "run_internal.h"
 #include <system_error>
 #include <utility>
 #include <vector>
+#include <unordered_set>
 
 #include <fcntl.h>
 #include <spawn.h>
@@ -75,6 +49,7 @@ constexpr std::size_t kAncestorLimit = 10U;
 constexpr std::size_t kLinkSearchDepth = 8U;
 constexpr std::size_t kCommandOutputLimit = 1024U * 1024U;
 
+#if CVITE_COMPILE_DATABASE_ENABLED
 class CXStringOwner final {
 public:
     explicit CXStringOwner(CXString value) : value_(value) {}
@@ -91,6 +66,7 @@ public:
 private:
     CXString value_;
 };
+#endif
 
 enum class NativeInputKind {
     DynamicLibrary,
@@ -98,17 +74,48 @@ enum class NativeInputKind {
     ObjectFile,
 };
 
+struct FileSignature final {
+    std::uint64_t device = 0U;
+    std::uint64_t inode = 0U;
+    std::uint64_t size = 0U;
+    std::int64_t modified_seconds = 0;
+    std::int64_t modified_nanoseconds = 0;
+    std::uint64_t content_hash = 0U;
+    bool is_directory = false;
+    bool valid = false;
+};
+
 struct NativeInput final {
     NativeInputKind kind = NativeInputKind::DynamicLibrary;
     fs::path path;
+    FileSignature signature;
+};
+
+struct TrackedPath final {
+    fs::path path;
+    FileSignature signature;
+};
+
+struct DiscoveredLinkCommand final {
+    std::string backend;
+    std::string target_name;
+    fs::path working_directory;
+    fs::path display_file;
+    std::vector<std::string> tokens;
+    std::vector<fs::path> metadata_files;
+    std::size_t score = 0U;
 };
 
 struct LinkPlan final {
     std::string target_triple;
     fs::path compilation_database;
+    std::string backend;
+    std::string target_name;
+    fs::path build_directory;
     fs::path link_command;
-    fs::file_time_type link_command_time{};
+    std::vector<std::string> link_tokens;
     std::vector<NativeInput> inputs;
+    std::vector<TrackedPath> tracked_paths;
     std::uint64_t fingerprint = 0U;
 };
 
@@ -162,6 +169,14 @@ fs::path canonicalIfPossible(const fs::path &path)
     return error ? path.lexically_normal() : result.lexically_normal();
 }
 
+
+fs::path absoluteNormalized(const fs::path &path)
+{
+    std::error_code error;
+    const fs::path result = fs::absolute(path, error);
+    return error ? path.lexically_normal() : result.lexically_normal();
+}
+
 bool isRegularFile(const fs::path &path)
 {
     std::error_code error;
@@ -182,6 +197,94 @@ std::optional<std::string> readText(const fs::path &path)
     return output.str();
 }
 
+
+std::uint64_t hashFileContents(const fs::path &path)
+{
+    constexpr std::uint64_t offset = UINT64_C(1469598103934665603);
+    constexpr std::uint64_t prime = UINT64_C(1099511628211);
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return 0U;
+    }
+
+    std::uint64_t value = offset;
+    std::array<char, 64U * 1024U> buffer{};
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = input.gcount();
+        for (std::streamsize index = 0; index < count; ++index) {
+            value ^= static_cast<unsigned char>(buffer[static_cast<std::size_t>(index)]);
+            value *= prime;
+        }
+    }
+    return input.eof() ? value : 0U;
+}
+
+FileSignature fileSignature(const fs::path &path, bool hash_contents)
+{
+    FileSignature signature;
+    struct stat status {};
+    if (stat(path.c_str(), &status) != 0) {
+        return signature;
+    }
+
+    signature.device = static_cast<std::uint64_t>(status.st_dev);
+    signature.inode = static_cast<std::uint64_t>(status.st_ino);
+    signature.size = static_cast<std::uint64_t>(status.st_size);
+    signature.modified_seconds =
+        static_cast<std::int64_t>(status.st_mtim.tv_sec);
+    signature.modified_nanoseconds =
+        static_cast<std::int64_t>(status.st_mtim.tv_nsec);
+    signature.is_directory = S_ISDIR(status.st_mode);
+    signature.valid = S_ISREG(status.st_mode) || signature.is_directory;
+    if (signature.valid && hash_contents && !signature.is_directory) {
+        signature.content_hash = hashFileContents(path);
+    }
+    return signature;
+}
+
+bool sameCheapSignature(
+    const FileSignature &left,
+    const FileSignature &right)
+{
+    return left.valid == right.valid && left.device == right.device &&
+        left.inode == right.inode && left.size == right.size &&
+        left.modified_seconds == right.modified_seconds &&
+        left.modified_nanoseconds == right.modified_nanoseconds &&
+        left.is_directory == right.is_directory;
+}
+
+void addTrackedPath(
+    std::vector<TrackedPath> &paths,
+    fs::path path,
+    bool hash_contents)
+{
+    path = canonicalIfPossible(path);
+    const auto found = std::find_if(
+        paths.begin(), paths.end(), [&](const TrackedPath &tracked) {
+            return tracked.path == path;
+        });
+    if (found != paths.end()) {
+        return;
+    }
+
+    const FileSignature signature = fileSignature(path, hash_contents);
+    if (signature.valid) {
+        paths.push_back(TrackedPath{std::move(path), signature});
+    }
+}
+
+bool trackedPathsChanged(const LinkPlan &plan)
+{
+    for (const TrackedPath &tracked : plan.tracked_paths) {
+        if (!sameCheapSignature(
+                tracked.signature, fileSignature(tracked.path, false))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::optional<fs::path> findCompilationDatabase(const fs::path &source)
 {
     fs::path directory = canonicalIfPossible(source).parent_path();
@@ -197,7 +300,7 @@ std::optional<fs::path> findCompilationDatabase(const fs::path &source)
         };
         for (const fs::path &candidate : candidates) {
             if (isRegularFile(candidate)) {
-                return canonicalIfPossible(candidate);
+                return absoluteNormalized(candidate);
             }
         }
 
@@ -219,7 +322,7 @@ std::optional<fs::path> findCompilationDatabase(const fs::path &source)
             const fs::path candidate =
                 iterator->path() / "compile_commands.json";
             if (isRegularFile(candidate)) {
-                return canonicalIfPossible(candidate);
+                return absoluteNormalized(candidate);
             }
         }
 
@@ -235,12 +338,15 @@ std::optional<fs::path> findCompilationDatabase(const fs::path &source)
 struct CompileDatabaseData final {
     std::vector<std::vector<std::string>> commands;
     std::vector<fs::path> sources;
+    std::vector<fs::path> working_directories;
 };
 
 CompileDatabaseData readCompilationDatabase(
     const fs::path &database_path,
     const fs::path &primary_source)
 {
+#if CVITE_COMPILE_DATABASE_ENABLED
+
     CompileDatabaseData result;
     CXCompilationDatabase_Error database_error =
         CXCompilationDatabase_CanNotLoadDatabase;
@@ -259,6 +365,8 @@ CompileDatabaseData readCompilationDatabase(
     const unsigned command_count = clang_CompileCommands_getSize(commands);
     result.commands.reserve(static_cast<std::size_t>(command_count));
     result.sources.reserve(static_cast<std::size_t>(command_count));
+    result.working_directories.reserve(
+        static_cast<std::size_t>(command_count));
 
     for (unsigned command_index = 0U;
          command_index < command_count;
@@ -271,6 +379,11 @@ CompileDatabaseData readCompilationDatabase(
             ? primary_source
             : canonicalIfPossible(source_text);
         result.sources.push_back(std::move(source_path));
+        const std::string directory_text =
+            CXStringOwner(clang_CompileCommand_getDirectory(command)).str();
+        result.working_directories.push_back(directory_text.empty()
+                ? database_path.parent_path()
+                : canonicalIfPossible(directory_text));
 
         const unsigned argument_count =
             clang_CompileCommand_getNumArgs(command);
@@ -289,6 +402,13 @@ CompileDatabaseData readCompilationDatabase(
     clang_CompileCommands_dispose(commands);
     clang_CompilationDatabase_dispose(database);
     return result;
+#else
+    (void)database_path;
+    CompileDatabaseData result;
+    result.sources.push_back(primary_source);
+    result.working_directories.push_back(primary_source.parent_path());
+    return result;
+#endif
 }
 
 std::vector<std::string> tokenizeCommand(std::string_view command)
@@ -455,9 +575,11 @@ std::optional<std::string> runAndCapture(
     }
 
     int descriptors[2] = {-1, -1};
-    if (pipe2(descriptors, O_CLOEXEC) != 0) {
+    if (pipe(descriptors) != 0) {
         return std::nullopt;
     }
+    (void)fcntl(descriptors[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(descriptors[1], F_SETFD, FD_CLOEXEC);
 
     posix_spawn_file_actions_t actions;
     if (posix_spawn_file_actions_init(&actions) != 0) {
@@ -516,6 +638,504 @@ std::optional<std::string> runAndCapture(
         return std::nullopt;
     }
     return trim(std::move(output));
+}
+
+bool isLibraryToken(std::string_view token);
+
+void appendUniquePath(std::vector<fs::path> &paths, fs::path path)
+{
+    path = canonicalIfPossible(path);
+    if (std::find(paths.begin(), paths.end(), path) == paths.end()) {
+        paths.push_back(std::move(path));
+    }
+}
+
+std::vector<fs::path> candidateBuildRoots(
+    const fs::path &source,
+    const std::optional<fs::path> &database)
+{
+    std::vector<fs::path> roots;
+    const fs::path source_directory = canonicalIfPossible(source).parent_path();
+    if (database.has_value()) {
+        appendUniquePath(roots, database->parent_path());
+    }
+    appendUniquePath(roots, source_directory);
+    appendUniquePath(roots, source_directory / "build");
+    appendUniquePath(roots, source_directory / "build-debug");
+    appendUniquePath(roots, source_directory / "cmake-build-debug");
+    appendUniquePath(roots, source_directory / "cmake-build-release");
+
+    std::error_code error;
+    for (fs::directory_iterator iterator(
+             source_directory,
+             fs::directory_options::skip_permission_denied,
+             error),
+         end;
+         !error && iterator != end;
+         iterator.increment(error)) {
+        if (!iterator->is_directory(error)) {
+            continue;
+        }
+        const std::string name = iterator->path().filename().string();
+        if (startsWith(name, "build") || startsWith(name, "cmake-build")) {
+            appendUniquePath(roots, iterator->path());
+        }
+    }
+    return roots;
+}
+
+std::optional<llvm::json::Value> parseJsonFile(const fs::path &path)
+{
+    const std::optional<std::string> text = readText(path);
+    if (!text.has_value()) {
+        return std::nullopt;
+    }
+    llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(*text);
+    if (!parsed) {
+        llvm::consumeError(parsed.takeError());
+        return std::nullopt;
+    }
+    return std::move(*parsed);
+}
+
+std::optional<fs::path> newestFileApiIndex(const fs::path &reply_directory)
+{
+    std::error_code error;
+    std::optional<fs::path> best;
+    fs::file_time_type best_time{};
+    for (fs::directory_iterator iterator(
+             reply_directory,
+             fs::directory_options::skip_permission_denied,
+             error),
+         end;
+         !error && iterator != end;
+         iterator.increment(error)) {
+        if (!iterator->is_regular_file(error)) {
+            continue;
+        }
+        const std::string name = iterator->path().filename().string();
+        if (!startsWith(name, "index-") || !endsWith(name, ".json")) {
+            continue;
+        }
+        const fs::file_time_type time = iterator->last_write_time(error);
+        if (error) {
+            break;
+        }
+        if (!best.has_value() || time > best_time) {
+            best = canonicalIfPossible(iterator->path());
+            best_time = time;
+        }
+    }
+    return best;
+}
+
+std::optional<fs::path> codemodelFileFromIndex(
+    const fs::path &index_path)
+{
+    std::optional<llvm::json::Value> value = parseJsonFile(index_path);
+    if (!value.has_value()) {
+        return std::nullopt;
+    }
+    const llvm::json::Object *root = value->getAsObject();
+    if (root == nullptr) {
+        return std::nullopt;
+    }
+    const llvm::json::Array *objects = root->getArray("objects");
+    if (objects == nullptr) {
+        return std::nullopt;
+    }
+    for (const llvm::json::Value &entry_value : *objects) {
+        const llvm::json::Object *entry = entry_value.getAsObject();
+        if (entry == nullptr) {
+            continue;
+        }
+        const std::optional<llvm::StringRef> kind = entry->getString("kind");
+        const llvm::json::Object *version = entry->getObject("version");
+        const std::optional<std::int64_t> major = version == nullptr
+            ? std::nullopt
+            : version->getInteger("major");
+        const std::optional<llvm::StringRef> json_file =
+            entry->getString("jsonFile");
+        if (kind.has_value() && *kind == "codemodel" && major.has_value() &&
+            *major == 2 && json_file.has_value()) {
+            return canonicalIfPossible(
+                index_path.parent_path() / json_file->str());
+        }
+    }
+    return std::nullopt;
+}
+
+std::size_t scoreTargetSources(
+    const llvm::json::Object &target,
+    const fs::path &source_root,
+    const std::vector<fs::path> &sources)
+{
+    const llvm::json::Array *target_sources = target.getArray("sources");
+    if (target_sources == nullptr) {
+        return 0U;
+    }
+
+    std::size_t score = 0U;
+    for (const llvm::json::Value &source_value : *target_sources) {
+        const llvm::json::Object *source_object = source_value.getAsObject();
+        if (source_object == nullptr) {
+            continue;
+        }
+        const std::optional<llvm::StringRef> path_text =
+            source_object->getString("path");
+        if (!path_text.has_value()) {
+            continue;
+        }
+        fs::path target_path(path_text->str());
+        if (target_path.is_relative()) {
+            target_path = source_root / target_path;
+        }
+        target_path = canonicalIfPossible(target_path);
+        for (const fs::path &source : sources) {
+            const fs::path canonical_source = canonicalIfPossible(source);
+            if (target_path == canonical_source) {
+                score += 1000U;
+            } else if (target_path.filename() == canonical_source.filename()) {
+                score += 10U;
+            }
+        }
+    }
+    return score;
+}
+
+void appendCommandFragment(
+    std::vector<std::string> &tokens,
+    llvm::StringRef fragment)
+{
+    const std::string text = trim(fragment.str());
+    if (text.empty()) {
+        return;
+    }
+    std::vector<std::string> fragment_tokens = tokenizeCommand(text);
+    if (fragment_tokens.empty()) {
+        tokens.push_back(text);
+        return;
+    }
+    tokens.insert(
+        tokens.end(),
+        std::make_move_iterator(fragment_tokens.begin()),
+        std::make_move_iterator(fragment_tokens.end()));
+}
+
+std::optional<DiscoveredLinkCommand> discoverCMakeFileApi(
+    const std::vector<fs::path> &build_roots,
+    const std::vector<fs::path> &sources)
+{
+    std::optional<DiscoveredLinkCommand> best;
+    bool ambiguous = false;
+
+    for (const fs::path &build_root_value : build_roots) {
+        const fs::path build_root = canonicalIfPossible(build_root_value);
+        const fs::path reply_directory =
+            build_root / ".cmake" / "api" / "v1" / "reply";
+        const std::optional<fs::path> index =
+            newestFileApiIndex(reply_directory);
+        if (!index.has_value()) {
+            continue;
+        }
+        const std::optional<fs::path> codemodel =
+            codemodelFileFromIndex(*index);
+        if (!codemodel.has_value()) {
+            continue;
+        }
+        std::optional<llvm::json::Value> codemodel_value =
+            parseJsonFile(*codemodel);
+        if (!codemodel_value.has_value()) {
+            continue;
+        }
+        const llvm::json::Object *codemodel_object =
+            codemodel_value->getAsObject();
+        if (codemodel_object == nullptr) {
+            continue;
+        }
+        fs::path source_root = sources.empty()
+            ? build_root
+            : sources.front().parent_path();
+        fs::path model_build_root = build_root;
+        if (const llvm::json::Object *paths =
+                codemodel_object->getObject("paths")) {
+            if (const std::optional<llvm::StringRef> source_path =
+                    paths->getString("source")) {
+                source_root = canonicalIfPossible(source_path->str());
+            }
+            if (const std::optional<llvm::StringRef> build_path =
+                    paths->getString("build")) {
+                model_build_root = canonicalIfPossible(build_path->str());
+            }
+        }
+
+        const llvm::json::Array *configurations =
+            codemodel_object->getArray("configurations");
+        if (configurations == nullptr) {
+            continue;
+        }
+        for (const llvm::json::Value &configuration_value : *configurations) {
+            const llvm::json::Object *configuration =
+                configuration_value.getAsObject();
+            if (configuration == nullptr) {
+                continue;
+            }
+            const llvm::json::Array *targets =
+                configuration->getArray("targets");
+            if (targets == nullptr) {
+                continue;
+            }
+            for (const llvm::json::Value &target_reference_value : *targets) {
+                const llvm::json::Object *target_reference =
+                    target_reference_value.getAsObject();
+                if (target_reference == nullptr) {
+                    continue;
+                }
+                const std::optional<llvm::StringRef> json_file =
+                    target_reference->getString("jsonFile");
+                if (!json_file.has_value()) {
+                    continue;
+                }
+                const fs::path target_file = canonicalIfPossible(
+                    codemodel->parent_path() / json_file->str());
+                std::optional<llvm::json::Value> target_value =
+                    parseJsonFile(target_file);
+                if (!target_value.has_value()) {
+                    continue;
+                }
+                const llvm::json::Object *target = target_value->getAsObject();
+                if (target == nullptr) {
+                    continue;
+                }
+                const std::optional<llvm::StringRef> target_type =
+                    target->getString("type");
+                const llvm::json::Object *link = target->getObject("link");
+                if (!target_type.has_value() || !(*target_type == "EXECUTABLE") ||
+                    link == nullptr) {
+                    continue;
+                }
+                const llvm::json::Array *fragments =
+                    link->getArray("commandFragments");
+                if (fragments == nullptr) {
+                    continue;
+                }
+
+                DiscoveredLinkCommand candidate;
+                candidate.backend = "cmake-file-api";
+                candidate.working_directory = model_build_root;
+                candidate.display_file = target_file;
+                candidate.metadata_files = {
+                    reply_directory, *index, *codemodel, target_file};
+                if (const std::optional<llvm::StringRef> name =
+                        target->getString("name")) {
+                    candidate.target_name = name->str();
+                }
+                candidate.score = scoreTargetSources(
+                    *target, source_root, sources);
+                for (const llvm::json::Value &fragment_value : *fragments) {
+                    const llvm::json::Object *fragment =
+                        fragment_value.getAsObject();
+                    if (fragment == nullptr) {
+                        continue;
+                    }
+                    if (const std::optional<llvm::StringRef> text =
+                            fragment->getString("fragment")) {
+                        appendCommandFragment(candidate.tokens, *text);
+                    }
+                }
+                if (candidate.tokens.empty()) {
+                    continue;
+                }
+
+                if (!best.has_value() || candidate.score > best->score) {
+                    best = std::move(candidate);
+                    ambiguous = false;
+                } else if (candidate.score == best->score &&
+                           candidate.display_file != best->display_file) {
+                    ambiguous = true;
+                }
+            }
+        }
+    }
+
+    if (ambiguous && best.has_value() && best->score == 0U) {
+        std::fprintf(
+            stderr,
+            "[cvite] CMake File API exposes multiple executable targets; "
+            "automatic target selection is ambiguous\n");
+        return std::nullopt;
+    }
+    return best;
+}
+
+std::optional<DiscoveredLinkCommand> discoverCMakeLinkText(
+    const fs::path &source,
+    const std::optional<fs::path> &database,
+    const std::vector<fs::path> &sources)
+{
+    const std::optional<fs::path> link_command = findCMakeLinkCommand(
+        source, database, sources);
+    if (!link_command.has_value()) {
+        return std::nullopt;
+    }
+    const std::optional<std::string> content = readText(*link_command);
+    if (!content.has_value()) {
+        return std::nullopt;
+    }
+
+    DiscoveredLinkCommand candidate;
+    candidate.backend = "cmake-link-txt";
+    candidate.working_directory = linkWorkingDirectory(*link_command);
+    candidate.display_file = *link_command;
+    candidate.tokens = tokenizeCommand(*content);
+    candidate.metadata_files.push_back(*link_command);
+    candidate.score = scoreLinkCommand(*content, sources);
+    return candidate.tokens.empty()
+        ? std::nullopt
+        : std::optional<DiscoveredLinkCommand>(std::move(candidate));
+}
+
+void collectNinjaMetadata(
+    const fs::path &path,
+    std::vector<fs::path> &metadata,
+    std::unordered_set<std::string> &visited)
+{
+    const fs::path canonical = canonicalIfPossible(path);
+    if (!visited.insert(canonical.string()).second || !isRegularFile(canonical)) {
+        return;
+    }
+    metadata.push_back(canonical);
+    const std::optional<std::string> content = readText(canonical);
+    if (!content.has_value()) {
+        return;
+    }
+    std::istringstream lines(*content);
+    std::string line;
+    while (std::getline(lines, line)) {
+        line = trim(std::move(line));
+        std::string included;
+        if (startsWith(line, "include ")) {
+            included = trim(line.substr(std::strlen("include ")));
+        } else if (startsWith(line, "subninja ")) {
+            included = trim(line.substr(std::strlen("subninja ")));
+        }
+        if (!included.empty() && included.find('$') == std::string::npos) {
+            collectNinjaMetadata(
+                canonical.parent_path() / included, metadata, visited);
+        }
+    }
+}
+
+bool isCompileCommand(const std::vector<std::string> &tokens)
+{
+    return std::find(tokens.begin(), tokens.end(), "-c") != tokens.end();
+}
+
+bool outputLooksLikeExecutable(const std::vector<std::string> &tokens)
+{
+    for (std::size_t index = 0U; index + 1U < tokens.size(); ++index) {
+        if (tokens[index] != "-o") {
+            continue;
+        }
+        const std::string output = lower(tokens[index + 1U]);
+        return !endsWith(output, ".o") && !endsWith(output, ".a") &&
+            output.find(".so") == std::string::npos &&
+            !endsWith(output, ".dylib");
+    }
+    return false;
+}
+
+std::optional<DiscoveredLinkCommand> discoverNinjaCommands(
+    const std::vector<fs::path> &build_roots,
+    const std::vector<fs::path> &sources)
+{
+    const char *ninja_environment = std::getenv("CVITE_NINJA");
+    const std::string ninja = ninja_environment != nullptr &&
+            ninja_environment[0] != '\0'
+        ? ninja_environment
+        : "ninja";
+    std::optional<DiscoveredLinkCommand> best;
+    bool ambiguous = false;
+
+    for (const fs::path &build_root_value : build_roots) {
+        const fs::path build_root = canonicalIfPossible(build_root_value);
+        const fs::path build_file = build_root / "build.ninja";
+        if (!isRegularFile(build_file)) {
+            continue;
+        }
+        const std::optional<std::string> output = runAndCapture(
+            {ninja, "-C", build_root.string(), "-t", "commands"});
+        if (!output.has_value()) {
+            continue;
+        }
+
+        std::istringstream lines(*output);
+        std::string line;
+        while (std::getline(lines, line)) {
+            line = trim(std::move(line));
+            if (line.empty()) {
+                continue;
+            }
+            std::vector<std::string> tokens = tokenizeCommand(line);
+            if (tokens.empty() || isCompileCommand(tokens) ||
+                !outputLooksLikeExecutable(tokens)) {
+                continue;
+            }
+            std::size_t score = scoreLinkCommand(line, sources);
+            for (const std::string &token : tokens) {
+                if (startsWith(token, "-l") || isLibraryToken(token)) {
+                    score += 2U;
+                }
+            }
+            if (score == 0U) {
+                continue;
+            }
+
+            DiscoveredLinkCommand candidate;
+            candidate.backend = "ninja-commands";
+            candidate.working_directory = build_root;
+            candidate.display_file = build_file;
+            candidate.tokens = std::move(tokens);
+            candidate.score = score;
+            std::unordered_set<std::string> visited;
+            collectNinjaMetadata(
+                build_file, candidate.metadata_files, visited);
+
+            if (!best.has_value() || candidate.score > best->score) {
+                best = std::move(candidate);
+                ambiguous = false;
+            } else if (candidate.score == best->score &&
+                       candidate.working_directory != best->working_directory) {
+                ambiguous = true;
+            }
+        }
+    }
+
+    if (ambiguous) {
+        std::fprintf(
+            stderr,
+            "[cvite] multiple Ninja executable link commands matched the "
+            "project; automatic selection is ambiguous\n");
+        return std::nullopt;
+    }
+    return best;
+}
+
+std::optional<DiscoveredLinkCommand> discoverLinkCommand(
+    const fs::path &source,
+    const std::optional<fs::path> &database,
+    const std::vector<fs::path> &sources)
+{
+    const std::vector<fs::path> roots = candidateBuildRoots(source, database);
+    if (std::optional<DiscoveredLinkCommand> file_api =
+            discoverCMakeFileApi(roots, sources)) {
+        return file_api;
+    }
+    if (std::optional<DiscoveredLinkCommand> link_text =
+            discoverCMakeLinkText(source, database, sources)) {
+        return link_text;
+    }
+    return discoverNinjaCommands(roots, sources);
 }
 
 std::string explicitTargetFromCommands(
@@ -640,10 +1260,6 @@ void collectSearchDirectories(
             appendSearchDirectory(
                 directories, token.substr(2U), working_directory);
         } else if (startsWith(token, "-Wl,")) {
-            const std::vector<std::string> parts = tokenizeCommand(
-                std::string(token.substr(4U)).replace(
-                    0U, 0U, ""));
-            (void)parts;
             std::string payload = token.substr(4U);
             std::replace(payload.begin(), payload.end(), ',', ' ');
             const std::vector<std::string> linker_parts =
@@ -685,7 +1301,7 @@ std::optional<fs::path> compilerFileName(
     if (!output.has_value() || output->empty() || *output == name) {
         return std::nullopt;
     }
-    const fs::path candidate = canonicalIfPossible(*output);
+    const fs::path candidate = absoluteNormalized(*output);
     return isRegularFile(candidate)
         ? std::optional<fs::path>(candidate)
         : std::nullopt;
@@ -709,7 +1325,7 @@ std::optional<fs::path> findVersionedSharedLibrary(
         }
         const std::string filename = iterator->path().filename().string();
         if (startsWith(filename, base_name + ".so.")) {
-            const fs::path candidate = canonicalIfPossible(iterator->path());
+            const fs::path candidate = absoluteNormalized(iterator->path());
             if (!best.has_value() || candidate.string() < best->string()) {
                 best = candidate;
             }
@@ -753,7 +1369,7 @@ std::optional<fs::path> resolveLibrary(
         for (const std::string &filename : filenames) {
             const fs::path candidate = directory / filename;
             if (isRegularFile(candidate)) {
-                return canonicalIfPossible(candidate);
+                return absoluteNormalized(candidate);
             }
         }
         if (!exact_filename) {
@@ -780,7 +1396,7 @@ void addInput(
     NativeInputKind kind,
     fs::path path)
 {
-    path = canonicalIfPossible(path);
+    path = absoluteNormalized(path);
     if (!isRegularFile(path)) {
         return;
     }
@@ -789,7 +1405,7 @@ void addInput(
             return input.path == path;
         });
     if (duplicate == inputs.end()) {
-        inputs.push_back(NativeInput{kind, std::move(path)});
+        inputs.push_back(NativeInput{kind, std::move(path), FileSignature{}});
     }
 }
 
@@ -858,7 +1474,7 @@ void collectNativeInputs(
         if (path.is_relative()) {
             path = working_directory / path;
         }
-        path = canonicalIfPossible(path);
+        path = absoluteNormalized(path);
         if (looksLikeProjectObject(path)) {
             continue;
         }
@@ -869,7 +1485,8 @@ void collectNativeInputs(
 std::uint64_t fnvAppend(std::uint64_t value, std::string_view text)
 {
     constexpr std::uint64_t prime = UINT64_C(1099511628211);
-    for (unsigned char byte : text) {
+    for (char character : text) {
+        const auto byte = static_cast<unsigned char>(character);
         value ^= static_cast<std::uint64_t>(byte);
         value *= prime;
     }
@@ -882,18 +1499,78 @@ std::uint64_t planFingerprint(const LinkPlan &plan)
 {
     std::uint64_t value = UINT64_C(1469598103934665603);
     value = fnvAppend(value, plan.target_triple);
+    value = fnvAppend(value, plan.backend);
+    value = fnvAppend(value, plan.target_name);
+    for (const std::string &token : plan.link_tokens) {
+        value = fnvAppend(value, token);
+    }
     std::vector<std::string> records;
     records.reserve(plan.inputs.size());
     for (const NativeInput &input : plan.inputs) {
         records.push_back(
             std::to_string(static_cast<unsigned>(input.kind)) + ":" +
-            input.path.string());
+            input.path.string() + ":" +
+            std::to_string(input.signature.content_hash));
     }
     std::sort(records.begin(), records.end());
     for (const std::string &record : records) {
         value = fnvAppend(value, record);
     }
     return value;
+}
+
+void collectEnvironmentPreloads(std::vector<NativeInput> &inputs)
+{
+    const char *environment = std::getenv("CVITE_PRELOAD");
+    if (environment == nullptr || environment[0] == '\0') {
+        return;
+    }
+
+    std::string value(environment);
+    std::size_t start = 0U;
+    while (start <= value.size()) {
+        const std::size_t separator = value.find(':', start);
+        const std::size_t length = separator == std::string::npos
+            ? value.size() - start
+            : separator - start;
+        const std::string item = value.substr(start, length);
+        if (!item.empty()) {
+            addInput(
+                inputs,
+                NativeInputKind::DynamicLibrary,
+                absoluteNormalized(item));
+        }
+        if (separator == std::string::npos) {
+            break;
+        }
+        start = separator + 1U;
+    }
+}
+
+void finalizePlan(LinkPlan &plan)
+{
+    std::sort(
+        plan.inputs.begin(),
+        plan.inputs.end(),
+        [](const NativeInput &left, const NativeInput &right) {
+            if (left.path != right.path) {
+                return left.path.string() < right.path.string();
+            }
+            return static_cast<unsigned>(left.kind) <
+                static_cast<unsigned>(right.kind);
+        });
+
+    for (NativeInput &input : plan.inputs) {
+        input.signature = fileSignature(input.path, true);
+        if (input.signature.valid) {
+            plan.tracked_paths.push_back(
+                TrackedPath{input.path, input.signature});
+        }
+    }
+    if (!plan.compilation_database.empty()) {
+        addTrackedPath(plan.tracked_paths, plan.compilation_database, true);
+    }
+    plan.fingerprint = planFingerprint(plan);
 }
 
 LinkPlan discoverPlan(
@@ -911,6 +1588,8 @@ LinkPlan discoverPlan(
     }
     if (database_data.sources.empty()) {
         database_data.sources.push_back(canonical_source);
+        database_data.working_directories.push_back(
+            canonical_source.parent_path());
     }
 
     std::string explicit_target =
@@ -923,47 +1602,55 @@ LinkPlan discoverPlan(
         plan.target_triple = canonical_target.has_value()
             ? *canonical_target
             : explicit_target;
+    } else if (const std::optional<std::string> default_target =
+                   runAndCapture({clang_path, "-print-target-triple"})) {
+        plan.target_triple = *default_target;
     }
 
     std::vector<fs::path> search_directories;
-    for (const std::vector<std::string> &command : database_data.commands) {
+    for (std::size_t index = 0U;
+         index < database_data.commands.size();
+         ++index) {
+        const fs::path working_directory =
+            index < database_data.working_directories.size()
+            ? database_data.working_directories[index]
+            : canonical_source.parent_path();
         collectSearchDirectories(
-            command,
-            canonical_source.parent_path(),
+            database_data.commands[index],
+            working_directory,
             search_directories);
         collectNativeInputs(
-            command,
-            canonical_source.parent_path(),
+            database_data.commands[index],
+            working_directory,
             search_directories,
             clang_path,
-            explicit_target,
+            plan.target_triple,
             plan.inputs);
     }
 
-    const std::optional<fs::path> link_command = findCMakeLinkCommand(
-        canonical_source, database, database_data.sources);
-    if (link_command.has_value()) {
-        plan.link_command = *link_command;
-        std::error_code time_error;
-        plan.link_command_time = fs::last_write_time(*link_command, time_error);
-        const std::optional<std::string> content = readText(*link_command);
-        if (content.has_value()) {
-            const std::vector<std::string> tokens = tokenizeCommand(*content);
-            const fs::path working_directory =
-                linkWorkingDirectory(*link_command);
-            collectSearchDirectories(
-                tokens, working_directory, search_directories);
-            collectNativeInputs(
-                tokens,
-                working_directory,
-                search_directories,
-                clang_path,
-                explicit_target,
-                plan.inputs);
+    if (std::optional<DiscoveredLinkCommand> link = discoverLinkCommand(
+            canonical_source, database, database_data.sources)) {
+        plan.backend = link->backend;
+        plan.target_name = link->target_name;
+        plan.build_directory = link->working_directory;
+        plan.link_command = link->display_file;
+        plan.link_tokens = link->tokens;
+        for (const fs::path &metadata : link->metadata_files) {
+            addTrackedPath(plan.tracked_paths, metadata, true);
         }
+        collectSearchDirectories(
+            link->tokens, link->working_directory, search_directories);
+        collectNativeInputs(
+            link->tokens,
+            link->working_directory,
+            search_directories,
+            clang_path,
+            plan.target_triple,
+            plan.inputs);
     }
 
-    plan.fingerprint = planFingerprint(plan);
+    collectEnvironmentPreloads(plan.inputs);
+    finalizePlan(plan);
     return plan;
 }
 
@@ -1106,6 +1793,30 @@ int restartCurrentProcess(const char *reason)
     return -1;
 }
 
+bool sameInputIdentity(const NativeInput &left, const NativeInput &right)
+{
+    return left.kind == right.kind && left.path == right.path;
+}
+
+bool nativeInputContentsChanged(
+    const LinkPlan &previous,
+    const LinkPlan &candidate)
+{
+    if (previous.inputs.size() != candidate.inputs.size()) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < previous.inputs.size(); ++index) {
+        if (!sameInputIdentity(previous.inputs[index], candidate.inputs[index])) {
+            return false;
+        }
+        if (previous.inputs[index].signature.content_hash !=
+            candidate.inputs[index].signature.content_hash) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int checkPlan(
     cvite_orc_loader *loader,
     const char *source_path,
@@ -1120,9 +1831,12 @@ int checkPlan(
         return restartCurrentProcess("the project target changed");
     }
     if (candidate.fingerprint != active_plan.fingerprint) {
-        return restartCurrentProcess("the native link plan changed");
+        const char *reason = nativeInputContentsChanged(active_plan, candidate)
+            ? "a native link input changed"
+            : "the native link plan changed";
+        return restartCurrentProcess(reason);
     }
-    active_plan.link_command_time = candidate.link_command_time;
+    active_plan = std::move(candidate);
     return 0;
 }
 
@@ -1148,10 +1862,20 @@ extern "C" int cvite_native_link_prepare(
             "[cvite] project target: %s\n",
             active_plan.target_triple.c_str());
     }
+    if (!active_plan.backend.empty()) {
+        std::fprintf(
+            stderr,
+            "[cvite] native link backend: %s%s%s\n",
+            active_plan.backend.c_str(),
+            active_plan.target_name.empty() ? "" : " (target ",
+            active_plan.target_name.empty()
+                ? ""
+                : (active_plan.target_name + ")").c_str());
+    }
     if (!active_plan.link_command.empty()) {
         std::fprintf(
             stderr,
-            "[cvite] CMake link command: %s\n",
+            "[cvite] native link metadata: %s\n",
             active_plan.link_command.c_str());
     }
     return 0;
@@ -1170,591 +1894,8 @@ extern "C" int cvite_native_link_poll(
     const char *source_path,
     const char *clang_path)
 {
-    if (!active_plan_initialized || active_plan.link_command.empty()) {
-        return 0;
-    }
-    std::error_code error;
-    const fs::file_time_type current = fs::last_write_time(
-        active_plan.link_command, error);
-    if (error || current == active_plan.link_command_time) {
+    if (!active_plan_initialized || !trackedPathsChanged(active_plan)) {
         return 0;
     }
     return checkPlan(loader, source_path, clang_path);
 }
-'''
-
-write("src/cli/native_link.cpp", native_link_cpp)
-
-orc_header = ROOT / "include/cvite/orc_loader.h"
-header_text = orc_header.read_text(encoding="utf-8")
-if "cvite_orc_loader_load_dynamic_library" not in header_text:
-    insertion = r'''
-/* Native link inputs discovered by the development server. */
-const char *cvite_orc_loader_target_triple(const cvite_orc_loader *loader);
-
-cvite_status cvite_orc_loader_load_dynamic_library(
-    cvite_orc_loader *loader,
-    const char *path,
-    cvite_error *error);
-
-cvite_status cvite_orc_loader_link_static_archive(
-    cvite_orc_loader *loader,
-    const char *path,
-    cvite_error *error);
-
-cvite_status cvite_orc_loader_add_support_object(
-    cvite_orc_loader *loader,
-    const char *path,
-    cvite_error *error);
-
-'''
-    insert_before_last(
-        "include/cvite/orc_loader.h", "#ifdef __cplusplus", insertion)
-
-orc_path = ROOT / "src/host/orc_loader.cpp"
-orc_text = orc_path.read_text(encoding="utf-8")
-if "automatic_link_dylibs" not in orc_text:
-    replace_once(
-        "src/host/orc_loader.cpp",
-        "struct cvite_orc_loader {\n",
-        "struct cvite_orc_loader {\n"
-        "    std::vector<llvm::orc::JITDylib *> automatic_link_dylibs;\n"
-        "    std::string automatic_target_triple;\n"
-        "    std::uint64_t next_automatic_link_id = 1U;\n",
-    )
-    replace_once(
-        "src/host/orc_loader.cpp",
-        "    created->jit = std::move(*jit);\n",
-        "    created->jit = std::move(*jit);\n"
-        "    created->automatic_target_triple =\n"
-        "        created->jit->getTargetTriple().str();\n",
-    )
-    replace_once(
-        "src/host/orc_loader.cpp",
-        "    llvm::orc::JITDylib &candidate_dylib = *dylib;\n",
-        "    llvm::orc::JITDylib &candidate_dylib = *dylib;\n"
-        "    for (llvm::orc::JITDylib *native_dylib :\n"
-        "         loader->automatic_link_dylibs) {\n"
-        "        candidate_dylib.addToLinkOrder(\n"
-        "            *native_dylib,\n"
-        "            llvm::orc::JITDylibLookupFlags::MatchAllSymbols);\n"
-        "    }\n",
-    )
-
-    orc_append = r'''
-
-extern "C" const char *cvite_orc_loader_target_triple(
-    const cvite_orc_loader *loader)
-{
-    return loader == nullptr ? nullptr : loader->automatic_target_triple.c_str();
-}
-
-extern "C" cvite_status cvite_orc_loader_load_dynamic_library(
-    cvite_orc_loader *loader,
-    const char *path,
-    cvite_error *error)
-{
-    cvite_error_clear(error);
-    if (loader == nullptr || path == nullptr || path[0] == '\0') {
-        return fail(
-            error,
-            CVITE_STATUS_INVALID_ARGUMENT,
-            "invalid dynamic-library request");
-    }
-
-    std::lock_guard<std::mutex> guard(loader->mutex);
-    if (!loader->generations.empty()) {
-        return fail(
-            error,
-            CVITE_STATUS_INVALID_STATE,
-            "native libraries must be loaded before the baseline is staged");
-    }
-
-    auto dylib = loader->jit->loadPlatformDynamicLibrary(path);
-    if (!dylib) {
-        return fail(
-            error,
-            CVITE_STATUS_LINK_ERROR,
-            dylib.takeError(),
-            "could not load native dynamic library");
-    }
-    loader->automatic_link_dylibs.push_back(&*dylib);
-    return CVITE_STATUS_OK;
-}
-
-extern "C" cvite_status cvite_orc_loader_link_static_archive(
-    cvite_orc_loader *loader,
-    const char *path,
-    cvite_error *error)
-{
-    cvite_error_clear(error);
-    if (loader == nullptr || path == nullptr || path[0] == '\0') {
-        return fail(
-            error,
-            CVITE_STATUS_INVALID_ARGUMENT,
-            "invalid static-archive request");
-    }
-
-    std::lock_guard<std::mutex> guard(loader->mutex);
-    if (!loader->generations.empty()) {
-        return fail(
-            error,
-            CVITE_STATUS_INVALID_STATE,
-            "native archives must be linked before the baseline is staged");
-    }
-
-    const std::string name = "cvite.native.archive." +
-        std::to_string(loader->next_automatic_link_id++);
-    auto dylib = loader->jit->createJITDylib(name);
-    if (!dylib) {
-        return fail(
-            error,
-            CVITE_STATUS_LINK_ERROR,
-            dylib.takeError(),
-            "could not create a native archive namespace");
-    }
-    if (llvm::Error link_error =
-            loader->jit->linkStaticLibraryInto(*dylib, path)) {
-        return fail(
-            error,
-            CVITE_STATUS_LINK_ERROR,
-            std::move(link_error),
-            "could not link native static archive");
-    }
-    loader->automatic_link_dylibs.push_back(&*dylib);
-    return CVITE_STATUS_OK;
-}
-
-extern "C" cvite_status cvite_orc_loader_add_support_object(
-    cvite_orc_loader *loader,
-    const char *path,
-    cvite_error *error)
-{
-    cvite_error_clear(error);
-    if (loader == nullptr || path == nullptr || path[0] == '\0') {
-        return fail(
-            error,
-            CVITE_STATUS_INVALID_ARGUMENT,
-            "invalid support-object request");
-    }
-
-    std::lock_guard<std::mutex> guard(loader->mutex);
-    if (!loader->generations.empty()) {
-        return fail(
-            error,
-            CVITE_STATUS_INVALID_STATE,
-            "support objects must be linked before the baseline is staged");
-    }
-
-    auto object = llvm::MemoryBuffer::getFile(path, false, false);
-    if (!object) {
-        return fail(
-            error,
-            CVITE_STATUS_IO_ERROR,
-            "could not read support object '" + std::string(path) +
-                "': " + object.getError().message());
-    }
-
-    const std::string name = "cvite.native.object." +
-        std::to_string(loader->next_automatic_link_id++);
-    auto dylib = loader->jit->createJITDylib(name);
-    if (!dylib) {
-        return fail(
-            error,
-            CVITE_STATUS_LINK_ERROR,
-            dylib.takeError(),
-            "could not create a support-object namespace");
-    }
-    if (llvm::Error add_error =
-            loader->jit->addObjectFile(*dylib, std::move(*object))) {
-        return fail(
-            error,
-            CVITE_STATUS_LINK_ERROR,
-            std::move(add_error),
-            "could not link support object");
-    }
-    loader->automatic_link_dylibs.push_back(&*dylib);
-    return CVITE_STATUS_OK;
-}
-'''
-    with orc_path.open("a", encoding="utf-8") as output:
-        output.write(orc_append)
-
-run_header = ROOT / "src/cli/run_internal.h"
-run_header_text = run_header.read_text(encoding="utf-8")
-if "cvite_native_link_prepare" not in run_header_text:
-    insertion = r'''
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-int cvite_native_link_prepare(
-    cvite_orc_loader *loader,
-    const char *source_path,
-    const char *clang_path);
-
-int cvite_native_link_check(
-    cvite_orc_loader *loader,
-    const char *source_path,
-    const char *clang_path);
-
-int cvite_native_link_poll(
-    cvite_orc_loader *loader,
-    const char *source_path,
-    const char *clang_path);
-
-#ifdef __cplusplus
-}
-#endif
-
-'''
-    insert_before_last("src/cli/run_internal.h", "#endif", insertion)
-
-run_path = ROOT / "src/cli/run.c"
-run_text = run_path.read_text(encoding="utf-8")
-if "cvite_native_link_prepare(" not in run_text:
-    marker = "    status = cvite_orc_loader_stage_object(\n"
-    position = run_text.find(marker)
-    if position < 0:
-        fail("src/cli/run.c: baseline stage marker not found")
-    insertion = (
-        "    if (cvite_native_link_prepare(\n"
-        "            state->loader, state->source_path, state->clang_path) != 0) {\n"
-        "        cvite_remove_if_present(object_path);\n"
-        "        return -1;\n"
-        "    }\n\n"
-    )
-    run_path.write_text(
-        run_text[:position] + insertion + run_text[position:],
-        encoding="utf-8",
-    )
-
-watcher_path = ROOT / "src/cli/watcher.c"
-watcher_text = watcher_path.read_text(encoding="utf-8")
-if "cvite_native_link_check(" not in watcher_text:
-    marker = "static int publish_candidate(cvite_run_state *state)\n{\n"
-    replacement = (
-        marker
-        + "    if (cvite_native_link_check(\n"
-        + "            state->loader, state->source_path, state->clang_path) != 0) {\n"
-        + "        return -1;\n"
-        + "    }\n\n"
-    )
-    if marker not in watcher_text:
-        fail("src/cli/watcher.c: publish_candidate marker not found")
-    watcher_text = watcher_text.replace(marker, replacement, 1)
-
-    timeout_marker = "        if (poll_status == 0) {\n            continue;\n        }\n"
-    timeout_replacement = (
-        "        if (poll_status == 0) {\n"
-        "            (void)cvite_native_link_poll(\n"
-        "                state->loader, state->source_path, state->clang_path);\n"
-        "            continue;\n"
-        "        }\n"
-    )
-    if timeout_marker not in watcher_text:
-        fail("src/cli/watcher.c: poll timeout marker not found")
-    watcher_text = watcher_text.replace(
-        timeout_marker, timeout_replacement, 1)
-    watcher_path.write_text(watcher_text, encoding="utf-8")
-
-cmake_path = ROOT / "CMakeLists.txt"
-cmake_text = cmake_path.read_text(encoding="utf-8")
-if "src/cli/native_link.cpp" not in cmake_text:
-    marker = "        src/cli/compile_database.c\n"
-    if marker not in cmake_text:
-        marker = "        src/cli/toolchain.c\n"
-    if marker not in cmake_text:
-        fail("CMakeLists.txt: runner source marker not found")
-    cmake_text = cmake_text.replace(
-        marker, marker + "        src/cli/native_link.cpp\n", 1)
-
-if "run-auto-native-link" not in cmake_text:
-    test_block = r'''
-
-if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-
-    add_library(cvite_test_auto_native SHARED
-        tests/fixtures/auto_link_library.c
-    )
-    set_target_properties(cvite_test_auto_native PROPERTIES
-        OUTPUT_NAME cvite_auto_native
-    )
-
-    add_test(
-        NAME run-auto-native-link
-        COMMAND
-            ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_auto_link.py
-            $<TARGET_FILE:cvite>
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/auto_link_app.c
-            $<TARGET_FILE:cvite_test_auto_native>
-    )
-    set_tests_properties(run-auto-native-link PROPERTIES TIMEOUT 60)
-endif()
-'''
-    marker = "\nif(CVITE_BUILD_EXAMPLES)\n"
-    if marker not in cmake_text:
-        fail("CMakeLists.txt: example section marker not found")
-    cmake_text = cmake_text.replace(marker, test_block + marker, 1)
-
-cmake_path.write_text(cmake_text, encoding="utf-8")
-
-write(
-    "tests/fixtures/auto_link_library.c",
-    r'''int cvite_auto_native_bonus(void)
-{
-    return 3;
-}
-''',
-)
-
-write(
-    "tests/fixtures/auto_link_app.c",
-    r'''#define _POSIX_C_SOURCE 200809L
-
-#include <stdio.h>
-#include <time.h>
-
-int cvite_auto_native_bonus(void);
-
-static int total = 0;
-
-static int step(void)
-{
-    total += cvite_auto_native_bonus();
-    return total;
-}
-
-int main(void)
-{
-    const struct timespec pause = {0, 20000000L};
-    for (int iteration = 0; iteration < 450; ++iteration) {
-        (void)printf("value=%d\n", step());
-        (void)fflush(stdout);
-        (void)nanosleep(&pause, NULL);
-    }
-    return 0;
-}
-''',
-)
-
-write(
-    "tests/check_auto_link.py",
-    r'''#!/usr/bin/env python3
-
-from __future__ import annotations
-
-import json
-import os
-import re
-import select
-import shutil
-import subprocess
-import sys
-import tempfile
-import time
-from pathlib import Path
-
-VALUE = re.compile(r"^value=(\d+)$")
-
-
-def fail(message: str, output: list[str]) -> None:
-    joined = "".join(output[-160:])
-    raise AssertionError(f"{message}\n\n--- cvite output ---\n{joined}")
-
-
-def atomic_write(path: Path, content: str) -> None:
-    replacement = path.with_suffix(path.suffix + ".new")
-    replacement.write_text(content, encoding="utf-8")
-    os.replace(replacement, path)
-
-
-def library_link_name(path: Path) -> str:
-    name = path.name
-    if name.startswith("lib"):
-        name = name[3:]
-    marker = name.find(".so")
-    if marker >= 0:
-        name = name[:marker]
-    elif name.endswith(".dylib"):
-        name = name[:-6]
-    return name
-
-
-def main() -> int:
-    if len(sys.argv) != 4:
-        raise SystemExit(
-            "usage: check_auto_link.py <cvite> <app-fixture> <shared-library>"
-        )
-
-    cvite = Path(sys.argv[1]).resolve()
-    fixture = Path(sys.argv[2]).resolve()
-    library = Path(sys.argv[3]).resolve()
-    output: list[str] = []
-
-    with tempfile.TemporaryDirectory(prefix="cvite-auto-link-") as directory:
-        root = Path(directory)
-        source = root / "main.c"
-        build = root / "build"
-        object_directory = build / "CMakeFiles" / "app.dir"
-        object_directory.mkdir(parents=True)
-        shutil.copyfile(fixture, source)
-
-        original = source.read_text(encoding="utf-8")
-        edited = original.replace(
-            "total += cvite_auto_native_bonus();",
-            "total += cvite_auto_native_bonus() * 10;",
-            1,
-        )
-        if edited == original:
-            fail("fixture edit marker was not found", output)
-
-        compile_commands = [
-            {
-                "directory": str(build),
-                "arguments": [
-                    "clang-18",
-                    "-std=c11",
-                    "-O2",
-                    "-c",
-                    str(source),
-                    "-o",
-                    str(object_directory / "main.c.o"),
-                ],
-                "file": str(source),
-            }
-        ]
-        (build / "compile_commands.json").write_text(
-            json.dumps(compile_commands), encoding="utf-8"
-        )
-
-        link_name = library_link_name(library)
-        link_command = (
-            f"clang-18 CMakeFiles/app.dir/main.c.o "
-            f"-L{library.parent} -l{link_name} "
-            f"-Wl,-rpath,{library.parent} -o app\n"
-        )
-        (object_directory / "link.txt").write_text(
-            link_command, encoding="utf-8"
-        )
-
-        environment = os.environ.copy()
-        environment.pop("CVITE_PRELOAD", None)
-        environment["CVITE_VERBOSE"] = "1"
-        process = subprocess.Popen(
-            [str(cvite), "run", str(root)],
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-
-        values: list[int] = []
-        edited_written = False
-        refreshed = False
-        preserved_jump = False
-        automatic_input_seen = False
-        deadline = time.monotonic() + 45.0
-
-        try:
-            while time.monotonic() < deadline:
-                ready, _, _ = select.select([process.stdout], [], [], 0.25)
-                if not ready:
-                    if process.poll() is not None:
-                        break
-                    continue
-                line = process.stdout.readline()
-                if line == "":
-                    if process.poll() is not None:
-                        break
-                    continue
-                output.append(line)
-
-                if "native link input:" in line and str(library.parent) in line:
-                    automatic_input_seen = True
-                if "[cvite] refreshed" in line:
-                    refreshed = True
-
-                match = VALUE.match(line.rstrip("\n"))
-                if match:
-                    current = int(match.group(1))
-                    if values and edited_written and current - values[-1] >= 30:
-                        preserved_jump = True
-                    values.append(current)
-                    if len(values) >= 5 and not edited_written:
-                        atomic_write(source, edited)
-                        edited_written = True
-
-                if (
-                    automatic_input_seen
-                    and refreshed
-                    and preserved_jump
-                    and len(values) >= 12
-                ):
-                    break
-        finally:
-            try:
-                return_code = process.wait(timeout=15.0)
-            except subprocess.TimeoutExpired:
-                process.terminate()
-                try:
-                    return_code = process.wait(timeout=3.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    return_code = process.wait(timeout=3.0)
-
-        if return_code != 0:
-            fail(f"cvite exited with status {return_code}", output)
-        if not automatic_input_seen:
-            fail("automatic native link input was not reported", output)
-        if not refreshed or not preserved_jump:
-            fail("did not observe state-preserving refresh", output)
-
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-''',
-)
-
-docs_path = ROOT / "docs/dev-server.md"
-docs = docs_path.read_text(encoding="utf-8")
-if "## Automatic native link discovery" not in docs:
-    docs += r'''
-
-## Automatic native link discovery
-
-When `compile_commands.json` belongs to a CMake build, CVite discovers the
-matching `CMakeFiles/<target>.dir/link.txt` command and reconstructs the native
-support inputs needed by the in-process program. The discovery layer recognizes
-`-L`, `-l`, direct shared-library paths, static archives, support object files,
-and CMake rpath search directories.
-
-Dynamic libraries are loaded into an LLVM ORC platform JITDylib. Static archives
-and standalone support objects are linked into dedicated ORC namespaces. Every
-baseline and candidate generation receives those namespaces in its link order,
-so external symbol addresses remain stable across refreshes.
-
-CVite also reads explicit target options from the Clang compilation database.
-A target whose architecture or operating-system family differs from the host JIT
-is rejected before native code is published. One in-process CVite session cannot
-execute a foreign architecture.
-
-The native link plan is fingerprinted. If CMake rewrites `link.txt`, or project
-target/library options change in `compile_commands.json`, CVite classifies that
-as a red refresh and re-executes itself so the edited program starts with a fresh
-baseline and a coherent native symbol graph. Set
-`CVITE_DISABLE_AUTO_RESTART=1` to inspect the rejection without restarting.
-
-`CVITE_PRELOAD` remains available as an explicit override for non-CMake builds,
-plugin systems, and libraries whose ownership cannot be inferred from a build
-command.
-'''
-    docs_path.write_text(docs, encoding="utf-8")
-
-print("automatic native link discovery staged")

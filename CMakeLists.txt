@@ -274,10 +274,11 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER)
         src/cli/watcher.c
         src/cli/dependencies.c
         src/cli/compile_database.c
+        src/cli/native_link.cpp
     )
     target_link_libraries(cvite PRIVATE cvite::orc_loader Threads::Threads)
     if(CVITE_BUILD_COMPILER)
-        target_include_directories(cvite PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR})
+        target_include_directories(cvite SYSTEM PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR})
         target_link_libraries(cvite PRIVATE ${CVITE_LIBCLANG_LIBRARY})
     endif()
     target_compile_definitions(cvite PRIVATE
@@ -438,6 +439,69 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/run_multi_shared.h
     )
     set_tests_properties(run-multi-tu-refresh PROPERTIES TIMEOUT 100)
+endif()
+
+
+if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+    add_library(cvite_test_auto_native SHARED
+        tests/fixtures/auto_link_library.c
+    )
+    set_target_properties(cvite_test_auto_native PROPERTIES
+        OUTPUT_NAME cvite_auto_native
+    )
+
+    add_library(cvite_test_auto_native_next SHARED
+        tests/fixtures/auto_link_library_next.c
+    )
+    set_target_properties(cvite_test_auto_native_next PROPERTIES
+        OUTPUT_NAME cvite_auto_native_next
+    )
+
+    add_test(
+        NAME run-auto-native-link
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_auto_link.py
+            $<TARGET_FILE:cvite>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/auto_link_app.c
+            $<TARGET_FILE:cvite_test_auto_native>
+    )
+    set_tests_properties(run-auto-native-link PROPERTIES TIMEOUT 60)
+
+    foreach(CVITE_NATIVE_LINK_BACKEND IN ITEMS cmake-file-api ninja)
+        add_test(
+            NAME run-native-link-${CVITE_NATIVE_LINK_BACKEND}
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_native_link_backend.py
+                ${CVITE_NATIVE_LINK_BACKEND}
+                $<TARGET_FILE:cvite>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/auto_link_app.c
+                $<TARGET_FILE:cvite_test_auto_native>
+                ${CMAKE_COMMAND}
+                ${CMAKE_MAKE_PROGRAM}
+        )
+        set_tests_properties(
+            run-native-link-${CVITE_NATIVE_LINK_BACKEND}
+            PROPERTIES TIMEOUT 70
+        )
+    endforeach()
+
+    add_test(
+        NAME run-native-input-replacement
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_native_input_replacement.py
+            $<TARGET_FILE:cvite>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/auto_link_app.c
+            $<TARGET_FILE:cvite_test_auto_native>
+            $<TARGET_FILE:cvite_test_auto_native_next>
+            ${CMAKE_COMMAND}
+            ${CMAKE_MAKE_PROGRAM}
+    )
+    set_tests_properties(run-native-input-replacement PROPERTIES TIMEOUT 75)
 endif()
 
 if(CVITE_BUILD_EXAMPLES)

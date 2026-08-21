@@ -68,6 +68,25 @@ cvite_status cvite_orc_loader_discard_generation(
     cvite_orc_generation generation,
     cvite_error *error);
 
+
+/* Native link inputs discovered by the development server. */
+const char *cvite_orc_loader_target_triple(const cvite_orc_loader *loader);
+
+cvite_status cvite_orc_loader_load_dynamic_library(
+    cvite_orc_loader *loader,
+    const char *path,
+    cvite_error *error);
+
+cvite_status cvite_orc_loader_link_static_archive(
+    cvite_orc_loader *loader,
+    const char *path,
+    cvite_error *error);
+
+cvite_status cvite_orc_loader_add_support_object(
+    cvite_orc_loader *loader,
+    const char *path,
+    cvite_error *error);
+
 #ifdef __cplusplus
 }
 #endif

@@ -6,11 +6,19 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stddef.h>
+#ifndef __cplusplus
 #include <stdatomic.h>
+#endif
 #include <stdio.h>
 
 #ifndef NAME_MAX
 #define NAME_MAX 255
+#endif
+
+#ifdef __cplusplus
+typedef bool cvite_atomic_bool;
+#else
+typedef atomic_bool cvite_atomic_bool;
 #endif
 
 typedef enum cvite_build_kind {
@@ -64,7 +72,7 @@ typedef struct cvite_run_state {
     int watch_descriptor;
     cvite_watch_directory *watch_directories;
     size_t watch_directory_count;
-    atomic_bool stop_requested;
+    cvite_atomic_bool stop_requested;
 } cvite_run_state;
 
 int cvite_join_path(
@@ -115,5 +123,29 @@ int cvite_initialize_source_watcher(cvite_run_state *state);
 int cvite_refresh_source_watcher(cvite_run_state *state);
 void cvite_close_source_watcher(cvite_run_state *state);
 void *cvite_watch_source(void *opaque);
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int cvite_native_link_prepare(
+    cvite_orc_loader *loader,
+    const char *source_path,
+    const char *clang_path);
+
+int cvite_native_link_check(
+    cvite_orc_loader *loader,
+    const char *source_path,
+    const char *clang_path);
+
+int cvite_native_link_poll(
+    cvite_orc_loader *loader,
+    const char *source_path,
+    const char *clang_path);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

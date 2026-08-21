@@ -163,6 +163,9 @@ std::string storageSymbolName(cvite_id id)
 } // namespace
 
 struct cvite_orc_loader {
+    std::vector<llvm::orc::JITDylib *> automatic_link_dylibs;
+    std::string automatic_target_triple;
+    std::uint64_t next_automatic_link_id = 1U;
     std::mutex mutex;
     std::unique_ptr<llvm::orc::LLJIT> jit;
     std::vector<HostFunction> host_functions;
@@ -203,6 +206,8 @@ extern "C" cvite_status cvite_orc_loader_create(
     }
 
     created->jit = std::move(*jit);
+    created->automatic_target_triple =
+        created->jit->getTargetTriple().str();
     created->host_functions.push_back(HostFunction{
         kTargetForSymbol,
         reinterpret_cast<cvite_function_pointer>(&__cvite_host_target_for),
@@ -309,6 +314,12 @@ extern "C" cvite_status cvite_orc_loader_stage_object(
     }
 
     llvm::orc::JITDylib &candidate_dylib = *dylib;
+    for (llvm::orc::JITDylib *native_dylib :
+         loader->automatic_link_dylibs) {
+        candidate_dylib.addToLinkOrder(
+            *native_dylib,
+            llvm::orc::JITDylibLookupFlags::MatchAllSymbols);
+    }
     llvm::orc::SymbolMap host_symbols;
     for (const HostFunction &function : loader->host_functions) {
         host_symbols[loader->jit->mangleAndIntern(function.name)] = {
@@ -767,5 +778,140 @@ extern "C" cvite_status cvite_orc_loader_discard_generation(
         }
     }
     loader->generations.erase(found);
+    return CVITE_STATUS_OK;
+}
+
+
+extern "C" const char *cvite_orc_loader_target_triple(
+    const cvite_orc_loader *loader)
+{
+    return loader == nullptr ? nullptr : loader->automatic_target_triple.c_str();
+}
+
+extern "C" cvite_status cvite_orc_loader_load_dynamic_library(
+    cvite_orc_loader *loader,
+    const char *path,
+    cvite_error *error)
+{
+    cvite_error_clear(error);
+    if (loader == nullptr || path == nullptr || path[0] == '\0') {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_ARGUMENT,
+            "invalid dynamic-library request");
+    }
+
+    std::lock_guard<std::mutex> guard(loader->mutex);
+    if (!loader->generations.empty()) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "native libraries must be loaded before the baseline is staged");
+    }
+
+    auto dylib = loader->jit->loadPlatformDynamicLibrary(path);
+    if (!dylib) {
+        return fail(
+            error,
+            CVITE_STATUS_LINK_ERROR,
+            dylib.takeError(),
+            "could not load native dynamic library");
+    }
+    loader->automatic_link_dylibs.push_back(&*dylib);
+    return CVITE_STATUS_OK;
+}
+
+extern "C" cvite_status cvite_orc_loader_link_static_archive(
+    cvite_orc_loader *loader,
+    const char *path,
+    cvite_error *error)
+{
+    cvite_error_clear(error);
+    if (loader == nullptr || path == nullptr || path[0] == '\0') {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_ARGUMENT,
+            "invalid static-archive request");
+    }
+
+    std::lock_guard<std::mutex> guard(loader->mutex);
+    if (!loader->generations.empty()) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "native archives must be linked before the baseline is staged");
+    }
+
+    const std::string name = "cvite.native.archive." +
+        std::to_string(loader->next_automatic_link_id++);
+    auto dylib = loader->jit->createJITDylib(name);
+    if (!dylib) {
+        return fail(
+            error,
+            CVITE_STATUS_LINK_ERROR,
+            dylib.takeError(),
+            "could not create a native archive namespace");
+    }
+    if (llvm::Error link_error =
+            loader->jit->linkStaticLibraryInto(*dylib, path)) {
+        return fail(
+            error,
+            CVITE_STATUS_LINK_ERROR,
+            std::move(link_error),
+            "could not link native static archive");
+    }
+    loader->automatic_link_dylibs.push_back(&*dylib);
+    return CVITE_STATUS_OK;
+}
+
+extern "C" cvite_status cvite_orc_loader_add_support_object(
+    cvite_orc_loader *loader,
+    const char *path,
+    cvite_error *error)
+{
+    cvite_error_clear(error);
+    if (loader == nullptr || path == nullptr || path[0] == '\0') {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_ARGUMENT,
+            "invalid support-object request");
+    }
+
+    std::lock_guard<std::mutex> guard(loader->mutex);
+    if (!loader->generations.empty()) {
+        return fail(
+            error,
+            CVITE_STATUS_INVALID_STATE,
+            "support objects must be linked before the baseline is staged");
+    }
+
+    auto object = llvm::MemoryBuffer::getFile(path, false, false);
+    if (!object) {
+        return fail(
+            error,
+            CVITE_STATUS_IO_ERROR,
+            "could not read support object '" + std::string(path) +
+                "': " + object.getError().message());
+    }
+
+    const std::string name = "cvite.native.object." +
+        std::to_string(loader->next_automatic_link_id++);
+    auto dylib = loader->jit->createJITDylib(name);
+    if (!dylib) {
+        return fail(
+            error,
+            CVITE_STATUS_LINK_ERROR,
+            dylib.takeError(),
+            "could not create a support-object namespace");
+    }
+    if (llvm::Error add_error =
+            loader->jit->addObjectFile(*dylib, std::move(*object))) {
+        return fail(
+            error,
+            CVITE_STATUS_LINK_ERROR,
+            std::move(add_error),
+            "could not link support object");
+    }
+    loader->automatic_link_dylibs.push_back(&*dylib);
     return CVITE_STATUS_OK;
 }
