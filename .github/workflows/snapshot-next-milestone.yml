@@ -1,0 +1,40 @@
+name: Snapshot clean branch for managed storage work
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'bootstrap/m0-runtime'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Package source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar \
+            --exclude=.git \
+            --exclude=.github/workflows/snapshot-next-milestone.yml \
+            -czf /tmp/cvite-clean-source.tar.gz .
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-managed-storage-source-${{ github.sha }}
+          path: /tmp/cvite-clean-source.tar.gz
+          retention-days: 1
+          if-no-files-found: error
