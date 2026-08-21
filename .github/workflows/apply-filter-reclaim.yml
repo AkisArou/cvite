@@ -1,0 +1,133 @@
+name: Apply changed-function filtering and JIT reclamation
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .cvite/filter-reclaim.tar.gz /tmp/filter-reclaim.tar.gz
+          echo "69522b79f126dfab43900b9dc587b6f6356388d9c2dc47cb3a4506514ab2bd89  /tmp/filter-reclaim.tar.gz" | sha256sum --check
+          tar -xzf /tmp/filter-reclaim.tar.gz -C .
+          git diff --check
+
+      - name: Install validation toolchains
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          gcc
+          clang
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+          cmake
+
+      - name: Configure full LLVM build
+        run: >-
+          cmake -S . -B build-full -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build full LLVM pipeline
+        run: cmake --build build-full --verbose
+
+      - name: Test full LLVM pipeline
+        run: ctest --test-dir build-full --output-on-failure
+
+      - name: Configure GCC runtime build
+        env:
+          CC: gcc
+        run: >-
+          cmake -S . -B build-gcc -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build and test GCC runtime
+        run: |
+          cmake --build build-gcc --verbose
+          ctest --test-dir build-gcc --output-on-failure
+
+      - name: Configure sanitizer runtime build
+        env:
+          CC: clang
+          CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          LDFLAGS: -fsanitize=address,undefined
+        run: >-
+          cmake -S . -B build-sanitize -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build and test sanitizer runtime
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          cmake --build build-sanitize --verbose
+          ctest --test-dir build-sanitize --output-on-failure
+
+      - name: Commit verified implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            CMakeLists.txt \
+            include/cvite/baseline.h \
+            include/cvite/candidate.h \
+            include/cvite/host.h \
+            include/cvite/orc_loader.h \
+            src/cli/watcher.c \
+            src/host/host_runtime.c \
+            src/host/orc_loader.cpp \
+            src/transform/baseline_manifest_pass.cpp \
+            src/transform/candidate_pass.cpp \
+            src/transform/stable_entry_pass.cpp \
+            src/transform/transform_support.h \
+            tests/check_candidate.py \
+            tests/check_stable_entry.py \
+            tests/fixtures/stable_e2e_baseline.c \
+            tests/fixtures/stable_e2e_candidate.c \
+            tests/fixtures/filter_baseline.c \
+            tests/fixtures/filter_candidate_one.c \
+            tests/fixtures/filter_candidate_two.c \
+            tests/test_candidate_filter.c \
+            tests/test_host.c \
+            tests/test_stable_entry.c
+
+          git rm -- \
+            .cvite/filter-reclaim.tar.gz \
+            .github/workflows/apply-filter-reclaim.yml \
+            .github/workflows/source-snapshot-current.yml
+
+          git diff --cached --check
+          git commit -m "feat: filter unchanged patches and reclaim retired JIT code"
+          git push origin HEAD:bootstrap/m0-runtime
