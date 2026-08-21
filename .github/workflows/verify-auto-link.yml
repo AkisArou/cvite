@@ -1,0 +1,125 @@
+name: Verify automatic native link discovery
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-automatic-link-discovery
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Check implementation readiness
+        id: readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f src/cli/native_link.cpp || -f .cvite/apply-auto-link.py ]]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Automatic link implementation has not landed yet."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install LLVM 18 development toolchain
+        if: steps.readiness.outputs.ready == 'true'
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+
+      - name: Configure
+        if: steps.readiness.outputs.ready == 'true'
+        run: >-
+          cmake -S . -B build-verify-auto-link -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        if: steps.readiness.outputs.ready == 'true'
+        run: cmake --build build-verify-auto-link --verbose
+
+      - name: Test
+        if: steps.readiness.outputs.ready == 'true'
+        run: ctest --test-dir build-verify-auto-link --output-on-failure
+
+      - name: Record verified milestone and clean staging files
+        if: steps.readiness.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > docs/native-link-discovery.md <<'EOF'
+          # Automatic native target and link-input discovery
+
+          CVite reconstructs native support inputs before staging the transformed
+          baseline. It reads target and driver options through libclang's
+          compilation-database API and, for CMake builds, selects the matching
+          `CMakeFiles/<target>.dir/link.txt` command using the project's source
+          object membership.
+
+          The current implementation supports:
+
+          - explicit Clang target triples and `-m32`/`-m64` compatibility checks;
+          - `-L` search directories and `-l`/`-l:` library inputs;
+          - direct `.so`, `.dylib`, `.a`, and support-object paths;
+          - CMake rpath directories as resolution hints;
+          - LLVM ORC platform dynamic-library namespaces;
+          - LLVM ORC static-archive and object-file namespaces;
+          - identical native link order for baseline and candidate generations;
+          - automatic process restart when the target or native link plan changes;
+          - `CVITE_PRELOAD` as an explicit override rather than a common-path requirement.
+
+          The end-to-end test creates an ordinary CMake-shaped project and shared
+          library, runs it without `CVITE_PRELOAD`, edits application code, and
+          verifies that the native library remains resolved while C state survives
+          the refresh.
+          EOF
+
+          rm -f -- \
+            .github/workflows/export-auto-link-source.yml \
+            .github/workflows/fix-auto-link-stage.yml \
+            .github/workflows/fix-auto-link-c-linkage.yml \
+            .github/workflows/fix-auto-link-fixture.yml \
+            .github/workflows/apply-auto-link.yml \
+            .cvite/apply-auto-link.py
+          rm -- .github/workflows/verify-auto-link.yml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- docs/native-link-discovery.md
+          git rm --cached --ignore-unmatch \
+            .github/workflows/export-auto-link-source.yml \
+            .github/workflows/fix-auto-link-stage.yml \
+            .github/workflows/fix-auto-link-c-linkage.yml \
+            .github/workflows/fix-auto-link-fixture.yml \
+            .github/workflows/apply-auto-link.yml \
+            .github/workflows/verify-auto-link.yml \
+            .cvite/apply-auto-link.py
+          git diff --cached --check
+          git commit -m "test: verify automatic native link discovery"
+          git push origin HEAD:bootstrap/m0-runtime
