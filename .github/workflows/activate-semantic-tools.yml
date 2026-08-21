@@ -26,11 +26,12 @@ jobs:
           ref: bootstrap/m0-runtime
           fetch-depth: 0
 
-      - name: Apply semantic cache transaction integration
+      - name: Apply semantic cache and restart integration
         shell: bash
         run: |
           set -euo pipefail
           python3 .cvite/apply-semantic-cache-transaction.py
+          python3 .cvite/apply-layout-restart.py
           git diff --check
 
       - name: Install build toolchains
@@ -111,7 +112,9 @@ jobs:
           git add -- \
             CMakeLists.txt \
             cmake/CViteExperimental.cmake \
+            src/cli/native_link.cpp \
             src/cli/run.c \
+            src/cli/run_internal.h \
             src/cli/semantic_cache.cpp \
             src/cli/semantic_cache.h \
             src/cli/toolchain.c \
@@ -120,10 +123,11 @@ jobs:
 
           git rm --ignore-unmatch -- \
             .cvite/apply-semantic-cache-transaction.py \
+            .cvite/apply-layout-restart.py \
             .github/workflows/activate-semantic-tools.yml \
             .github/workflows/diagnose-semantic-tools.yml \
             .github/workflows/snapshot-next-milestone.yml
 
           git diff --cached --check
-          git commit -m 'feat: make semantic layout diagnostics transactional'
+          git commit -m 'feat: make semantic layout failures transactional and restart-safe'
           git push origin HEAD:bootstrap/m0-runtime
