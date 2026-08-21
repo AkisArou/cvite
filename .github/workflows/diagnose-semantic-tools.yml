@@ -31,6 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .cvite/apply-semantic-cache-transaction.py
+          python3 .cvite/apply-layout-restart.py
           git diff --check
 
       - name: Install LLVM 18 toolchain
