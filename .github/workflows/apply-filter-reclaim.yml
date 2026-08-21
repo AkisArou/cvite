@@ -30,7 +30,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp .cvite/filter-reclaim.tar.gz /tmp/filter-reclaim.tar.gz
+          cat .cvite/filter-reclaim.part-{00,01,02,03} > /tmp/filter-reclaim.b64
+          base64 -d /tmp/filter-reclaim.b64 > /tmp/filter-reclaim.tar.gz
           echo "69522b79f126dfab43900b9dc587b6f6356388d9c2dc47cb3a4506514ab2bd89  /tmp/filter-reclaim.tar.gz" | sha256sum --check
           tar -xzf /tmp/filter-reclaim.tar.gz -C .
           git diff --check
@@ -131,7 +132,10 @@ jobs:
             tests/test_stable_entry.c
 
           git rm -- \
-            .cvite/filter-reclaim.tar.gz \
+            .cvite/filter-reclaim.part-00 \
+            .cvite/filter-reclaim.part-01 \
+            .cvite/filter-reclaim.part-02 \
+            .cvite/filter-reclaim.part-03 \
             .github/workflows/apply-filter-reclaim.yml \
             .github/workflows/source-snapshot-current.yml
 
