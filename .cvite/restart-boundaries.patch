@@ -1,0 +1,502 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b7407ce..cff3a94 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -183,6 +183,19 @@ if(CVITE_BUILD_LLVM_PASS)
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/candidate_input.c
+                 ${CMAKE_CURRENT_BINARY_DIR}
+         )
++        add_test(
++            NAME candidate-restart-boundaries
++            COMMAND
++                ${Python3_EXECUTABLE}
++                ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_candidate_boundaries.py
++                ${CVITE_CLANG_EXECUTABLE}
++                ${CVITE_OPT_EXECUTABLE}
++                $<TARGET_FILE:CViteLoweringPass>
++                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/restart_tls_candidate.c
++                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/restart_constructor_candidate.c
++                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/restart_destructor_candidate.c
++                ${CMAKE_CURRENT_BINARY_DIR}
++        )
+     endif()
+ endif()
+ 
+@@ -390,12 +403,15 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
+         "${CVITE_FILTER_TEST_DIRECTORY}/candidate-two.ll")
+     set(CVITE_FILTER_CANDIDATE_TWO_OBJECT
+         "${CVITE_FILTER_TEST_DIRECTORY}/candidate-two.o")
++    set(CVITE_RESTART_BOUNDARY_OBJECT
++        "${CVITE_FILTER_TEST_DIRECTORY}/restart-boundary.o")
+ 
+     add_custom_command(
+         OUTPUT
+             ${CVITE_FILTER_BASELINE_OBJECT}
+             ${CVITE_FILTER_CANDIDATE_ONE_OBJECT}
+             ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
++            ${CVITE_RESTART_BOUNDARY_OBJECT}
+         COMMAND ${CMAKE_COMMAND} -E make_directory ${CVITE_FILTER_TEST_DIRECTORY}
+         COMMAND
+             ${CVITE_CLANG_EXECUTABLE}
+@@ -442,11 +458,18 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
+             ${CVITE_CLANG_EXECUTABLE}
+             -O0 -fPIC -c ${CVITE_FILTER_CANDIDATE_TWO_IR}
+             -o ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
++        COMMAND
++            ${CVITE_CLANG_EXECUTABLE}
++            -std=c11 -O0 -fPIC
++            -I${CMAKE_CURRENT_SOURCE_DIR}/include
++            -c ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/restart_boundary_manifest.c
++            -o ${CVITE_RESTART_BOUNDARY_OBJECT}
+         DEPENDS
+             CViteLoweringPass
+             tests/fixtures/filter_baseline.c
+             tests/fixtures/filter_candidate_one.c
+             tests/fixtures/filter_candidate_two.c
++            tests/fixtures/restart_boundary_manifest.c
+         VERBATIM
+     )
+     add_custom_target(cvite_candidate_filter_test_objects
+@@ -454,6 +477,7 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
+             ${CVITE_FILTER_BASELINE_OBJECT}
+             ${CVITE_FILTER_CANDIDATE_ONE_OBJECT}
+             ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
++            ${CVITE_RESTART_BOUNDARY_OBJECT}
+     )
+     add_executable(cvite_test_candidate_filter tests/test_candidate_filter.c)
+     target_link_libraries(cvite_test_candidate_filter PRIVATE
+@@ -474,6 +498,24 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
+             ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
+     )
+ 
++    add_executable(cvite_test_restart_boundary tests/test_restart_boundary.c)
++    target_link_libraries(cvite_test_restart_boundary PRIVATE
++        cvite::host
++        cvite::orc_loader
++    )
++    cvite_set_warnings(cvite_test_restart_boundary)
++    add_dependencies(
++        cvite_test_restart_boundary
++        cvite_candidate_filter_test_objects
++    )
++    add_test(
++        NAME candidate-restart-required
++        COMMAND
++            cvite_test_restart_boundary
++            ${CVITE_FILTER_BASELINE_OBJECT}
++            ${CVITE_RESTART_BOUNDARY_OBJECT}
++    )
++
+     set(CVITE_BASELINE_LOADER_DIRECTORY
+         "${CMAKE_CURRENT_BINARY_DIR}/baseline-loader-test")
+     set(CVITE_BASELINE_LOADER_RAW_IR
+diff --git a/docs/candidate-objects.md b/docs/candidate-objects.md
+index 8f7ad4a..38141f1 100644
+--- a/docs/candidate-objects.md
++++ b/docs/candidate-objects.md
+@@ -50,8 +50,23 @@ prepared again, discarded, or the loader is destroyed.
+ 
+ The loader automatically exposes the hidden host resolver required by
+ compiler-generated candidate entries. Application/library symbols referenced by
+-edited code still need to be resolved from the baseline process or an explicit
+-symbol provider; project orchestration will automate that layer.
++edited code are resolved from the baseline process and the native link plan
++discovered by the development server.
++
++## Restart-required native state
++
++The candidate manifest also records native state that cannot be installed as a
++live code-only update. The first explicit restart boundaries are:
++
++- C thread-local storage definitions;
++- native constructor records (`llvm.global_ctors`);
++- native destructor records (`llvm.global_dtors`).
++
++These records are derived from LLVM IR, not from source-text pattern matching.
++The ORC loader returns `CVITE_STATUS_RESTART_REQUIRED` before constructing a
++patch, and the development server enters the same controlled re-exec path used
++for other incompatible native state. With `CVITE_DISABLE_AUTO_RESTART=1`, the
++last known-good generation remains active so the rejection can be inspected.
+ 
+ ## Safety
+ 
+@@ -64,5 +79,6 @@ A candidate object remains isolated until all of the following succeed:
+ 5. construction of a complete immutable dispatch snapshot.
+ 
+ Failure before publication leaves the last known-good generation active.
+-Published JIT generations are retained for now because quiescence/epoch-based
+-code reclamation has not yet been implemented.
++Superseded JIT generations are reclaimed after the compiler-generated call
++scopes establish quiescence. Generations whose function addresses may have
++escaped, or whose inline assembly cannot be analyzed safely, remain pinned.
+diff --git a/include/cvite/candidate.h b/include/cvite/candidate.h
+index 733b1aa..517b3b0 100644
+--- a/include/cvite/candidate.h
++++ b/include/cvite/candidate.h
+@@ -16,6 +16,9 @@ extern "C" {
+ #define CVITE_CANDIDATE_MANIFEST_SCHEMA UINT64_C(3)
+ #define CVITE_CANDIDATE_MANIFEST_SYMBOL "__cvite_candidate_manifest"
+ #define CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES UINT64_C(1)
++#define CVITE_CANDIDATE_FLAG_RESTART_TLS UINT64_C(2)
++#define CVITE_CANDIDATE_FLAG_RESTART_CONSTRUCTORS UINT64_C(4)
++#define CVITE_CANDIDATE_FLAG_RESTART_DESTRUCTORS UINT64_C(8)
+ 
+ typedef struct cvite_candidate_function {
+     uint64_t id_high;
+diff --git a/include/cvite/status.h b/include/cvite/status.h
+index 91fc88d..bd1fc81 100644
+--- a/include/cvite/status.h
++++ b/include/cvite/status.h
+@@ -20,6 +20,7 @@ typedef enum cvite_status {
+     CVITE_STATUS_CHECKSUM_MISMATCH,
+     CVITE_STATUS_IO_ERROR,
+     CVITE_STATUS_LINK_ERROR,
++    CVITE_STATUS_RESTART_REQUIRED,
+     CVITE_STATUS_NOT_IMPLEMENTED
+ } cvite_status;
+ 
+diff --git a/src/cli/watcher.c b/src/cli/watcher.c
+index cf03465..13b2ef1 100644
+--- a/src/cli/watcher.c
++++ b/src/cli/watcher.c
+@@ -107,6 +107,8 @@ static int publish_candidate(cvite_run_state *state)
+             (void)cvite_semantic_cache_report_pending();
+             (void)cvite_restart_current_process(
+                 "persistent storage layout changed");
++        } else if (error.status == CVITE_STATUS_RESTART_REQUIRED) {
++            (void)cvite_restart_current_process(error.message);
+         }
+         (void)fprintf(stderr, "[cvite] previous code remains active\n");
+         (void)cvite_orc_loader_discard_generation(
+diff --git a/src/host/orc_loader.cpp b/src/host/orc_loader.cpp
+index 78c7289..abc02d1 100644
+--- a/src/host/orc_loader.cpp
++++ b/src/host/orc_loader.cpp
+@@ -782,13 +782,36 @@ extern "C" cvite_status cvite_orc_loader_prepare_patch(
+             "candidate manifest schema is unsupported");
+     }
+     const std::uint64_t known_flags =
+-        CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES;
++        CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES |
++        CVITE_CANDIDATE_FLAG_RESTART_TLS |
++        CVITE_CANDIDATE_FLAG_RESTART_CONSTRUCTORS |
++        CVITE_CANDIDATE_FLAG_RESTART_DESTRUCTORS;
+     if ((manifest->flags & ~known_flags) != 0U) {
+         return fail(
+             error,
+             CVITE_STATUS_UNSUPPORTED_PROTOCOL,
+             "candidate manifest contains unsupported compatibility flags");
+     }
++    if ((manifest->flags & CVITE_CANDIDATE_FLAG_RESTART_TLS) != 0U) {
++        return fail(
++            error,
++            CVITE_STATUS_RESTART_REQUIRED,
++            "candidate uses thread-local storage; process restart required");
++    }
++    if ((manifest->flags &
++         CVITE_CANDIDATE_FLAG_RESTART_CONSTRUCTORS) != 0U) {
++        return fail(
++            error,
++            CVITE_STATUS_RESTART_REQUIRED,
++            "candidate contains native constructors; process restart required");
++    }
++    if ((manifest->flags &
++         CVITE_CANDIDATE_FLAG_RESTART_DESTRUCTORS) != 0U) {
++        return fail(
++            error,
++            CVITE_STATUS_RESTART_REQUIRED,
++            "candidate contains native destructors; process restart required");
++    }
+     candidate.reclaimable =
+         (manifest->flags & CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES) == 0U;
+     if (manifest->function_count == 0U) {
+diff --git a/src/runtime/status.c b/src/runtime/status.c
+index c4dda3e..4e19709 100644
+--- a/src/runtime/status.c
++++ b/src/runtime/status.c
+@@ -31,6 +31,8 @@ const char *cvite_status_string(cvite_status status)
+         return "I/O error";
+     case CVITE_STATUS_LINK_ERROR:
+         return "link error";
++    case CVITE_STATUS_RESTART_REQUIRED:
++        return "restart required";
+     case CVITE_STATUS_NOT_IMPLEMENTED:
+         return "not implemented";
+     }
+diff --git a/src/transform/candidate_pass.cpp b/src/transform/candidate_pass.cpp
+index 63ecd5f..08fa00b 100644
+--- a/src/transform/candidate_pass.cpp
++++ b/src/transform/candidate_pass.cpp
+@@ -368,6 +368,26 @@ llvm::GlobalVariable *createDebugName(
+     return global;
+ }
+ 
++bool hasThreadLocalStorage(const llvm::Module &module)
++{
++    for (const llvm::GlobalVariable &global : module.globals()) {
++        if (!global.isDeclaration() && global.isThreadLocal()) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool hasLifecycleRecords(
++    const llvm::Module &module,
++    llvm::StringRef global_name)
++{
++    const llvm::GlobalVariable *records =
++        module.getGlobalVariable(global_name, true);
++    return records != nullptr && !records->isDeclaration() &&
++        records->hasInitializer() && !records->getInitializer()->isNullValue();
++}
++
+ llvm::GlobalVariable *createFunctionRecords(
+     llvm::Module &module,
+     llvm::ArrayRef<CandidateFunction> functions)
+@@ -482,6 +502,15 @@ void createManifest(
+             flags |= CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES;
+         }
+     }
++    if (hasThreadLocalStorage(module)) {
++        flags |= CVITE_CANDIDATE_FLAG_RESTART_TLS;
++    }
++    if (hasLifecycleRecords(module, "llvm.global_ctors")) {
++        flags |= CVITE_CANDIDATE_FLAG_RESTART_CONSTRUCTORS;
++    }
++    if (hasLifecycleRecords(module, "llvm.global_dtors")) {
++        flags |= CVITE_CANDIDATE_FLAG_RESTART_DESTRUCTORS;
++    }
+ 
+     llvm::StructType *manifest_type = llvm::StructType::get(
+         context, {i64, i64, i64, pointer, i64, pointer}, false);
+diff --git a/tests/check_candidate_boundaries.py b/tests/check_candidate_boundaries.py
+new file mode 100755
+index 0000000..3e56a4f
+--- /dev/null
++++ b/tests/check_candidate_boundaries.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import pathlib
++import re
++import subprocess
++import sys
++import tempfile
++
++
++def fail(message: str) -> None:
++    raise AssertionError(message)
++
++
++def run(command: list[str]) -> None:
++    completed = subprocess.run(command, text=True, capture_output=True, check=False)
++    if completed.returncode != 0:
++        fail(
++            f"command failed ({completed.returncode}): {' '.join(command)}\n"
++            f"stdout:\n{completed.stdout}\n"
++            f"stderr:\n{completed.stderr}"
++        )
++
++
++def manifest_flags(ir: str) -> int:
++    match = re.search(
++        r"@__cvite_candidate_manifest\s*=.*?\{\s*i64\s+3,\s*i64\s+(-?\d+)",
++        ir,
++        re.DOTALL,
++    )
++    if match is None:
++        fail("candidate manifest flags are missing")
++    value = int(match.group(1))
++    return value if value >= 0 else value + (1 << 64)
++
++
++def transform(
++    clang: pathlib.Path,
++    opt: pathlib.Path,
++    plugin: pathlib.Path,
++    source: pathlib.Path,
++    directory: pathlib.Path,
++) -> str:
++    raw_ir = directory / f"{source.stem}.raw.ll"
++    transformed_ir = directory / f"{source.stem}.ll"
++    run([
++        str(clang), "-std=c11", "-O0", "-S", "-emit-llvm",
++        str(source), "-o", str(raw_ir),
++    ])
++    run([
++        str(opt), f"-load-pass-plugin={plugin}",
++        "-passes=cvite-lowering,cvite-candidate,verify",
++        "-S", str(raw_ir), "-o", str(transformed_ir),
++    ])
++    return transformed_ir.read_text(encoding="utf-8")
++
++
++def main() -> int:
++    if len(sys.argv) != 8:
++        print(
++            "usage: check_candidate_boundaries.py <clang> <opt> <plugin> "
++            "<tls-source> <constructor-source> <destructor-source> <work-dir>",
++            file=sys.stderr,
++        )
++        return 2
++
++    clang = pathlib.Path(sys.argv[1]).resolve()
++    opt = pathlib.Path(sys.argv[2]).resolve()
++    plugin = pathlib.Path(sys.argv[3]).resolve()
++    sources = [pathlib.Path(value).resolve() for value in sys.argv[4:7]]
++    work_root = pathlib.Path(sys.argv[7]).resolve()
++
++    expected = [2, 4, 8]
++    with tempfile.TemporaryDirectory(prefix="cvite-boundaries-", dir=work_root) as temp:
++        directory = pathlib.Path(temp)
++        for source, flag in zip(sources, expected, strict=True):
++            flags = manifest_flags(transform(clang, opt, plugin, source, directory))
++            if (flags & flag) == 0:
++                fail(f"{source.name} did not set compatibility flag {flag}: {flags}")
++
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/fixtures/restart_boundary_manifest.c b/tests/fixtures/restart_boundary_manifest.c
+new file mode 100644
+index 0000000..956a0f3
+--- /dev/null
++++ b/tests/fixtures/restart_boundary_manifest.c
+@@ -0,0 +1,12 @@
++#include "cvite/candidate.h"
++
++const cvite_candidate_manifest __cvite_candidate_manifest = {
++    CVITE_CANDIDATE_MANIFEST_SCHEMA,
++    CVITE_CANDIDATE_FLAG_RESTART_TLS |
++        CVITE_CANDIDATE_FLAG_RESTART_CONSTRUCTORS |
++        CVITE_CANDIDATE_FLAG_RESTART_DESTRUCTORS,
++    0U,
++    0,
++    0U,
++    0,
++};
+diff --git a/tests/fixtures/restart_constructor_candidate.c b/tests/fixtures/restart_constructor_candidate.c
+new file mode 100644
+index 0000000..3d71108
+--- /dev/null
++++ b/tests/fixtures/restart_constructor_candidate.c
+@@ -0,0 +1,17 @@
++static int initialized;
++
++__attribute__((constructor))
++static void initialize_candidate(void)
++{
++    initialized = 41;
++}
++
++int app_update(void)
++{
++    return initialized + 1;
++}
++
++int main(void)
++{
++    return app_update();
++}
+diff --git a/tests/fixtures/restart_destructor_candidate.c b/tests/fixtures/restart_destructor_candidate.c
+new file mode 100644
+index 0000000..eb568e9
+--- /dev/null
++++ b/tests/fixtures/restart_destructor_candidate.c
+@@ -0,0 +1,17 @@
++static int finalized;
++
++__attribute__((destructor))
++static void finalize_candidate(void)
++{
++    finalized = 1;
++}
++
++int app_update(void)
++{
++    return finalized;
++}
++
++int main(void)
++{
++    return app_update();
++}
+diff --git a/tests/fixtures/restart_tls_candidate.c b/tests/fixtures/restart_tls_candidate.c
+new file mode 100644
+index 0000000..c8b6687
+--- /dev/null
++++ b/tests/fixtures/restart_tls_candidate.c
+@@ -0,0 +1,12 @@
++static _Thread_local int counter;
++
++int app_update(void)
++{
++    counter += 1;
++    return counter;
++}
++
++int main(void)
++{
++    return app_update();
++}
+diff --git a/tests/test_restart_boundary.c b/tests/test_restart_boundary.c
+new file mode 100644
+index 0000000..06759d9
+--- /dev/null
++++ b/tests/test_restart_boundary.c
+@@ -0,0 +1,51 @@
++#include "cvite/orc_loader.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define CHECK(CONDITION)                                                        \
++    do {                                                                        \
++        if (!(CONDITION)) {                                                     \
++            (void)fprintf(                                                      \
++                stderr,                                                         \
++                "CHECK failed at %s:%d: %s\n",                                \
++                __FILE__,                                                       \
++                __LINE__,                                                       \
++                #CONDITION);                                                    \
++            return EXIT_FAILURE;                                                \
++        }                                                                       \
++    } while (0)
++
++int main(int argc, char **argv)
++{
++    cvite_orc_loader *loader = NULL;
++    cvite_orc_generation baseline = CVITE_ORC_GENERATION_INVALID;
++    cvite_orc_generation candidate = CVITE_ORC_GENERATION_INVALID;
++    cvite_program_main program_main = NULL;
++    cvite_patch patch;
++    cvite_error error;
++    cvite_status status;
++
++    CHECK(argc == 3);
++    CHECK(cvite_orc_loader_create(&loader, &error) == CVITE_STATUS_OK);
++    CHECK(cvite_orc_loader_stage_object(
++              loader, argv[1], &baseline, &error) == CVITE_STATUS_OK);
++    CHECK(cvite_orc_loader_prepare_baseline(
++              loader, baseline, &program_main, &error) == CVITE_STATUS_OK);
++    CHECK(program_main != NULL);
++
++    CHECK(cvite_orc_loader_stage_object(
++              loader, argv[2], &candidate, &error) == CVITE_STATUS_OK);
++    status = cvite_orc_loader_prepare_patch(
++        loader, candidate, 0U, 1U, &patch, &error);
++    CHECK(status == CVITE_STATUS_RESTART_REQUIRED);
++    CHECK(error.status == CVITE_STATUS_RESTART_REQUIRED);
++    CHECK(strstr(error.message, "thread-local storage") != NULL);
++    CHECK(strstr(error.message, "restart required") != NULL);
++    CHECK(cvite_orc_loader_discard_generation(
++              loader, candidate, &error) == CVITE_STATUS_OK);
++
++    cvite_orc_loader_destroy(loader);
++    return EXIT_SUCCESS;
++}
