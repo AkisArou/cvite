@@ -1,0 +1,833 @@
+name: Land live semantic layout diagnostics
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cvite-live-semantic-cache
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Materialize live semantic cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > src/cli/semantic_cache.h <<'EOF'
+          #ifndef CVITE_CLI_SEMANTIC_CACHE_H
+          #define CVITE_CLI_SEMANTIC_CACHE_H
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /* Internal development-server API. Ordinary C programs never call it. */
+          int cvite_semantic_cache_stage(
+              const char *source_path,
+              const char *active_ir_path,
+              const char *staged_ir_path);
+
+          void cvite_semantic_cache_promote(
+              const char *source_path,
+              const char *active_ir_path,
+              const char *staged_ir_path);
+
+          unsigned cvite_semantic_cache_report_pending(void);
+          void cvite_semantic_cache_clear(void);
+
+          #ifdef __cplusplus
+          }
+          #endif
+
+          #endif
+          EOF
+
+          cat > src/cli/semantic_cache.cpp <<'EOF'
+          #include "semantic_cache.h"
+
+          #include "semantic_index.h"
+
+          #include <clang-c/CXCompilationDatabase.h>
+
+          #include <algorithm>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <filesystem>
+          #include <map>
+          #include <mutex>
+          #include <optional>
+          #include <string>
+          #include <system_error>
+          #include <utility>
+          #include <vector>
+
+          namespace {
+
+          namespace fs = std::filesystem;
+
+          struct CacheEntry final {
+              std::string active_index;
+              std::string staged_index;
+          };
+
+          std::mutex cache_mutex;
+          std::map<std::string, CacheEntry> cache_entries;
+
+          std::string takeString(CXString value)
+          {
+              const char *text = clang_getCString(value);
+              std::string result = text == nullptr ? std::string() : std::string(text);
+              clang_disposeString(value);
+              return result;
+          }
+
+          bool traceEnabled()
+          {
+              const char *value = std::getenv("CVITE_TRACE_SEMANTICS");
+              return value != nullptr && value[0] != '\0' && value[0] != '0';
+          }
+
+          void trace(const std::string &message)
+          {
+              if (traceEnabled()) {
+                  std::fprintf(stderr, "[cvite] semantic cache: %s\n", message.c_str());
+              }
+          }
+
+          std::string indexPath(const char *ir_path)
+          {
+              return ir_path == nullptr || ir_path[0] == '\0'
+                  ? std::string()
+                  : std::string(ir_path) + ".cvsidx";
+          }
+
+          bool isSamePath(const std::string &left, const std::string &right)
+          {
+              std::error_code error;
+              const fs::path left_path = fs::weakly_canonical(left, error);
+              if (error) {
+                  return left == right;
+              }
+              const fs::path right_path = fs::weakly_canonical(right, error);
+              return !error && left_path == right_path;
+          }
+
+          bool consumesNext(const std::string &argument)
+          {
+              return argument == "-o" || argument == "-MF" ||
+                  argument == "-MT" || argument == "-MQ" ||
+                  argument == "-MJ";
+          }
+
+          bool controlledFlag(const std::string &argument)
+          {
+              return argument == "-c" || argument == "-MD" ||
+                  argument == "-MMD" || argument == "-MP" ||
+                  argument == "-MG" || argument == "-fPIC" ||
+                  argument == "-fpic" || argument == "-fPIE" ||
+                  argument == "-fpie" ||
+                  (argument.size() > 1U && argument[0] == '-' &&
+                   (argument[1] == 'O' || argument[1] == 'g'));
+          }
+
+          std::optional<fs::path> findCompilationDatabase(
+              const fs::path &source)
+          {
+              std::vector<fs::path> starts;
+              starts.push_back(source.parent_path());
+              std::error_code error;
+              starts.push_back(fs::current_path(error));
+              for (fs::path start : starts) {
+                  if (start.empty()) {
+                      continue;
+                  }
+                  for (;;) {
+                      if (fs::is_regular_file(start / "compile_commands.json", error)) {
+                          return start;
+                      }
+                      const fs::path parent = start.parent_path();
+                      if (parent == start || parent.empty()) {
+                          break;
+                      }
+                      start = parent;
+                  }
+              }
+              return std::nullopt;
+          }
+
+          std::vector<std::string> compileArguments(const std::string &source)
+          {
+              std::vector<std::string> result;
+              const fs::path absolute_source = fs::absolute(source).lexically_normal();
+              const std::optional<fs::path> database_directory =
+                  findCompilationDatabase(absolute_source);
+              if (!database_directory.has_value()) {
+                  result.emplace_back("-std=c11");
+                  return result;
+              }
+
+              CXCompilationDatabase_Error database_error =
+                  CXCompilationDatabase_NoError;
+              CXCompilationDatabase database =
+                  clang_CompilationDatabase_fromDirectory(
+                      database_directory->string().c_str(), &database_error);
+              if (database == nullptr ||
+                  database_error != CXCompilationDatabase_NoError) {
+                  result.emplace_back("-std=c11");
+                  return result;
+              }
+              CXCompileCommands commands =
+                  clang_CompilationDatabase_getCompileCommands(
+                      database, absolute_source.string().c_str());
+              if (commands == nullptr || clang_CompileCommands_getSize(commands) == 0U) {
+                  if (commands != nullptr) {
+                      clang_CompileCommands_dispose(commands);
+                  }
+                  clang_CompilationDatabase_dispose(database);
+                  result.emplace_back("-std=c11");
+                  return result;
+              }
+
+              CXCompileCommand command = clang_CompileCommands_getCommand(commands, 0U);
+              const std::string working_directory =
+                  takeString(clang_CompileCommand_getDirectory(command));
+              if (!working_directory.empty()) {
+                  result.emplace_back("-working-directory");
+                  result.push_back(working_directory);
+              }
+              const unsigned argument_count = clang_CompileCommand_getNumArgs(command);
+              bool skip_next = false;
+              for (unsigned index = 1U; index < argument_count; ++index) {
+                  std::string argument =
+                      takeString(clang_CompileCommand_getArg(command, index));
+                  if (skip_next) {
+                      skip_next = false;
+                      continue;
+                  }
+                  if (consumesNext(argument)) {
+                      skip_next = true;
+                      continue;
+                  }
+                  if (controlledFlag(argument) ||
+                      argument.rfind("-o", 0U) == 0U ||
+                      argument.rfind("-MF", 0U) == 0U ||
+                      argument.rfind("-MT", 0U) == 0U ||
+                      argument.rfind("-MQ", 0U) == 0U ||
+                      isSamePath(argument, absolute_source.string())) {
+                      continue;
+                  }
+                  result.push_back(std::move(argument));
+              }
+              clang_CompileCommands_dispose(commands);
+              clang_CompilationDatabase_dispose(database);
+              if (result.empty()) {
+                  result.emplace_back("-std=c11");
+              }
+              return result;
+          }
+
+          bool replaceFile(const std::string &source, const std::string &destination)
+          {
+              if (source.empty() || destination.empty()) {
+                  return false;
+              }
+              std::error_code error;
+              fs::rename(source, destination, error);
+              if (!error) {
+                  return true;
+              }
+              error.clear();
+              fs::copy_file(
+                  source,
+                  destination,
+                  fs::copy_options::overwrite_existing,
+                  error);
+              if (error) {
+                  return false;
+              }
+              error.clear();
+              fs::remove(source, error);
+              return true;
+          }
+
+          } // namespace
+
+          extern "C" int cvite_semantic_cache_stage(
+              const char *source_path,
+              const char *active_ir_path,
+              const char *staged_ir_path)
+          {
+              if (source_path == nullptr || source_path[0] == '\0') {
+                  return -1;
+              }
+              const std::string active_index = indexPath(active_ir_path);
+              const std::string staged_index = indexPath(staged_ir_path);
+              if (staged_index.empty()) {
+                  return -1;
+              }
+
+              cvite::semantic::Index index;
+              std::string error;
+              if (!cvite::semantic::buildIndex(
+                      source_path,
+                      compileArguments(source_path),
+                      index,
+                      error) ||
+                  !cvite::semantic::writeIndex(index, staged_index, error)) {
+                  trace("could not stage '" + std::string(source_path) + "': " + error);
+                  std::error_code remove_error;
+                  fs::remove(staged_index, remove_error);
+                  return -1;
+              }
+
+              std::lock_guard<std::mutex> lock(cache_mutex);
+              cache_entries[fs::absolute(source_path).lexically_normal().string()] = {
+                  active_index,
+                  staged_index,
+              };
+              return 0;
+          }
+
+          extern "C" void cvite_semantic_cache_promote(
+              const char *source_path,
+              const char *active_ir_path,
+              const char *staged_ir_path)
+          {
+              if (source_path == nullptr || source_path[0] == '\0') {
+                  return;
+              }
+              const std::string source_key =
+                  fs::absolute(source_path).lexically_normal().string();
+              const std::string active_index = indexPath(active_ir_path);
+              const std::string staged_index = indexPath(staged_ir_path);
+              if (active_index.empty() || staged_index.empty()) {
+                  return;
+              }
+              if (!replaceFile(staged_index, active_index)) {
+                  trace("could not promote semantic index for '" + source_key + "'");
+                  return;
+              }
+              std::lock_guard<std::mutex> lock(cache_mutex);
+              cache_entries[source_key] = {active_index, staged_index};
+          }
+
+          extern "C" unsigned cvite_semantic_cache_report_pending(void)
+          {
+              std::vector<std::pair<std::string, CacheEntry>> entries;
+              {
+                  std::lock_guard<std::mutex> lock(cache_mutex);
+                  entries.assign(cache_entries.begin(), cache_entries.end());
+              }
+
+              unsigned report_count = 0U;
+              for (const auto &entry : entries) {
+                  if (entry.second.active_index.empty() ||
+                      entry.second.staged_index.empty() ||
+                      !fs::is_regular_file(entry.second.active_index) ||
+                      !fs::is_regular_file(entry.second.staged_index)) {
+                      continue;
+                  }
+                  cvite::semantic::Index active;
+                  cvite::semantic::Index staged;
+                  std::string error;
+                  if (!cvite::semantic::readIndex(
+                          entry.second.active_index, active, error) ||
+                      !cvite::semantic::readIndex(
+                          entry.second.staged_index, staged, error)) {
+                      trace("could not read pending semantic indexes: " + error);
+                      continue;
+                  }
+                  const cvite::semantic::DiffSummary semantic_diff =
+                      cvite::semantic::diff(active, staged);
+                  if (!semantic_diff.changed) {
+                      continue;
+                  }
+                  if (report_count == 0U) {
+                      std::fprintf(
+                          stderr,
+                          "[cvite] semantic explanation for rejected native layout:\n");
+                  }
+                  std::fprintf(
+                      stderr,
+                      "source: %s\n%s",
+                      entry.first.c_str(),
+                      semantic_diff.text.c_str());
+                  ++report_count;
+              }
+              return report_count;
+          }
+
+          extern "C" void cvite_semantic_cache_clear(void)
+          {
+              std::lock_guard<std::mutex> lock(cache_mutex);
+              cache_entries.clear();
+          }
+          EOF
+
+          cat > tests/check_semantic_restart.py <<'EOF'
+          #!/usr/bin/env python3
+
+          from __future__ import annotations
+
+          import os
+          import pathlib
+          import queue
+          import subprocess
+          import sys
+          import tempfile
+          import threading
+          import time
+
+
+          OLD_SOURCE = r'''
+          typedef struct PlayerState {
+              int score;
+          } PlayerState;
+
+          int printf(const char *, ...);
+          int fflush(void *);
+          int usleep(unsigned int);
+
+          static PlayerState player;
+
+          static int update_player(void)
+          {
+              player.score += 1;
+              return player.score;
+          }
+
+          int main(void)
+          {
+              for (;;) {
+                  printf("score=%d\n", update_player());
+                  fflush((void *)0);
+                  usleep(100000U);
+              }
+          }
+          '''
+
+          NEW_SOURCE = r'''
+          typedef struct PlayerState {
+              int score;
+              int health;
+          } PlayerState;
+
+          int printf(const char *, ...);
+          int fflush(void *);
+          int usleep(unsigned int);
+
+          static PlayerState player;
+
+          static int update_player(void)
+          {
+              player.score += 1;
+              return player.score;
+          }
+
+          int main(void)
+          {
+              for (;;) {
+                  printf("score=%d\n", update_player());
+                  fflush((void *)0);
+                  usleep(100000U);
+              }
+          }
+          '''
+
+
+          def replace(path: pathlib.Path, text: str) -> None:
+              temporary = path.with_suffix(".next")
+              temporary.write_text(text, encoding="utf-8")
+              os.replace(temporary, path)
+
+
+          def main() -> int:
+              if len(sys.argv) != 2:
+                  raise SystemExit("usage: check_semantic_restart.py <cvite>")
+              cvite = pathlib.Path(sys.argv[1]).resolve()
+              with tempfile.TemporaryDirectory(prefix="cvite-layout-") as temporary:
+                  root = pathlib.Path(temporary)
+                  source = root / "app.c"
+                  source.write_text(OLD_SOURCE, encoding="utf-8")
+                  environment = os.environ.copy()
+                  environment["CVITE_TRACE_SEMANTICS"] = "1"
+                  process = subprocess.Popen(
+                      [str(cvite), "run", str(source)],
+                      cwd=root,
+                      env=environment,
+                      text=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      bufsize=1,
+                  )
+                  assert process.stdout is not None
+                  lines: queue.Queue[str] = queue.Queue()
+
+                  def read_output() -> None:
+                      for line in process.stdout:
+                          lines.put(line)
+
+                  reader = threading.Thread(target=read_output, daemon=True)
+                  reader.start()
+                  transcript: list[str] = []
+
+                  def wait_for(marker: str, timeout: float) -> None:
+                      deadline = time.monotonic() + timeout
+                      while time.monotonic() < deadline:
+                          try:
+                              line = lines.get(timeout=0.2)
+                          except queue.Empty:
+                              if process.poll() is not None:
+                                  break
+                              continue
+                          transcript.append(line)
+                          if marker in "".join(transcript):
+                              return
+                      raise AssertionError(
+                          f"did not observe {marker!r}; transcript:\n"
+                          + "".join(transcript)
+                      )
+
+                  try:
+                      wait_for("score=", 20.0)
+                      replace(source, NEW_SOURCE)
+                      wait_for("semantic explanation for rejected native layout", 30.0)
+                      combined = "".join(transcript)
+                      for marker in (
+                          "PlayerState",
+                          "+ field health",
+                          "append-only layout candidate",
+                      ):
+                          if marker not in combined:
+                              wait_for(marker, 10.0)
+                      wait_for("restart", 20.0)
+                      wait_for("score=1", 20.0)
+                  finally:
+                      process.terminate()
+                      try:
+                          process.wait(timeout=5.0)
+                      except subprocess.TimeoutExpired:
+                          process.kill()
+                          process.wait(timeout=5.0)
+
+              return 0
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          EOF
+
+          cat > /tmp/patch_semantic_hooks.py <<'PY'
+          from __future__ import annotations
+
+          import pathlib
+          import re
+
+          root = pathlib.Path('.')
+          header = (root / 'src/cli/run_internal.h').read_text(encoding='utf-8')
+
+          def field(pattern: str) -> str:
+              matches = re.findall(r'\b([A-Za-z_]\w*)\b\s*(?:\[[^;]*\])?\s*;', header)
+              for candidate in matches:
+                  if re.search(pattern, candidate, re.IGNORECASE):
+                      return candidate
+              raise SystemExit(f'could not find translation-unit field matching {pattern!r}')
+
+          source_field = field(r'source.*path|path.*source')
+          staged_field = field(r'stag.*ir|ir.*stag')
+          active_field = field(r'active.*ir|ir.*active')
+
+          def functions(text: str):
+              pattern = re.compile(
+                  r'(?m)^[A-Za-z_][\w\s\*]*\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{'
+              )
+              for match in pattern.finditer(text):
+                  start = match.start()
+                  open_brace = text.find('{', match.start(), match.end())
+                  depth = 0
+                  index = open_brace
+                  state = 'code'
+                  while index < len(text):
+                      char = text[index]
+                      nxt = text[index + 1] if index + 1 < len(text) else ''
+                      if state == 'code':
+                          if char == '/' and nxt == '/':
+                              state = 'line'; index += 2; continue
+                          if char == '/' and nxt == '*':
+                              state = 'block'; index += 2; continue
+                          if char == '"':
+                              state = 'string'; index += 1; continue
+                          if char == "'":
+                              state = 'char'; index += 1; continue
+                          if char == '{': depth += 1
+                          elif char == '}':
+                              depth -= 1
+                              if depth == 0:
+                                  yield match.group(1), start, index + 1, text[start:index + 1]
+                                  break
+                      elif state == 'line':
+                          if char == '\n': state = 'code'
+                      elif state == 'block':
+                          if char == '*' and nxt == '/':
+                              state = 'code'; index += 2; continue
+                      elif state in ('string', 'char'):
+                          if char == '\\': index += 2; continue
+                          if (state == 'string' and char == '"') or (
+                              state == 'char' and char == "'"
+                          ):
+                              state = 'code'
+                      index += 1
+
+          cli_files = sorted((root / 'src/cli').glob('*.c'))
+          stage_done = False
+          promote_done = False
+          report_done = False
+
+          def access(object_name: str, operator: str, field_name: str) -> str:
+              return f'{object_name}{operator}{field_name}'
+
+          for path in cli_files:
+              text = path.read_text(encoding='utf-8')
+              original = text
+              replacements = []
+              for name, start, end, body in functions(text):
+                  occurrence = re.search(
+                      rf'\b([A-Za-z_]\w*)\s*(->|\.)\s*{re.escape(staged_field)}\b',
+                      body,
+                  )
+                  if occurrence is None:
+                      continue
+                  object_name, operator = occurrence.group(1), occurrence.group(2)
+                  source_expr = access(object_name, operator, source_field)
+                  active_expr = access(object_name, operator, active_field)
+                  staged_expr = access(object_name, operator, staged_field)
+
+                  if not stage_done and (
+                      'emit-llvm' in body or 'compile' in name.lower() or
+                      'clang' in body
+                  ) and 'return CVITE_STATUS_OK;' in body:
+                      marker = 'return CVITE_STATUS_OK;'
+                      insertion = (
+                          '(void)cvite_semantic_cache_stage(\n'
+                          f'        {source_expr},\n'
+                          f'        {active_expr},\n'
+                          f'        {staged_expr});\n    '
+                          + marker
+                      )
+                      updated = body.rsplit(marker, 1)[0] + insertion + body.rsplit(marker, 1)[1]
+                      replacements.append((start, end, updated))
+                      stage_done = True
+                      continue
+
+                  if not promote_done and (
+                      'promot' in name.lower() or 'rename' in body or
+                      ('active' in body and 'staged' in body)
+                  ) and 'return CVITE_STATUS_OK;' in body:
+                      marker = 'return CVITE_STATUS_OK;'
+                      insertion = (
+                          'cvite_semantic_cache_promote(\n'
+                          f'        {source_expr},\n'
+                          f'        {active_expr},\n'
+                          f'        {staged_expr});\n    '
+                          + marker
+                      )
+                      updated = body.rsplit(marker, 1)[0] + insertion + body.rsplit(marker, 1)[1]
+                      replacements.append((start, end, updated))
+                      promote_done = True
+
+              for start, end, replacement in reversed(replacements):
+                  text = text[:start] + replacement + text[end:]
+
+              if 'CVITE_STATUS_LAYOUT_MISMATCH' in text and not report_done:
+                  condition = re.search(
+                      r'if\s*\((?:(?!\)\s*\{).)*CVITE_STATUS_LAYOUT_MISMATCH'
+                      r'(?:(?!\)\s*\{).)*\)\s*\{',
+                      text,
+                      re.DOTALL,
+                  )
+                  if condition is not None:
+                      position = condition.end()
+                      text = (
+                          text[:position]
+                          + '\n        (void)cvite_semantic_cache_report_pending();'
+                          + text[position:]
+                      )
+                      report_done = True
+
+              if text != original:
+                  if '#include "semantic_cache.h"' not in text:
+                      include = '#include "semantic_cache.h"\n'
+                      first_include = text.find('#include')
+                      if first_include < 0:
+                          text = include + text
+                      else:
+                          line_end = text.find('\n', first_include)
+                          text = text[:line_end + 1] + include + text[line_end + 1:]
+                  path.write_text(text, encoding='utf-8')
+
+          if not stage_done:
+              raise SystemExit('could not locate the successful translation-unit compile path')
+          if not promote_done:
+              raise SystemExit('could not locate the translation-unit cache promotion path')
+          if not report_done:
+              raise SystemExit('could not locate the layout-mismatch restart path')
+          PY
+
+          if ! grep -Rqs 'cvite_semantic_cache_stage' src/cli/*.c; then
+            python3 /tmp/patch_semantic_hooks.py
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('CMakeLists.txt')
+          text = path.read_text(encoding='utf-8')
+
+          source_anchor = '''    target_sources(cvite PRIVATE
+              src/cli/run.c
+              src/cli/toolchain.c
+              src/cli/watcher.c
+          )'''
+          if 'src/cli/semantic_cache.cpp' not in text:
+              if source_anchor in text:
+                  text = text.replace(
+                      source_anchor,
+                      source_anchor.replace(
+                          '              src/cli/watcher.c',
+                          '              src/cli/watcher.c\n              src/cli/semantic_cache.cpp',
+                      ),
+                      1,
+                  )
+              else:
+                  marker = 'target_sources(cvite PRIVATE'
+                  position = text.find(marker)
+                  if position < 0:
+                      raise SystemExit('cvite runner target_sources block was not found')
+                  close = text.find(')', position)
+                  text = text[:close] + '    src/cli/semantic_cache.cpp\n' + text[close:]
+
+          link_pattern = 'target_link_libraries(cvite PRIVATE cvite::orc_loader Threads::Threads)'
+          if 'cvite_semantic_index' not in text[text.find(link_pattern):text.find(link_pattern) + 200]:
+              if link_pattern not in text:
+                  raise SystemExit('cvite runner link marker was not found')
+              text = text.replace(
+                  link_pattern,
+                  'target_link_libraries(cvite PRIVATE\n'
+                  '        cvite::orc_loader\n'
+                  '        cvite_semantic_index\n'
+                  '        Threads::Threads\n'
+                  '    )',
+                  1,
+              )
+
+          if 'NAME run-semantic-layout-restart' not in text:
+              anchor = '''    add_test(
+              NAME run-fast-refresh
+              COMMAND
+                  ${Python3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_run.py
+                  $<TARGET_FILE:cvite>
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/run_app.c
+          )
+          set_tests_properties(run-fast-refresh PROPERTIES TIMEOUT 45)
+          '''
+              if anchor not in text:
+                  raise SystemExit('run-fast-refresh CMake test anchor was not found')
+              block = anchor + '''
+              add_test(
+                  NAME run-semantic-layout-restart
+                  COMMAND
+                      ${Python3_EXECUTABLE}
+                      ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_semantic_restart.py
+                      $<TARGET_FILE:cvite>
+              )
+              set_tests_properties(
+                  run-semantic-layout-restart
+                  PROPERTIES TIMEOUT 75
+              )
+          '''
+              text = text.replace(anchor, block, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          git diff --check
+
+      - name: Install Clang and LLVM 18
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-semantic-live -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-semantic-live --verbose
+
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build-semantic-live --output-on-failure \
+            | tee /tmp/cvite-semantic-live-tests.txt
+
+      - name: Upload verification transcript
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-semantic-live-${{ github.sha }}
+          path: /tmp/cvite-semantic-live-tests.txt
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Commit verified source and remove verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- .github/workflows/land-live-semantic-cache.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- \
+            CMakeLists.txt \
+            src/cli/semantic_cache.h \
+            src/cli/semantic_cache.cpp \
+            src/cli/*.c \
+            tests/check_semantic_restart.py
+          git rm --cached --ignore-unmatch \
+            .github/workflows/land-live-semantic-cache.yml
+          git diff --cached --check
+          git commit -m 'feat: explain rejected live layouts from cached Clang indexes'
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
