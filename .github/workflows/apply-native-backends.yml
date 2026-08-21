@@ -35,13 +35,28 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("CMakeLists.txt")
-          content = path.read_text(encoding="utf-8")
-          old = "target_include_directories(cvite PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR})"
-          new = "target_include_directories(cvite SYSTEM PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR})"
-          if old not in content:
+          cmake_path = Path("CMakeLists.txt")
+          cmake = cmake_path.read_text(encoding="utf-8")
+          old_include = "target_include_directories(cvite PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR})"
+          new_include = "target_include_directories(cvite SYSTEM PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR})"
+          if old_include not in cmake:
               raise SystemExit("CVite libclang include marker was not found")
-          path.write_text(content.replace(old, new, 1), encoding="utf-8")
+          cmake_path.write_text(cmake.replace(old_include, new_include, 1), encoding="utf-8")
+
+          source_path = Path("src/cli/native_link.cpp")
+          source = source_path.read_text(encoding="utf-8")
+          old_loop = """    for (unsigned char byte : text) {
+                  value ^= static_cast<std::uint64_t>(byte);
+                  value *= prime;
+              }"""
+          new_loop = """    for (char character : text) {
+                  const auto byte = static_cast<unsigned char>(character);
+                  value ^= static_cast<std::uint64_t>(byte);
+                  value *= prime;
+              }"""
+          if old_loop not in source:
+              raise SystemExit("native plan hash marker was not found")
+          source_path.write_text(source.replace(old_loop, new_loop, 1), encoding="utf-8")
           PY
 
           rm -f -- \
