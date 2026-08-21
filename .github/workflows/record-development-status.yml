@@ -1,0 +1,174 @@
+name: Record CVite development status
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-development-status
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Install Clang and LLVM 18
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+
+      - name: Configure
+        id: configure
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake -S . -B build-status -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCVITE_BUILD_COMPILER=ON \
+            -DCVITE_BUILD_LLVM_PASS=ON \
+            -DCVITE_BUILD_ORC_LOADER=ON \
+            -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18 \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCVITE_WARNINGS_AS_ERRORS=ON \
+            2>&1 | tee /tmp/cvite-status-configure.txt
+
+      - name: Build
+        id: build
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build-status --verbose \
+            2>&1 | tee /tmp/cvite-status-build.txt
+
+      - name: Test
+        id: test
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build-status --output-on-failure \
+            2>&1 | tee /tmp/cvite-status-test.txt
+
+      - name: Write exact status report
+        if: always()
+        env:
+          CONFIGURE_OUTCOME: ${{ steps.configure.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          test_count=0
+          if [[ -f /tmp/cvite-status-test.txt ]]; then
+            test_count=$(grep -Eo '[0-9]+% tests passed' /tmp/cvite-status-test.txt | tail -1 | grep -Eo '[0-9]+' || true)
+          fi
+          source_markers=0
+          for marker in \
+            src/compiler/semantic_index.cpp \
+            src/compiler/layout_plan.cpp \
+            src/cli/semantic_cache.cpp \
+            tests/check_semantic_restart.py \
+            tests/test_layout_plan.cpp; do
+            [[ -f "$marker" ]] && source_markers=$((source_markers + 1))
+          done
+          result=FAILED
+          if [[ "$CONFIGURE_OUTCOME" == success && \
+                "$BUILD_OUTCOME" == success && \
+                "$TEST_OUTCOME" == success ]]; then
+            result=PASSED
+          fi
+          cat > docs/development-status.md <<EOF
+          # CVite development verification
+
+          This file is generated from a fresh GitHub Actions checkout of
+          \`bootstrap/m0-runtime\`. It is the source of truth for the current
+          pre-alpha branch, not a product-release declaration.
+
+          - Source commit tested: \`${GITHUB_SHA}\`
+          - Workflow run: \`${GITHUB_RUN_ID}\`
+          - Result: **${result}**
+          - Configure: \`${CONFIGURE_OUTCOME}\`
+          - Build: \`${BUILD_OUTCOME}\`
+          - Tests: \`${TEST_OUTCOME}\`
+          - Expected new-source markers present: \`${source_markers}/5\`
+          - Parsed pass percentage: \`${test_count}%\`
+
+          ## Newly exercised areas
+
+          - transactional implementation filtering and native lifecycle safety;
+          - Clang semantic record-layout index/diff;
+          - live cached semantic diagnostics before layout-triggered restart;
+          - managed append-only layout migration planning and byte-copy execution;
+          - single/multi-TU Fast Refresh and native-link backends;
+          - runtime, protocol, ORC/JITLink, and concurrent publication tests.
+
+          ## Safety boundary
+
+          A managed append-only plan is only valid when CVite owns the storage
+          address and pointer provenance. It does not make arbitrary unmanaged C
+          pointer graphs movable. Unsafe or ambiguous edits still restart.
+
+          ## Failure tail
+
+          \`\`\`text
+          EOF
+          for log in \
+            /tmp/cvite-status-configure.txt \
+            /tmp/cvite-status-build.txt \
+            /tmp/cvite-status-test.txt; do
+            if [[ -f "$log" ]]; then
+              echo "--- $(basename "$log") ---" >> docs/development-status.md
+              tail -80 "$log" >> docs/development-status.md
+            fi
+          done
+          cat >> docs/development-status.md <<'EOF'
+          ```
+          EOF
+          echo "$result" > /tmp/cvite-development-result
+
+      - name: Commit report and remove recorder
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- .github/workflows/record-development-status.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- docs/development-status.md
+          git rm --cached --ignore-unmatch \
+            .github/workflows/record-development-status.yml
+          git diff --cached --check
+          git commit -m 'docs: record reproducible development verification'
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
+
+      - name: Fail workflow when verification failed
+        if: always()
+        shell: bash
+        run: |
+          test "$(cat /tmp/cvite-development-result)" = PASSED
