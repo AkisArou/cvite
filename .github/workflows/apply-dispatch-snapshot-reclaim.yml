@@ -1,9 +1,9 @@
 name: Apply verified dispatch snapshot reclamation
 
 on:
-  push:
+  pull_request:
     branches:
-      - bootstrap/m0-runtime
+      - main
   workflow_dispatch:
 
 permissions:
@@ -11,11 +11,14 @@ permissions:
 
 concurrency:
   group: cvite-dispatch-snapshot-reclaim
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   apply:
-    if: github.actor != 'github-actions[bot]'
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'bootstrap/m0-runtime'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
