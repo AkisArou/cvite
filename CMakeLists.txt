@@ -183,6 +183,19 @@ if(CVITE_BUILD_LLVM_PASS)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/candidate_input.c
                 ${CMAKE_CURRENT_BINARY_DIR}
         )
+        add_test(
+            NAME candidate-restart-boundaries
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_candidate_boundaries.py
+                ${CVITE_CLANG_EXECUTABLE}
+                ${CVITE_OPT_EXECUTABLE}
+                $<TARGET_FILE:CViteLoweringPass>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/restart_tls_candidate.c
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/restart_constructor_candidate.c
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/restart_destructor_candidate.c
+                ${CMAKE_CURRENT_BINARY_DIR}
+        )
     endif()
 endif()
 
@@ -390,12 +403,15 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
         "${CVITE_FILTER_TEST_DIRECTORY}/candidate-two.ll")
     set(CVITE_FILTER_CANDIDATE_TWO_OBJECT
         "${CVITE_FILTER_TEST_DIRECTORY}/candidate-two.o")
+    set(CVITE_RESTART_BOUNDARY_OBJECT
+        "${CVITE_FILTER_TEST_DIRECTORY}/restart-boundary.o")
 
     add_custom_command(
         OUTPUT
             ${CVITE_FILTER_BASELINE_OBJECT}
             ${CVITE_FILTER_CANDIDATE_ONE_OBJECT}
             ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
+            ${CVITE_RESTART_BOUNDARY_OBJECT}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CVITE_FILTER_TEST_DIRECTORY}
         COMMAND
             ${CVITE_CLANG_EXECUTABLE}
@@ -442,11 +458,18 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
             ${CVITE_CLANG_EXECUTABLE}
             -O0 -fPIC -c ${CVITE_FILTER_CANDIDATE_TWO_IR}
             -o ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
+        COMMAND
+            ${CVITE_CLANG_EXECUTABLE}
+            -std=c11 -O0 -fPIC
+            -I${CMAKE_CURRENT_SOURCE_DIR}/include
+            -c ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/restart_boundary_manifest.c
+            -o ${CVITE_RESTART_BOUNDARY_OBJECT}
         DEPENDS
             CViteLoweringPass
             tests/fixtures/filter_baseline.c
             tests/fixtures/filter_candidate_one.c
             tests/fixtures/filter_candidate_two.c
+            tests/fixtures/restart_boundary_manifest.c
         VERBATIM
     )
     add_custom_target(cvite_candidate_filter_test_objects
@@ -454,6 +477,7 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
             ${CVITE_FILTER_BASELINE_OBJECT}
             ${CVITE_FILTER_CANDIDATE_ONE_OBJECT}
             ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
+            ${CVITE_RESTART_BOUNDARY_OBJECT}
     )
     add_executable(cvite_test_candidate_filter tests/test_candidate_filter.c)
     target_link_libraries(cvite_test_candidate_filter PRIVATE
@@ -472,6 +496,24 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
             ${CVITE_FILTER_BASELINE_OBJECT}
             ${CVITE_FILTER_CANDIDATE_ONE_OBJECT}
             ${CVITE_FILTER_CANDIDATE_TWO_OBJECT}
+    )
+
+    add_executable(cvite_test_restart_boundary tests/test_restart_boundary.c)
+    target_link_libraries(cvite_test_restart_boundary PRIVATE
+        cvite::host
+        cvite::orc_loader
+    )
+    cvite_set_warnings(cvite_test_restart_boundary)
+    add_dependencies(
+        cvite_test_restart_boundary
+        cvite_candidate_filter_test_objects
+    )
+    add_test(
+        NAME candidate-restart-required
+        COMMAND
+            cvite_test_restart_boundary
+            ${CVITE_FILTER_BASELINE_OBJECT}
+            ${CVITE_RESTART_BOUNDARY_OBJECT}
     )
 
     set(CVITE_BASELINE_LOADER_DIRECTORY

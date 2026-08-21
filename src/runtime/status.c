@@ -31,6 +31,8 @@ const char *cvite_status_string(cvite_status status)
         return "I/O error";
     case CVITE_STATUS_LINK_ERROR:
         return "link error";
+    case CVITE_STATUS_RESTART_REQUIRED:
+        return "restart required";
     case CVITE_STATUS_NOT_IMPLEMENTED:
         return "not implemented";
     }

@@ -782,12 +782,35 @@ extern "C" cvite_status cvite_orc_loader_prepare_patch(
             "candidate manifest schema is unsupported");
     }
     const std::uint64_t known_flags =
-        CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES;
+        CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES |
+        CVITE_CANDIDATE_FLAG_RESTART_TLS |
+        CVITE_CANDIDATE_FLAG_RESTART_CONSTRUCTORS |
+        CVITE_CANDIDATE_FLAG_RESTART_DESTRUCTORS;
     if ((manifest->flags & ~known_flags) != 0U) {
         return fail(
             error,
             CVITE_STATUS_UNSUPPORTED_PROTOCOL,
             "candidate manifest contains unsupported compatibility flags");
+    }
+    if ((manifest->flags & CVITE_CANDIDATE_FLAG_RESTART_TLS) != 0U) {
+        return fail(
+            error,
+            CVITE_STATUS_RESTART_REQUIRED,
+            "candidate uses thread-local storage; process restart required");
+    }
+    if ((manifest->flags &
+         CVITE_CANDIDATE_FLAG_RESTART_CONSTRUCTORS) != 0U) {
+        return fail(
+            error,
+            CVITE_STATUS_RESTART_REQUIRED,
+            "candidate contains native constructors; process restart required");
+    }
+    if ((manifest->flags &
+         CVITE_CANDIDATE_FLAG_RESTART_DESTRUCTORS) != 0U) {
+        return fail(
+            error,
+            CVITE_STATUS_RESTART_REQUIRED,
+            "candidate contains native destructors; process restart required");
     }
     candidate.reclaimable =
         (manifest->flags & CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES) == 0U;

@@ -368,6 +368,26 @@ llvm::GlobalVariable *createDebugName(
     return global;
 }
 
+bool hasThreadLocalStorage(const llvm::Module &module)
+{
+    for (const llvm::GlobalVariable &global : module.globals()) {
+        if (!global.isDeclaration() && global.isThreadLocal()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool hasLifecycleRecords(
+    const llvm::Module &module,
+    llvm::StringRef global_name)
+{
+    const llvm::GlobalVariable *records =
+        module.getGlobalVariable(global_name, true);
+    return records != nullptr && !records->isDeclaration() &&
+        records->hasInitializer() && !records->getInitializer()->isNullValue();
+}
+
 llvm::GlobalVariable *createFunctionRecords(
     llvm::Module &module,
     llvm::ArrayRef<CandidateFunction> functions)
@@ -481,6 +501,15 @@ void createManifest(
         if (function.entry_address_escapes) {
             flags |= CVITE_CANDIDATE_FLAG_ENTRY_ADDRESS_ESCAPES;
         }
+    }
+    if (hasThreadLocalStorage(module)) {
+        flags |= CVITE_CANDIDATE_FLAG_RESTART_TLS;
+    }
+    if (hasLifecycleRecords(module, "llvm.global_ctors")) {
+        flags |= CVITE_CANDIDATE_FLAG_RESTART_CONSTRUCTORS;
+    }
+    if (hasLifecycleRecords(module, "llvm.global_dtors")) {
+        flags |= CVITE_CANDIDATE_FLAG_RESTART_DESTRUCTORS;
     }
 
     llvm::StructType *manifest_type = llvm::StructType::get(

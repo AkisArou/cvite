@@ -50,8 +50,23 @@ prepared again, discarded, or the loader is destroyed.
 
 The loader automatically exposes the hidden host resolver required by
 compiler-generated candidate entries. Application/library symbols referenced by
-edited code still need to be resolved from the baseline process or an explicit
-symbol provider; project orchestration will automate that layer.
+edited code are resolved from the baseline process and the native link plan
+discovered by the development server.
+
+## Restart-required native state
+
+The candidate manifest also records native state that cannot be installed as a
+live code-only update. The first explicit restart boundaries are:
+
+- C thread-local storage definitions;
+- native constructor records (`llvm.global_ctors`);
+- native destructor records (`llvm.global_dtors`).
+
+These records are derived from LLVM IR, not from source-text pattern matching.
+The ORC loader returns `CVITE_STATUS_RESTART_REQUIRED` before constructing a
+patch, and the development server enters the same controlled re-exec path used
+for other incompatible native state. With `CVITE_DISABLE_AUTO_RESTART=1`, the
+last known-good generation remains active so the rejection can be inspected.
 
 ## Safety
 
@@ -64,5 +79,6 @@ A candidate object remains isolated until all of the following succeed:
 5. construction of a complete immutable dispatch snapshot.
 
 Failure before publication leaves the last known-good generation active.
-Published JIT generations are retained for now because quiescence/epoch-based
-code reclamation has not yet been implemented.
+Superseded JIT generations are reclaimed after the compiler-generated call
+scopes establish quiescence. Generations whose function addresses may have
+escaped, or whose inline assembly cannot be analyzed safely, remain pinned.

@@ -107,6 +107,8 @@ static int publish_candidate(cvite_run_state *state)
             (void)cvite_semantic_cache_report_pending();
             (void)cvite_restart_current_process(
                 "persistent storage layout changed");
+        } else if (error.status == CVITE_STATUS_RESTART_REQUIRED) {
+            (void)cvite_restart_current_process(error.message);
         }
         (void)fprintf(stderr, "[cvite] previous code remains active\n");
         (void)cvite_orc_loader_discard_generation(
