@@ -606,6 +606,12 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
     set_tests_properties(run-native-input-replacement PROPERTIES TIMEOUT 75)
 endif()
 
+# Clang-backed semantic analysis, conservative managed-layout planning,
+# and opt-in development stress tests are declared after the core/compiler
+# targets they extend.
+include(cmake/CViteSemantic.cmake)
+include(cmake/CViteExperimental.cmake)
+
 if(CVITE_BUILD_EXAMPLES)
     add_executable(cvite_runtime_transaction examples/runtime_transaction.c)
     target_link_libraries(cvite_runtime_transaction PRIVATE cvite::runtime)

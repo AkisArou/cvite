@@ -203,6 +203,39 @@ bool replaceFile(const std::string &source, const std::string &destination)
 
 } // namespace
 
+extern "C" int cvite_semantic_cache_activate(
+    const char *source_path,
+    const char *active_ir_path)
+{
+    if (source_path == nullptr || source_path[0] == '\0') {
+        return -1;
+    }
+    const std::string active_index = indexPath(active_ir_path);
+    if (active_index.empty()) {
+        return -1;
+    }
+
+    cvite::semantic::Index index;
+    std::string error;
+    if (!cvite::semantic::buildIndex(
+            source_path,
+            compileArguments(source_path),
+            index,
+            error) ||
+        !cvite::semantic::writeIndex(index, active_index, error)) {
+        trace("could not activate '" + std::string(source_path) + "': " + error);
+        std::error_code remove_error;
+        fs::remove(active_index, remove_error);
+        return -1;
+    }
+
+    const std::string source_key =
+        fs::absolute(source_path).lexically_normal().string();
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    cache_entries[source_key] = {active_index, std::string()};
+    return 0;
+}
+
 extern "C" int cvite_semantic_cache_stage(
     const char *source_path,
     const char *active_ir_path,
@@ -260,6 +293,35 @@ extern "C" void cvite_semantic_cache_promote(
     }
     std::lock_guard<std::mutex> lock(cache_mutex);
     cache_entries[source_key] = {active_index, staged_index};
+}
+
+extern "C" void cvite_semantic_cache_discard(
+    const char *source_path,
+    const char *staged_ir_path)
+{
+    const std::string staged_index = indexPath(staged_ir_path);
+    if (!staged_index.empty()) {
+        std::error_code remove_error;
+        fs::remove(staged_index, remove_error);
+    }
+    if (source_path == nullptr || source_path[0] == '\0') {
+        return;
+    }
+
+    const std::string source_key =
+        fs::absolute(source_path).lexically_normal().string();
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto found = cache_entries.find(source_key);
+    if (found == cache_entries.end()) {
+        return;
+    }
+    if (found->second.staged_index == staged_index) {
+        found->second.staged_index.clear();
+    }
+    if (found->second.active_index.empty() &&
+        found->second.staged_index.empty()) {
+        cache_entries.erase(found);
+    }
 }
 
 extern "C" unsigned cvite_semantic_cache_report_pending(void)

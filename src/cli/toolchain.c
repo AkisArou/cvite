@@ -1,4 +1,5 @@
 #include "run_internal.h"
+#include "semantic_cache.h"
 
 #include "cvite/status.h"
 
@@ -431,6 +432,30 @@ static int compile_selected_units(
                 dependency_path) != 0) {
             return -1;
         }
+
+        if (kind == CVITE_BUILD_BASELINE) {
+            if (cvite_semantic_cache_activate(
+                    state->translation_units[index].source_path,
+                    ir_path) != 0) {
+                (void)fprintf(
+                    stderr,
+                    "[cvite] warning: semantic index unavailable for %s\n",
+                    state->translation_units[index].source_path);
+            }
+        } else {
+            char active_ir[PATH_MAX];
+
+            if (cvite_active_ir_path(state, index, active_ir) != 0 ||
+                cvite_semantic_cache_stage(
+                    state->translation_units[index].source_path,
+                    active_ir,
+                    ir_path) != 0) {
+                (void)fprintf(
+                    stderr,
+                    "[cvite] warning: staged semantic index unavailable for %s\n",
+                    state->translation_units[index].source_path);
+            }
+        }
         ++compiled_count;
     }
 
@@ -658,7 +683,12 @@ void cvite_commit_candidate_build(cvite_run_state *state)
                 "[cvite] warning: could not commit TU cache %zu: %s\n",
                 index,
                 strerror(errno));
+            continue;
         }
+        cvite_semantic_cache_promote(
+            state->translation_units[index].source_path,
+            active_ir,
+            staged_ir);
     }
     free(state->candidate_dirty);
     state->candidate_dirty = NULL;
@@ -676,6 +706,9 @@ void cvite_discard_candidate_build(cvite_run_state *state)
         char path[PATH_MAX];
 
         if (staged_ir_path(state, index, path) == 0) {
+            cvite_semantic_cache_discard(
+                state->translation_units[index].source_path,
+                path);
             cvite_remove_if_present(path);
         }
         if (staged_dependency_path(state, index, path) == 0) {

@@ -1842,6 +1842,15 @@ int checkPlan(
 
 } // namespace
 
+extern "C" int cvite_restart_current_process(const char *reason)
+{
+    const char *effective_reason =
+        reason != nullptr && reason[0] != '\0'
+        ? reason
+        : "native state is incompatible with the candidate";
+    return restartCurrentProcess(effective_reason);
+}
+
 extern "C" int cvite_native_link_prepare(
     cvite_orc_loader *loader,
     const char *source_path,

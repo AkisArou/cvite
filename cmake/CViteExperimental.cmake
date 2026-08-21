@@ -57,6 +57,7 @@ if(
         )
     endif()
     target_link_libraries(cvite PRIVATE cvite_semantic_index)
+    target_compile_definitions(cvite PRIVATE CVITE_SEMANTIC_CACHE_ENABLED=1)
 endif()
 
 if(BUILD_TESTING)
@@ -83,6 +84,10 @@ if(BUILD_TESTING)
         target_link_libraries(
             cvite_test_runtime_stress
             PRIVATE cvite::runtime Threads::Threads
+        )
+        target_compile_definitions(
+            cvite_test_runtime_stress
+            PRIVATE _POSIX_C_SOURCE=200809L
         )
         cvite_set_warnings(cvite_test_runtime_stress)
         if(NOT TEST runtime-stress)

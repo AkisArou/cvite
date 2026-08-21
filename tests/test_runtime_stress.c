@@ -45,14 +45,14 @@ static const cvite_function_pointer targets_b[STRESS_SLOT_COUNT] = {
 };
 
 static const cvite_id function_ids[STRESS_SLOT_COUNT] = {
-    CVITE_ID(UINT64_C(0xA100), UINT64_C(1)),
-    CVITE_ID(UINT64_C(0xA100), UINT64_C(2)),
-    CVITE_ID(UINT64_C(0xA100), UINT64_C(3)),
-    CVITE_ID(UINT64_C(0xA100), UINT64_C(4)),
+    CVITE_ID_INITIALIZER(UINT64_C(0xA100), UINT64_C(1)),
+    CVITE_ID_INITIALIZER(UINT64_C(0xA100), UINT64_C(2)),
+    CVITE_ID_INITIALIZER(UINT64_C(0xA100), UINT64_C(3)),
+    CVITE_ID_INITIALIZER(UINT64_C(0xA100), UINT64_C(4)),
 };
 
 static const cvite_id function_abi =
-    CVITE_ID(UINT64_C(0xB200), UINT64_C(1));
+    CVITE_ID_INITIALIZER(UINT64_C(0xB200), UINT64_C(1));
 
 static void stress_signal_handler(int signal_number)
 {

@@ -1,4 +1,5 @@
 #include "run_internal.h"
+#include "semantic_cache.h"
 
 #include "cvite/host.h"
 
@@ -102,6 +103,11 @@ static int publish_candidate(cvite_run_state *state)
         &error);
     if (status != CVITE_STATUS_OK) {
         cvite_print_runtime_error("candidate validation", &error);
+        if (error.status == CVITE_STATUS_LAYOUT_MISMATCH) {
+            (void)cvite_semantic_cache_report_pending();
+            (void)cvite_restart_current_process(
+                "persistent storage layout changed");
+        }
         (void)fprintf(stderr, "[cvite] previous code remains active\n");
         (void)cvite_orc_loader_discard_generation(
             state->loader,

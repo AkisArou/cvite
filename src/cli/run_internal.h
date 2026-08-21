@@ -144,6 +144,8 @@ int cvite_native_link_poll(
     const char *source_path,
     const char *clang_path);
 
+int cvite_restart_current_process(const char *reason);
+
 #ifdef __cplusplus
 }
 #endif

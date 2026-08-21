@@ -1,5 +1,6 @@
 #include "run.h"
 #include "run_internal.h"
+#include "semantic_cache.h"
 
 #include "cvite/baseline.h"
 
@@ -446,6 +447,7 @@ cleanup:
     }
     free(program_arguments);
     cvite_discard_candidate_build(&state);
+    cvite_semantic_cache_clear();
     cvite_free_project(&state);
     /*
      * Once user code has run, retain JIT generations through process exit.
