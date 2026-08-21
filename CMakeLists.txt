@@ -186,14 +186,6 @@ if(CVITE_BUILD_LLVM_PASS)
 endif()
 
 if(CVITE_BUILD_ORC_LOADER)
-    llvm_map_components_to_libnames(CVITE_ORC_LLVM_LIBS
-        Core
-        JITLink
-        OrcJIT
-        Support
-        nativecodegen
-    )
-
     add_library(cvite_orc_loader STATIC src/host/orc_loader.cpp)
     add_library(cvite::orc_loader ALIAS cvite_orc_loader)
     target_include_directories(cvite_orc_loader
@@ -202,9 +194,17 @@ if(CVITE_BUILD_ORC_LOADER)
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     )
     target_include_directories(cvite_orc_loader SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
-    target_link_libraries(cvite_orc_loader
-        PUBLIC cvite::host
-        PRIVATE ${CVITE_ORC_LLVM_LIBS}
+    target_link_libraries(cvite_orc_loader PUBLIC cvite::host)
+    # libclang and ORC must share one LLVM runtime. Linking the ORC component
+    # archives beside libclang's libLLVM registers LLVM command-line options
+    # twice and aborts before the development server can start. LLVM's own
+    # helper links libLLVM and adds only components omitted from that dylib.
+    llvm_config(cvite_orc_loader USE_SHARED
+        Core
+        JITLink
+        OrcJIT
+        Support
+        nativecodegen
     )
     cvite_set_warnings(cvite_orc_loader)
     install(TARGETS cvite_orc_loader
