@@ -99,25 +99,3 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build-compiler --output-on-failure
-
-  source-snapshot:
-    name: Source snapshot
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Package repository source
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar --exclude=.git -czf /tmp/cvite-source.tar.gz .
-
-      - name: Upload source snapshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: cvite-source-${{ github.sha }}
-          path: /tmp/cvite-source.tar.gz
-          retention-days: 1
-          if-no-files-found: error
