@@ -1,0 +1,137 @@
+name: Activate and verify semantic tooling
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-semantic-tooling
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'bootstrap/m0-runtime'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Activate existing semantic and stress targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+          cmake = root / 'CMakeLists.txt'
+          text = cmake.read_text(encoding='utf-8')
+          marker = '''if(CVITE_BUILD_EXAMPLES)\n    add_executable(cvite_runtime_transaction examples/runtime_transaction.c)\n'''
+          insertion = '''# Clang-backed semantic analysis, conservative managed-layout planning,\n# and opt-in development stress tests are declared after the core/compiler\n# targets they extend.\ninclude(cmake/CViteSemantic.cmake)\ninclude(cmake/CViteExperimental.cmake)\n\n'''
+          if insertion not in text:
+              if marker not in text:
+                  raise SystemExit('root CMake insertion marker is missing')
+              text = text.replace(marker, insertion + marker, 1)
+          cmake.write_text(text, encoding='utf-8')
+
+          experimental = root / 'cmake/CViteExperimental.cmake'
+          text = experimental.read_text(encoding='utf-8')
+          old = '''        target_link_libraries(\n            cvite_test_runtime_stress\n            PRIVATE cvite::runtime Threads::Threads\n        )\n        cvite_set_warnings(cvite_test_runtime_stress)\n'''
+          new = '''        target_link_libraries(\n            cvite_test_runtime_stress\n            PRIVATE cvite::runtime Threads::Threads\n        )\n        target_compile_definitions(\n            cvite_test_runtime_stress\n            PRIVATE _POSIX_C_SOURCE=200809L\n        )\n        cvite_set_warnings(cvite_test_runtime_stress)\n'''
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('runtime-stress target marker is missing')
+              text = text.replace(old, new, 1)
+          experimental.write_text(text, encoding='utf-8')
+          PY
+          git diff --check
+
+      - name: Install build toolchains
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          gcc
+          g++
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+          cmake
+
+      - name: Verify GCC runtime build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-gcc -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-gcc --verbose
+          ctest --test-dir build-gcc --output-on-failure
+
+      - name: Verify Clang runtime build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-clang -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-clang --verbose
+          ctest --test-dir build-clang --output-on-failure
+
+      - name: Verify ASan and UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+          LDFLAGS='-fsanitize=address,undefined' \
+          cmake -S . -B build-sanitize -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-sanitize --verbose
+          ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 \
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+          ctest --test-dir build-sanitize --output-on-failure
+
+      - name: Verify full semantic and LLVM pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCVITE_BUILD_COMPILER=ON \
+            -DCVITE_BUILD_LLVM_PASS=ON \
+            -DCVITE_BUILD_ORC_LOADER=ON \
+            -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18 \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-llvm --verbose
+          ctest --test-dir build-llvm --output-on-failure
+
+      - name: Commit verified integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- CMakeLists.txt cmake/CViteExperimental.cmake
+          git rm -- .github/workflows/activate-semantic-tools.yml
+          git diff --cached --check
+          git commit -m 'build: activate semantic tooling and stress coverage'
+          git push origin HEAD:bootstrap/m0-runtime
