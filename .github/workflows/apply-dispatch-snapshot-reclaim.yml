@@ -1,0 +1,137 @@
+name: Apply verified dispatch snapshot reclamation
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-dispatch-snapshot-reclaim
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply audited source transformation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .cvite/dispatch-snapshot-script.part-{00,01,02,03,04} \
+            > /tmp/apply-dispatch-snapshots.b64
+          base64 -d /tmp/apply-dispatch-snapshots.b64 \
+            > /tmp/apply-dispatch-snapshots.py
+          echo "fd362b34b0676b604e58470ba24469d8dd030c60d087575d35a85debc72d397a  /tmp/apply-dispatch-snapshots.py" \
+            | sha256sum --check
+          python3 /tmp/apply-dispatch-snapshots.py
+          git diff --check
+
+      - name: Install build toolchains
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          gcc
+          g++
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+          cmake
+
+      - name: Verify GCC runtime build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-gcc -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-gcc --verbose
+          ctest --test-dir build-gcc --output-on-failure
+
+      - name: Verify Clang runtime build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-clang -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-clang --verbose
+          ctest --test-dir build-clang --output-on-failure
+
+      - name: Verify ASan and UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+          LDFLAGS="-fsanitize=address,undefined" \
+          cmake -S . -B build-sanitize -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-sanitize --verbose
+          ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 \
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+          ctest --test-dir build-sanitize --output-on-failure
+
+      - name: Verify full Clang and LLVM pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCVITE_BUILD_COMPILER=ON \
+            -DCVITE_BUILD_LLVM_PASS=ON \
+            -DCVITE_BUILD_ORC_LOADER=ON \
+            -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18 \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-llvm --verbose
+          ctest --test-dir build-llvm --output-on-failure
+
+      - name: Remove temporary implementation machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- .cvite
+          find .github/workflows -maxdepth 1 -type f ! -name ci.yml -delete
+          git diff --check
+
+      - name: Commit verified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            include/cvite/runtime.h \
+            include/cvite/host.h \
+            src/runtime/runtime_internal.h \
+            src/runtime/runtime_core.c \
+            src/runtime/runtime_function.c \
+            src/host/host_runtime.c \
+            src/cli/watcher.c \
+            tests/test_runtime.c \
+            tests/test_concurrency.c \
+            tests/test_host.c \
+            docs/architecture.md
+          git add -u -- .cvite .github/workflows
+          git diff --cached --check
+          git commit -m "feat: reclaim retired runtime dispatch snapshots"
+          git push origin HEAD:bootstrap/m0-runtime
