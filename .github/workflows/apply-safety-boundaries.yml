@@ -1,0 +1,102 @@
+name: Apply native-state refresh boundaries
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply implementation and recovery fixups
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .cvite/apply-safety-boundaries.py
+          rm -- .cvite/apply-safety-boundaries.py
+          rm -f -- \
+            .cvite/apply-filter-reclaim.py \
+            .github/workflows/apply-filter-reclaim.yml \
+            .github/workflows/source-snapshot-current.yml
+          rm -- .github/workflows/apply-safety-boundaries.yml
+          git diff --check
+
+      - name: Install Clang and LLVM 18
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+
+      - name: Configure full compiler/runtime build
+        run: >-
+          cmake -S . -B build-safety -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-safety --verbose
+
+      - name: Test
+        run: ctest --test-dir build-safety --output-on-failure
+
+      - name: Commit verified implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            CMakeLists.txt \
+            include/cvite/candidate.h \
+            include/cvite/host.h \
+            include/cvite/orc_loader.h \
+            include/cvite/runtime.h \
+            src/host/host_runtime.c \
+            src/host/orc_loader.cpp \
+            src/runtime/runtime_patch.c \
+            src/transform/candidate_pass.cpp \
+            src/transform/stable_entry_pass.cpp \
+            src/transform/transform_support.h \
+            tests/check_call_scope.py \
+            tests/check_filtered_refresh.py \
+            tests/check_tls_restart.py \
+            tests/fixtures/filtered_refresh.c \
+            tests/fixtures/tls_restart.c \
+            tests/test_quiescence.c \
+            docs/candidate-objects.md \
+            docs/orc-loader.md
+
+          git rm --cached --ignore-unmatch \
+            .cvite/apply-filter-reclaim.py \
+            .cvite/apply-safety-boundaries.py \
+            .github/workflows/apply-filter-reclaim.yml \
+            .github/workflows/apply-safety-boundaries.yml \
+            .github/workflows/source-snapshot-current.yml
+
+          git diff --cached --check
+          git commit -m "feat: add transactional filtering and native-state boundaries"
+          git push origin HEAD:bootstrap/m0-runtime
