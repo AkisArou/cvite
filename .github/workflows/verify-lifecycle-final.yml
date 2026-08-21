@@ -1,0 +1,175 @@
+name: Verify lifecycle and refresh boundaries
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cvite-final-lifecycle-verifier
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Require completed source milestones
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'cvite_patch_commit_callback' include/cvite/runtime.h
+          grep -q 'implementation_high' include/cvite/candidate.h
+          grep -q 'cvite_host_try_begin_collection' include/cvite/host.h
+          grep -q 'CVITE_CANDIDATE_FLAG_RESTART_TLS' include/cvite/candidate.h
+          test -f tests/check_filtered_refresh.py
+          test -f tests/check_tls_restart.py
+          test -f tests/check_constructor_restart.py
+
+      - name: Install Clang and LLVM 18
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-final -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-final --verbose
+
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build-final --output-on-failure | tee /tmp/cvite-final-tests.txt
+
+      - name: Upload verification transcript
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-lifecycle-final-${{ github.sha }}
+          path: /tmp/cvite-final-tests.txt
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Remove temporary implementation machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- .cvite
+          rm -f -- \
+            .github/workflows/apply-filter-reclaim.yml \
+            .github/workflows/apply-safety-boundaries.yml \
+            .github/workflows/finalize-lifecycle.yml \
+            .github/workflows/apply-refresh-diagnostics.yml \
+            .github/workflows/source-snapshot-current.yml \
+            .github/workflows/verify-lifecycle-final.yml
+          git diff --check
+
+      - name: Commit cleanup when needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u -- \
+            .cvite \
+            .github/workflows/apply-filter-reclaim.yml \
+            .github/workflows/apply-safety-boundaries.yml \
+            .github/workflows/finalize-lifecycle.yml \
+            .github/workflows/apply-refresh-diagnostics.yml \
+            .github/workflows/source-snapshot-current.yml \
+            .github/workflows/verify-lifecycle-final.yml
+          if git diff --cached --quiet; then
+            echo "No temporary files remain."
+          else
+            git diff --cached --check
+            git commit -m "ci: finalize lifecycle verification"
+            git push origin HEAD:bootstrap/m0-runtime
+          fi
+
+      - name: Update draft pull request status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cat > /tmp/pr-body.md <<'EOF'
+          ## Summary
+
+          CVite is an experimental React/Vite-style Fast Refresh runtime for ordinary C. Application code does not require CVite macros, state APIs, annotations, custom allocators, or lifecycle calls.
+
+          ```console
+          cvite run .
+          ```
+
+          Compatible edits are compiled with Clang, linked through LLVM/ORC, validated, and atomically published while process, global, static, heap, and OS-resource state remains alive. Invalid candidates leave the last known-good generation active. Native state that cannot be preserved safely takes the controlled restart path.
+
+          ## Implemented
+
+          - Clang/libclang semantic and compilation-database integration; no custom C parser.
+          - Stable native function entries, lowered-ABI fingerprints, and persistent global/static identities.
+          - Single- and multi-translation-unit projects with per-TU last-known-good LLVM IR/dependency caches.
+          - Header and `compile_commands.json` invalidation.
+          - CMake File API, CMake `link.txt`, and Ninja native-link discovery.
+          - Automatic target validation and shared-library/archive/support-object ORC namespaces.
+          - Transactional implementation fingerprints: unchanged functions are omitted from dispatch publication, and a byte-identical candidate is a valid zero-function transaction.
+          - Per-function JIT-generation ownership transfer after successful runtime publication only.
+          - Compiler-generated call scopes and a writer gate for quiescent ORC generation reclamation.
+          - Conservative generation pinning for address-taken functions and inline assembly.
+          - Controlled restart boundaries for `_Thread_local` state and native constructors/destructors.
+          - Actionable storage-layout diagnostics with old/new size and alignment.
+          - Last-known-good behavior across compiler, LLVM-link, ABI, layout, target, and native-link failures.
+
+          ## Verification
+
+          The pinned Clang/LLVM 18 verifier builds with warnings-as-errors and exercises semantic manifests, LLVM transforms, ORC/JITLink, stable entries, transactional dispatch, single- and multi-TU live refresh, native-link backends, same-path library replacement, implementation filtering, zero-change candidates, quiescent reclamation, TLS restart, constructor restart, runtime protocol, and concurrent publication.
+
+          ## Current constraints
+
+          - Linux/inotify and Clang/LLVM 18.
+          - C11-compatible application source and development-oriented optimization settings.
+          - One supported C `main` entry.
+          - Translation-unit set changes currently restart the process.
+          - Incremental TU compilation still performs a complete candidate LLVM relink.
+          - No transparent migration of arbitrary changed struct layouts or unmanaged pointer graphs.
+          - Address-escaped/inline-assembly generations may remain pinned for process lifetime.
+          - No packaged macOS or Windows backend yet.
+
+          ## Next milestones
+
+          1. semantic field-level compatibility reports and safe append-only storage experiments;
+          2. runtime dispatch-snapshot reclamation under the same quiescence gate;
+          3. debugger/profiler and long-running multithreaded stress coverage;
+          4. packaged toolchain/installer and reproducible example projects;
+          5. macOS and Windows watcher/linker backends.
+          EOF
+          gh api \
+            --method PATCH \
+            repos/AkisArou/cvite/pulls/1 \
+            --raw-field body="$(cat /tmp/pr-body.md)" \
+            >/dev/null
