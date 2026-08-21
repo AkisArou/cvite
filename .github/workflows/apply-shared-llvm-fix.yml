@@ -1,0 +1,53 @@
+name: Apply shared LLVM runtime fix
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'bootstrap/m0-runtime'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Link libclang and ORC through one LLVM dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('CMakeLists.txt')
+          text = path.read_text(encoding='utf-8')
+          preamble = '''if(CVITE_BUILD_ORC_LOADER)\n    llvm_map_components_to_libnames(CVITE_ORC_LLVM_LIBS\n        Core\n        JITLink\n        OrcJIT\n        Support\n        nativecodegen\n    )\n\n    add_library(cvite_orc_loader STATIC src/host/orc_loader.cpp)\n'''
+          replacement = '''if(CVITE_BUILD_ORC_LOADER)\n    add_library(cvite_orc_loader STATIC src/host/orc_loader.cpp)\n'''
+          if preamble not in text:
+              raise SystemExit('ORC component preamble was not found')
+          text = text.replace(preamble, replacement, 1)
+
+          link_block = '''    target_link_libraries(cvite_orc_loader\n        PUBLIC cvite::host\n        PRIVATE ${CVITE_ORC_LLVM_LIBS}\n    )\n    cvite_set_warnings(cvite_orc_loader)\n'''
+          shared_block = '''    target_link_libraries(cvite_orc_loader PUBLIC cvite::host)\n    # libclang and ORC must share one LLVM runtime. Linking the ORC component\n    # archives beside libclang's libLLVM registers LLVM command-line options\n    # twice and aborts before the development server can start. LLVM's own\n    # helper links libLLVM and adds only components omitted from that dylib.\n    llvm_config(cvite_orc_loader USE_SHARED\n        Core\n        JITLink\n        OrcJIT\n        Support\n        nativecodegen\n    )\n    cvite_set_warnings(cvite_orc_loader)\n'''
+          if link_block not in text:
+              raise SystemExit('ORC component link block was not found')
+          text = text.replace(link_block, shared_block, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- CMakeLists.txt
+          git diff --cached --check
+          git commit -m "fix: use one shared LLVM runtime"
+          git push origin HEAD:bootstrap/m0-runtime
