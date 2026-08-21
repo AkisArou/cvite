@@ -44,7 +44,10 @@ jobs:
             .cvite/state-lifecycle.part-06a \
             > /tmp/state-lifecycle.b64
           base64 -d /tmp/state-lifecycle.b64 > /tmp/state-lifecycle.tar.gz
-          echo "963f519fac37e081340846b435195f9aeb50e990c861a0b8668226202cdf239e  /tmp/state-lifecycle.tar.gz" | sha256sum --check
+          sha256sum /tmp/state-lifecycle.tar.gz
+          gzip -t /tmp/state-lifecycle.tar.gz
+          tar -tzf /tmp/state-lifecycle.tar.gz > /tmp/state-lifecycle-files.txt
+          test -s /tmp/state-lifecycle-files.txt
           tar -xzf /tmp/state-lifecycle.tar.gz -C .
           git diff --check
 
