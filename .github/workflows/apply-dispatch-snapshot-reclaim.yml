@@ -33,10 +33,10 @@ jobs:
           cat .cvite/dispatch-snapshot-script.part-{00,01,02,03,04} \
             > /tmp/apply-dispatch-snapshots.b64
           base64 -d /tmp/apply-dispatch-snapshots.b64 \
-            > /tmp/apply-dispatch-snapshots.py
-          echo "fd362b34b0676b604e58470ba24469d8dd030c60d087575d35a85debc72d397a  /tmp/apply-dispatch-snapshots.py" \
+            > .cvite/apply-dispatch-snapshots.py
+          echo "fd362b34b0676b604e58470ba24469d8dd030c60d087575d35a85debc72d397a  .cvite/apply-dispatch-snapshots.py" \
             | sha256sum --check
-          python3 /tmp/apply-dispatch-snapshots.py
+          python3 .cvite/apply-dispatch-snapshots.py
           git diff --check
 
       - name: Install build toolchains
