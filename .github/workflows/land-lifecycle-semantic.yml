@@ -1,0 +1,210 @@
+name: Land lifecycle and semantic indexes
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cvite-land-lifecycle-semantic
+  cancel-in-progress: false
+
+jobs:
+  verify-and-land:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Materialize lifecycle source and semantic build targets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! grep -q 'cvite_patch_commit_callback' include/cvite/runtime.h; then
+            python3 .cvite/apply-filter-reclaim.py
+          fi
+          if ! grep -q 'CVITE_CANDIDATE_FLAG_RESTART_TLS' include/cvite/candidate.h; then
+            python3 .cvite/apply-safety-boundaries.py
+          fi
+          if [[ -f .cvite/apply-refresh-diagnostics.py ]] &&
+             ! grep -q 'alignment.*->' src/runtime/runtime_storage.c; then
+            python3 .cvite/apply-refresh-diagnostics.py
+          fi
+
+          test -f src/compiler/semantic_index.h
+          test -f src/compiler/semantic_index.cpp
+          test -f src/compiler/semantic_index_main.cpp
+          test -f tests/check_semantic_index.py
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('CMakeLists.txt')
+          text = path.read_text(encoding='utf-8')
+
+          if 'add_library(cvite_semantic_index STATIC' not in text:
+              anchor = (
+                  '    install(TARGETS cvite_manifest '
+                  'RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})\n'
+              )
+              if anchor not in text:
+                  raise SystemExit('cvite_manifest install anchor was not found')
+              block = anchor + '''
+
+    add_library(cvite_semantic_index STATIC
+        src/compiler/semantic_index.cpp
+    )
+    target_include_directories(cvite_semantic_index
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/compiler
+    )
+    target_include_directories(cvite_semantic_index
+        SYSTEM PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR}
+    )
+    target_link_libraries(cvite_semantic_index PRIVATE ${CVITE_LIBCLANG_LIBRARY})
+    cvite_set_warnings(cvite_semantic_index)
+
+    add_executable(cvite_semantic_index_cli
+        src/compiler/semantic_index_main.cpp
+    )
+    set_target_properties(
+        cvite_semantic_index_cli
+        PROPERTIES OUTPUT_NAME cvite-semantic-index
+    )
+    target_link_libraries(
+        cvite_semantic_index_cli
+        PRIVATE cvite_semantic_index
+    )
+    cvite_set_warnings(cvite_semantic_index_cli)
+    install(
+        TARGETS cvite_semantic_index_cli
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+'''
+              text = text.replace(anchor, block, 1)
+
+          if 'NAME semantic-index' not in text:
+              anchor = '''        add_test(
+            NAME manifest
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_manifest.py
+                $<TARGET_FILE:cvite_manifest>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/manifest_input.c
+                ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+'''
+              if anchor not in text:
+                  raise SystemExit('manifest test anchor was not found')
+              semantic_test = anchor + '''        add_test(
+            NAME semantic-index
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_semantic_index.py
+                $<TARGET_FILE:cvite_semantic_index_cli>
+        )
+'''
+              text = text.replace(anchor, semantic_test, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          git diff --check
+
+      - name: Install Clang and LLVM 18
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-land -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-land --verbose
+
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build-land --output-on-failure | tee /tmp/cvite-land-tests.txt
+
+      - name: Upload verification transcript
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-lifecycle-semantic-${{ github.sha }}
+          path: /tmp/cvite-land-tests.txt
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Remove temporary implementation machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- .cvite
+          find .github/workflows -maxdepth 1 -type f ! -name ci.yml -delete
+          git diff --check
+
+      - name: Commit verified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          {
+            git diff --name-only --diff-filter=ACMRTUXB
+            git diff --name-only --diff-filter=D
+            git ls-files --others --exclude-standard
+          } | sort -u > /tmp/cvite-paths.txt
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          exact = {'CMakeLists.txt', 'README.md', '.github/workflows/ci.yml'}
+          prefixes = (
+              'docs/', 'include/cvite/', 'src/', 'tests/',
+              '.cvite/', '.github/workflows/',
+          )
+          paths = [p for p in Path('/tmp/cvite-paths.txt').read_text().splitlines() if p]
+          bad = [p for p in paths if p not in exact and not p.startswith(prefixes)]
+          if bad:
+              raise SystemExit('refusing unexpected paths: ' + ', '.join(bad))
+          Path('/tmp/cvite-paths.nul').write_bytes(
+              b'\0'.join(p.encode() for p in paths) + (b'\0' if paths else b'')
+          )
+          PY
+
+          if [[ ! -s /tmp/cvite-paths.nul ]]; then
+            echo 'No source changes remain to commit.'
+            exit 0
+          fi
+          xargs -0 git add -- < /tmp/cvite-paths.nul
+          git diff --cached --check
+          git commit -m 'feat: land lifecycle safety and semantic layout indexes'
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
