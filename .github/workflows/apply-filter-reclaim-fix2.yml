@@ -1,0 +1,213 @@
+name: Verify filtering and JIT reclamation with idempotent fixes
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-commit:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.ref == 'bootstrap/m0-runtime'))
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply feature source and LLVM integration fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .cvite/filter-reclaim.part-{00,01,02,03} > /tmp/filter-reclaim.b64
+          base64 -d /tmp/filter-reclaim.b64 > /tmp/filter-reclaim.tar.gz
+          echo "69522b79f126dfab43900b9dc587b6f6356388d9c2dc47cb3a4506514ab2bd89  /tmp/filter-reclaim.tar.gz" | sha256sum --check
+          tar -xzf /tmp/filter-reclaim.tar.gz -C .
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text(encoding="utf-8")
+              if new in text and old not in text:
+                  return
+              if old not in text:
+                  raise SystemExit(f"missing integration-fix marker in {path}: {old!r}")
+              file.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          replace_once(
+              "src/transform/transform_support.h",
+              '#include "llvm/IR/Attributes.h"\n',
+              '#include "llvm/IR/Attributes.h"\n#include "llvm/IR/Constants.h"\n',
+          )
+
+          replace_once(
+              "src/transform/baseline_manifest_pass.cpp",
+              "    Hash128 implementation;\n    std::string debug_name;",
+              "    Hash128 implementation_fingerprint;\n    std::string debug_name;",
+          )
+          baseline = Path("src/transform/baseline_manifest_pass.cpp")
+          text = baseline.read_text(encoding="utf-8")
+          text = text.replace(
+              "function.implementation.high",
+              "function.implementation_fingerprint.high",
+          ).replace(
+              "function.implementation.low",
+              "function.implementation_fingerprint.low",
+          )
+          baseline.write_text(text, encoding="utf-8")
+
+          replace_once(
+              "src/transform/stable_entry_pass.cpp",
+              "    Hash128 implementation;\n    std::string debug_name;",
+              "    Hash128 implementation_fingerprint;\n    std::string debug_name;",
+          )
+          replace_once(
+              "src/transform/stable_entry_pass.cpp",
+              "    const Hash128 implementation = cvite::transform::hash128(\n",
+              "    const Hash128 implementation_fingerprint = cvite::transform::hash128(\n",
+          )
+          replace_once(
+              "src/transform/stable_entry_pass.cpp",
+              "    cvite::transform::setImplementationMetadata(function, implementation);",
+              "    cvite::transform::setImplementationMetadata(\n"
+              "        function, implementation_fingerprint);",
+          )
+          replace_once(
+              "src/transform/stable_entry_pass.cpp",
+              "        abi,\n        implementation,\n        original_name,",
+              "        abi,\n        implementation_fingerprint,\n        original_name,",
+          )
+
+          replace_once(
+              "src/transform/candidate_pass.cpp",
+              '#include "candidate_pass.h"\n',
+              '#include "candidate_pass.h"\n#include "cvite/candidate.h"\n',
+          )
+
+          orc = Path("src/host/orc_loader.cpp")
+          text = orc.read_text(encoding="utf-8")
+          for old, new in (
+              ("cvite_id id = CVITE_ID_ZERO;", "cvite_id id{};"),
+              ("cvite_id abi = CVITE_ID_ZERO;", "cvite_id abi{};"),
+              ("cvite_id implementation = CVITE_ID_ZERO;", "cvite_id implementation{};"),
+              (
+                  "cvite_id previous_implementation = CVITE_ID_ZERO;",
+                  "cvite_id previous_implementation{};",
+              ),
+          ):
+              text = text.replace(old, new)
+          orc.write_text(text, encoding="utf-8")
+          PY
+
+          git diff --check
+
+      - name: Install validation toolchains
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          gcc
+          clang
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+          cmake
+
+      - name: Configure, build, and test full LLVM pipeline
+        run: |
+          cmake -S . -B build-full -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCVITE_BUILD_COMPILER=ON \
+            -DCVITE_BUILD_LLVM_PASS=ON \
+            -DCVITE_BUILD_ORC_LOADER=ON \
+            -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18 \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-full --verbose
+          ctest --test-dir build-full --output-on-failure
+
+      - name: Configure, build, and test GCC runtime
+        env:
+          CC: gcc
+        run: |
+          cmake -S . -B build-gcc -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-gcc --verbose
+          ctest --test-dir build-gcc --output-on-failure
+
+      - name: Configure, build, and test sanitizer runtime
+        env:
+          CC: clang
+          CFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+          LDFLAGS: -fsanitize=address,undefined
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          cmake -S . -B build-sanitize -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-sanitize --verbose
+          ctest --test-dir build-sanitize --output-on-failure
+
+      - name: Commit verified implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            CMakeLists.txt \
+            include/cvite/baseline.h \
+            include/cvite/candidate.h \
+            include/cvite/host.h \
+            include/cvite/orc_loader.h \
+            src/cli/watcher.c \
+            src/host/host_runtime.c \
+            src/host/orc_loader.cpp \
+            src/transform/baseline_manifest_pass.cpp \
+            src/transform/candidate_pass.cpp \
+            src/transform/stable_entry_pass.cpp \
+            src/transform/transform_support.h \
+            tests/check_candidate.py \
+            tests/check_stable_entry.py \
+            tests/fixtures/stable_e2e_baseline.c \
+            tests/fixtures/stable_e2e_candidate.c \
+            tests/fixtures/filter_baseline.c \
+            tests/fixtures/filter_candidate_one.c \
+            tests/fixtures/filter_candidate_two.c \
+            tests/test_candidate_filter.c \
+            tests/test_host.c \
+            tests/test_stable_entry.c
+
+          git rm -- \
+            .cvite/filter-reclaim.part-00 \
+            .cvite/filter-reclaim.part-01 \
+            .cvite/filter-reclaim.part-02 \
+            .cvite/filter-reclaim.part-03 \
+            .github/workflows/apply-filter-reclaim.yml \
+            .github/workflows/apply-filter-reclaim-fix.yml \
+            .github/workflows/apply-filter-reclaim-fix2.yml \
+            .github/workflows/source-snapshot-current.yml
+
+          git diff --cached --check
+          git commit -m "feat: filter unchanged patches and reclaim retired JIT code"
+          git push origin HEAD:bootstrap/m0-runtime
