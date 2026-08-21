@@ -266,181 +266,37 @@ static int watch_set_add_path(cvite_watch_set *set, const char *absolute_path)
     return 0;
 }
 
-static int read_file(
-    const char *path,
-    char **content,
-    size_t *content_size)
+static int add_watch_dependency(const char *path, void *opaque)
 {
-    FILE *file;
-    long length;
-    size_t size;
-    char *buffer;
-
-    *content = NULL;
-    *content_size = 0U;
-    file = fopen(path, "rb");
-    if (file == NULL) {
-        (void)fprintf(
-            stderr,
-            "[cvite] could not read dependency file %s: %s\n",
-            path,
-            strerror(errno));
-        return -1;
-    }
-    if (fseek(file, 0L, SEEK_END) != 0) {
-        (void)fclose(file);
-        return -1;
-    }
-    length = ftell(file);
-    if (length < 0L || (unsigned long)length > CVITE_MAX_DEPFILE_SIZE) {
-        (void)fclose(file);
-        (void)fprintf(stderr, "[cvite] dependency file is unreasonably large\n");
-        return -1;
-    }
-    if (fseek(file, 0L, SEEK_SET) != 0) {
-        (void)fclose(file);
-        return -1;
-    }
-    size = (size_t)length;
-    if (size == SIZE_MAX) {
-        (void)fclose(file);
-        return -1;
-    }
-    buffer = malloc(size + 1U);
-    if (buffer == NULL) {
-        (void)fclose(file);
-        return -1;
-    }
-    if (size != 0U && fread(buffer, 1U, size, file) != size) {
-        free(buffer);
-        (void)fclose(file);
-        (void)fprintf(stderr, "[cvite] could not read complete dependency file\n");
-        return -1;
-    }
-    buffer[size] = '\0';
-    (void)fclose(file);
-    *content = buffer;
-    *content_size = size;
-    return 0;
+    cvite_watch_set *set = opaque;
+    return watch_set_add_path(set, path);
 }
 
-static size_t dependency_list_offset(const char *content, size_t size)
-{
-    bool escaped = false;
-    size_t index;
-
-    for (index = 0U; index < size; ++index) {
-        if (escaped) {
-            escaped = false;
-        } else if (content[index] == '\\') {
-            escaped = true;
-        } else if (content[index] == ':') {
-            return index + 1U;
-        }
-    }
-    return SIZE_MAX;
-}
-
-static int add_dependency_token(
-    cvite_watch_set *set,
-    const char *token,
-    size_t token_length)
-{
-    char path[PATH_MAX];
-    char resolved[PATH_MAX];
-
-    if (token_length == 0U) {
-        return 0;
-    }
-    if (token_length >= sizeof(path)) {
-        (void)fprintf(stderr, "[cvite] dependency path is too long\n");
-        return -1;
-    }
-    (void)memcpy(path, token, token_length);
-    path[token_length] = '\0';
-    if (realpath(path, resolved) == NULL) {
-        (void)fprintf(
-            stderr,
-            "[cvite] could not resolve dependency '%s': %s\n",
-            path,
-            strerror(errno));
-        return -1;
-    }
-    return watch_set_add_path(set, resolved);
-}
-
-static int parse_dependency_file(
+static int build_watch_set(
     const cvite_run_state *state,
-    cvite_build_kind kind,
     cvite_watch_set *set)
 {
-    char dependency_path[PATH_MAX];
-    char *content = NULL;
-    char token[PATH_MAX];
-    size_t content_size = 0U;
-    size_t offset;
-    size_t token_length = 0U;
     size_t index;
-    int result = -1;
 
-    if (cvite_dependency_path(state, kind, dependency_path) != 0 ||
-        read_file(dependency_path, &content, &content_size) != 0) {
+    for (index = 0U; index < state->translation_unit_count; ++index) {
+        char dependency_path[PATH_MAX];
+
+        if (cvite_active_dependency_path(
+                state,
+                index,
+                dependency_path) != 0 ||
+            cvite_visit_dependency_file(
+                dependency_path,
+                add_watch_dependency,
+                set) != 0) {
+            return -1;
+        }
+    }
+    if (state->compile_database_path[0] != '\0' &&
+        watch_set_add_path(set, state->compile_database_path) != 0) {
         return -1;
     }
-    if (watch_set_add_path(set, state->source_path) != 0) {
-        goto cleanup;
-    }
-
-    offset = dependency_list_offset(content, content_size);
-    if (offset == SIZE_MAX) {
-        (void)fprintf(stderr, "[cvite] malformed Clang dependency file\n");
-        goto cleanup;
-    }
-
-    for (index = offset; index <= content_size; ++index) {
-        const char character = index < content_size ? content[index] : '\0';
-
-        if (character == '\\' && index + 1U < content_size &&
-            content[index + 1U] == '\n') {
-            ++index;
-            continue;
-        }
-        if (character == '\\' && index + 2U < content_size &&
-            content[index + 1U] == '\r' && content[index + 2U] == '\n') {
-            index += 2U;
-            continue;
-        }
-        if (character == '\\' && index + 1U < content_size) {
-            if (token_length + 1U >= sizeof(token)) {
-                (void)fprintf(stderr, "[cvite] dependency path is too long\n");
-                goto cleanup;
-            }
-            token[token_length] = content[index + 1U];
-            ++token_length;
-            ++index;
-            continue;
-        }
-        if (character == ' ' || character == '\t' || character == '\r' ||
-            character == '\n' || character == '\0') {
-            if (add_dependency_token(set, token, token_length) != 0) {
-                goto cleanup;
-            }
-            token_length = 0U;
-            continue;
-        }
-        if (token_length + 1U >= sizeof(token)) {
-            (void)fprintf(stderr, "[cvite] dependency path is too long\n");
-            goto cleanup;
-        }
-        token[token_length] = character;
-        ++token_length;
-    }
-
-    result = 0;
-
-cleanup:
-    free(content);
-    return result;
+    return 0;
 }
 
 static bool watch_sets_equal(
@@ -583,16 +439,14 @@ static int install_watch_set(
     return 0;
 }
 
-int cvite_refresh_source_watcher(
-    cvite_run_state *state,
-    cvite_build_kind kind)
+int cvite_refresh_source_watcher(cvite_run_state *state)
 {
     cvite_watch_set candidate = {0};
 
     if (state == NULL || state->watch_descriptor < 0) {
         return -1;
     }
-    if (parse_dependency_file(state, kind, &candidate) != 0) {
+    if (build_watch_set(state, &candidate) != 0) {
         free_watch_set(&candidate);
         return -1;
     }

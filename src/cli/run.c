@@ -3,6 +3,7 @@
 
 #include "cvite/baseline.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -18,6 +19,10 @@
 
 #ifndef CVITE_OPT_PATH
 #define CVITE_OPT_PATH "opt-18"
+#endif
+
+#ifndef CVITE_LLVM_LINK_PATH
+#define CVITE_LLVM_LINK_PATH "llvm-link-18"
 #endif
 
 #ifndef CVITE_PASS_PLUGIN_BUILD_PATH
@@ -36,20 +41,14 @@ static bool path_is_regular_file(const char *path)
 {
     struct stat status;
 
-    if (path == NULL || stat(path, &status) != 0) {
-        return false;
-    }
-    return S_ISREG(status.st_mode);
+    return path != NULL && stat(path, &status) == 0 && S_ISREG(status.st_mode);
 }
 
 static bool path_is_directory(const char *path)
 {
     struct stat status;
 
-    if (path == NULL || stat(path, &status) != 0) {
-        return false;
-    }
-    return S_ISDIR(status.st_mode);
+    return path != NULL && stat(path, &status) == 0 && S_ISDIR(status.st_mode);
 }
 
 static bool string_ends_with(const char *value, const char *suffix)
@@ -66,33 +65,66 @@ static bool string_ends_with(const char *value, const char *suffix)
         strcmp(value + value_length - suffix_length, suffix) == 0;
 }
 
-static int resolve_source_path(
+static int copy_path(char output[PATH_MAX], const char *value)
+{
+    const size_t length = value != NULL ? strlen(value) : 0U;
+
+    if (length == 0U || length >= PATH_MAX) {
+        return -1;
+    }
+    (void)memcpy(output, value, length + 1U);
+    return 0;
+}
+
+static int parent_directory(char path[PATH_MAX])
+{
+    char *separator;
+
+    if (path == NULL || path[0] != '/') {
+        return -1;
+    }
+    separator = strrchr(path, '/');
+    if (separator == NULL) {
+        return -1;
+    }
+    if (separator == path) {
+        path[1] = '\0';
+        return 0;
+    }
+    *separator = '\0';
+    return 0;
+}
+
+static int resolve_project_input(
     const char *input,
-    char output[PATH_MAX],
+    cvite_run_state *state,
     FILE *diagnostics)
 {
+    char resolved_input[PATH_MAX];
     char candidate_root[PATH_MAX];
     char candidate_source[PATH_MAX];
     const char *selected = input;
     bool has_root;
     bool has_source;
 
-    if (input == NULL || output == NULL || diagnostics == NULL) {
+    if (input == NULL || state == NULL || diagnostics == NULL) {
         return -1;
     }
 
     if (path_is_directory(input)) {
-        if (cvite_join_path(
+        if (realpath(input, resolved_input) == NULL ||
+            copy_path(state->project_root, resolved_input) != 0 ||
+            cvite_join_path(
                 candidate_root,
                 sizeof(candidate_root),
-                input,
+                resolved_input,
                 CVITE_SOURCE_ROOT_CANDIDATE) != 0 ||
             cvite_join_path(
                 candidate_source,
                 sizeof(candidate_source),
-                input,
+                resolved_input,
                 CVITE_SOURCE_DIRECTORY_CANDIDATE) != 0) {
-            (void)fprintf(diagnostics, "cvite: project path is too long\n");
+            (void)fprintf(diagnostics, "cvite: project path is unavailable\n");
             return -1;
         }
 
@@ -107,7 +139,7 @@ static int resolve_source_path(
             } else {
                 (void)fprintf(
                     diagnostics,
-                    "cvite: M1 project discovery expects main.c or src/main.c\n");
+                    "cvite: project discovery expects main.c or src/main.c\n");
             }
             return -1;
         }
@@ -118,13 +150,10 @@ static int resolve_source_path(
     }
 
     if (!string_ends_with(selected, ".c")) {
-        (void)fprintf(
-            diagnostics,
-            "cvite: the M1 runner currently accepts one .c translation unit\n");
+        (void)fprintf(diagnostics, "cvite: the entry source must be a .c file\n");
         return -1;
     }
-
-    if (realpath(selected, output) == NULL) {
+    if (realpath(selected, state->source_path) == NULL) {
         (void)fprintf(
             diagnostics,
             "cvite: could not resolve source path '%s': %s\n",
@@ -132,35 +161,13 @@ static int resolve_source_path(
             strerror(errno));
         return -1;
     }
-    return 0;
-}
 
-static int split_watch_path(cvite_run_state *state, FILE *diagnostics)
-{
-    char *separator;
-    const size_t source_length = strlen(state->source_path);
-
-    if (source_length == 0U || source_length >= sizeof(state->watch_directory)) {
-        return -1;
-    }
-    (void)memcpy(
-        state->watch_directory,
-        state->source_path,
-        source_length + 1U);
-    separator = strrchr(state->watch_directory, '/');
-    if (separator == NULL || separator[1] == '\0') {
-        (void)fprintf(diagnostics, "cvite: source path has no file name\n");
-        return -1;
-    }
-    if (strlen(separator + 1) >= sizeof(state->watch_name)) {
-        (void)fprintf(diagnostics, "cvite: source file name is too long\n");
-        return -1;
-    }
-    (void)strcpy(state->watch_name, separator + 1);
-    if (separator == state->watch_directory) {
-        separator[1] = '\0';
-    } else {
-        *separator = '\0';
+    if (!path_is_directory(input)) {
+        if (copy_path(state->project_root, state->source_path) != 0 ||
+            parent_directory(state->project_root) != 0) {
+            (void)fprintf(diagnostics, "cvite: source path has no project root\n");
+            return -1;
+        }
     }
     return 0;
 }
@@ -186,23 +193,31 @@ static const char *select_plugin_path(void)
 
 static void cleanup_build_directory(const cvite_run_state *state)
 {
+    DIR *directory;
+    struct dirent *entry;
     char path[PATH_MAX];
 
-    if (cvite_build_path(state, "translation.raw.ll", path) == 0) {
-        cvite_remove_if_present(path);
+    if (state == NULL || state->build_directory[0] == '\0') {
+        return;
     }
-    if (cvite_build_path(state, "translation.ll", path) == 0) {
-        cvite_remove_if_present(path);
+    directory = opendir(state->build_directory);
+    if (directory == NULL) {
+        return;
     }
-    if (cvite_build_path(state, "translation.o", path) == 0) {
-        cvite_remove_if_present(path);
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (cvite_join_path(
+                path,
+                sizeof(path),
+                state->build_directory,
+                entry->d_name) == 0) {
+            cvite_remove_if_present(path);
+        }
     }
-    if (cvite_dependency_path(state, CVITE_BUILD_BASELINE, path) == 0) {
-        cvite_remove_if_present(path);
-    }
-    if (cvite_dependency_path(state, CVITE_BUILD_CANDIDATE, path) == 0) {
-        cvite_remove_if_present(path);
-    }
+    (void)closedir(directory);
     (void)rmdir(state->build_directory);
 }
 
@@ -218,12 +233,11 @@ static int initialize_build_directory(cvite_run_state *state)
             strerror(errno));
         return -1;
     }
-    if (strlen(directory) >= sizeof(state->build_directory)) {
+    if (copy_path(state->build_directory, directory) != 0) {
         (void)rmdir(directory);
         (void)fprintf(stderr, "cvite: temporary build path is too long\n");
         return -1;
     }
-    (void)strcpy(state->build_directory, directory);
     return 0;
 }
 
@@ -236,10 +250,10 @@ static int prepare_baseline(
     cvite_error error = {0};
     cvite_status status;
 
-    if (cvite_compile_translation_unit(
+    if (cvite_compile_program(
             state,
             CVITE_BUILD_BASELINE,
-            object_path) != 0) {
+            object_path) != CVITE_BUILD_RESULT_OK) {
         return -1;
     }
 
@@ -296,6 +310,8 @@ void cvite_run_print_doctor(FILE *stream)
 {
     const char *clang_path = environment_or_default("CVITE_CLANG", CVITE_CLANG_PATH);
     const char *opt_path = environment_or_default("CVITE_OPT", CVITE_OPT_PATH);
+    const char *link_path = environment_or_default(
+        "CVITE_LLVM_LINK", CVITE_LLVM_LINK_PATH);
     const char *plugin_path = select_plugin_path();
 
     if (stream == NULL) {
@@ -304,10 +320,12 @@ void cvite_run_print_doctor(FILE *stream)
     (void)fprintf(stream, "compiler service: available\n");
     (void)fprintf(stream, "clang: %s\n", clang_path);
     (void)fprintf(stream, "opt: %s\n", opt_path);
+    (void)fprintf(stream, "llvm-link: %s\n", link_path);
     (void)fprintf(stream, "pass plugin: %s\n", plugin_path);
+    cvite_compile_database_print_doctor(stream);
     (void)fprintf(
         stream,
-        "project mode: single translation unit + header graph (M1)\n");
+        "project mode: atomic multi-translation-unit refresh with TU IR cache\n");
 }
 
 int cvite_run_command(int argc, char **argv)
@@ -344,13 +362,14 @@ int cvite_run_command(int argc, char **argv)
         application_arguments = argv + 2;
     }
 
-    if (resolve_source_path(argv[0], state.source_path, stderr) != 0 ||
-        split_watch_path(&state, stderr) != 0) {
+    if (resolve_project_input(argv[0], &state, stderr) != 0) {
         return 2;
     }
 
     state.clang_path = environment_or_default("CVITE_CLANG", CVITE_CLANG_PATH);
     state.opt_path = environment_or_default("CVITE_OPT", CVITE_OPT_PATH);
+    state.llvm_link_path = environment_or_default(
+        "CVITE_LLVM_LINK", CVITE_LLVM_LINK_PATH);
     state.plugin_path = select_plugin_path();
 
     if (access(state.plugin_path, R_OK) != 0) {
@@ -364,9 +383,16 @@ int cvite_run_command(int argc, char **argv)
     if (initialize_build_directory(&state) != 0) {
         return 3;
     }
+    if (cvite_refresh_project(&state) != CVITE_PROJECT_RESULT_OK) {
+        goto cleanup;
+    }
 
-    (void)fprintf(stderr, "[cvite] source: %s\n", state.source_path);
-    (void)fprintf(stderr, "[cvite] compiling baseline...\n");
+    (void)fprintf(stderr, "[cvite] entry: %s\n", state.source_path);
+    (void)fprintf(
+        stderr,
+        "[cvite] compiling baseline (%zu translation unit%s)...\n",
+        state.translation_unit_count,
+        state.translation_unit_count == 1U ? "" : "s");
     if (prepare_baseline(&state, &program_main) != 0) {
         goto cleanup;
     }
@@ -397,7 +423,7 @@ int cvite_run_command(int argc, char **argv)
 
     (void)fprintf(
         stderr,
-        "[cvite] application started; watching Clang dependency graph\n");
+        "[cvite] application started; watching linked project dependencies\n");
     application_started = true;
     result = program_main(
         application_argument_count + 1,
@@ -413,6 +439,8 @@ cleanup:
         (void)pthread_join(watcher, NULL);
     }
     free(program_arguments);
+    cvite_discard_candidate_build(&state);
+    cvite_free_project(&state);
     /*
      * Once user code has run, retain JIT generations through process exit.
      * atexit handlers or surviving application threads may still reference

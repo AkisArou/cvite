@@ -6,7 +6,9 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalObject.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/raw_ostream.h"
@@ -15,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <utility>
 
 namespace cvite::transform {
 
@@ -22,6 +25,7 @@ inline constexpr llvm::StringLiteral kAbiSchema = "cvite.lowered-abi.v1";
 inline constexpr llvm::StringLiteral kIdentitySchema = "cvite.function-id.v1";
 inline constexpr llvm::StringLiteral kFunctionMetadata = "cvite.abi";
 inline constexpr llvm::StringLiteral kFunctionIndex = "cvite.functions";
+inline constexpr llvm::StringLiteral kOriginMetadata = "cvite.origin";
 inline constexpr llvm::StringLiteral kStorageIdentitySchema =
     "cvite.storage-id.v1";
 inline constexpr llvm::StringLiteral kStorageLayoutSchema =
@@ -29,6 +33,48 @@ inline constexpr llvm::StringLiteral kStorageLayoutSchema =
 inline constexpr llvm::StringLiteral kStorageMetadata = "cvite.storage";
 inline constexpr llvm::StringLiteral kStorageSymbolPrefix =
     "__cvite_storage.";
+
+
+struct DeclarationOrigin final {
+    std::string source;
+    std::string name;
+};
+
+inline DeclarationOrigin declarationOrigin(
+    const llvm::Module &module,
+    const llvm::GlobalObject &object,
+    llvm::StringRef fallback_name)
+{
+    const llvm::MDNode *metadata = object.getMetadata(kOriginMetadata);
+    if (metadata != nullptr && metadata->getNumOperands() >= 2U) {
+        const auto *source = llvm::dyn_cast<llvm::MDString>(
+            metadata->getOperand(0U).get());
+        const auto *name = llvm::dyn_cast<llvm::MDString>(
+            metadata->getOperand(1U).get());
+        if (source != nullptr && name != nullptr && !name->getString().empty()) {
+            return {source->getString().str(), name->getString().str()};
+        }
+    }
+
+    std::string source = module.getSourceFileName();
+    if (source.empty()) {
+        source = module.getModuleIdentifier();
+    }
+    return {std::move(source), fallback_name.str()};
+}
+
+inline void setDeclarationOrigin(
+    llvm::GlobalObject &object,
+    llvm::StringRef source,
+    llvm::StringRef name)
+{
+    llvm::LLVMContext &context = object.getContext();
+    llvm::Metadata *values[] = {
+        llvm::MDString::get(context, source),
+        llvm::MDString::get(context, name),
+    };
+    object.setMetadata(kOriginMetadata, llvm::MDNode::get(context, values));
+}
 
 struct Hash128 final {
     std::uint64_t high = 0U;
@@ -85,15 +131,17 @@ inline std::string identitySeed(
 {
     std::string seed;
     llvm::raw_string_ostream output(seed);
+    const DeclarationOrigin origin =
+        declarationOrigin(module, function, original_name);
 
     output << kIdentitySchema << '\n';
     if (function.hasLocalLinkage()) {
         output << "scope=translation-unit\n";
-        output << "source=" << module.getSourceFileName() << '\n';
+        output << "source=" << origin.source << '\n';
     } else {
         output << "scope=linkage-unit\n";
     }
-    output << "name=" << original_name << '\n';
+    output << "name=" << origin.name << '\n';
     return output.str();
 }
 
@@ -104,15 +152,17 @@ inline std::string storageIdentitySeed(
 {
     std::string seed;
     llvm::raw_string_ostream output(seed);
+    const DeclarationOrigin origin =
+        declarationOrigin(module, storage, original_name);
 
     output << kStorageIdentitySchema << '\n';
     if (storage.hasLocalLinkage()) {
         output << "scope=translation-unit\n";
-        output << "source=" << module.getSourceFileName() << '\n';
+        output << "source=" << origin.source << '\n';
     } else {
         output << "scope=linkage-unit\n";
     }
-    output << "name=" << original_name << '\n';
+    output << "name=" << origin.name << '\n';
     return output.str();
 }
 

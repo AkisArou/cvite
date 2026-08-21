@@ -6,8 +6,8 @@ The first executable vertical slice of CVite is available through:
 cvite run app.c
 ```
 
-For a simple directory, CVite discovers exactly one of `main.c` or
-`src/main.c`, so this also works:
+For a project directory, CVite discovers exactly one of `main.c` or
+`src/main.c` as the entry translation unit:
 
 ```console
 cvite run .
@@ -19,52 +19,141 @@ Application arguments follow `--`:
 cvite run . -- --level arena.json
 ```
 
-The source remains ordinary C. The M1 runner does not require CVite headers,
-macros, annotations, state APIs, allocators, or lifecycle callbacks.
+Application source remains ordinary C. The development server does not require
+CVite headers, macros, annotations, state APIs, allocators, or lifecycle
+callbacks.
 
 ## Current loop
 
 On startup, CVite:
 
-1. invokes the configured Clang 18 compiler to emit LLVM IR and a Make-style
-   dependency file;
-2. applies `cvite-lowering`, `cvite-baseline`, and
-   `cvite-baseline-manifest`;
-3. emits a position-independent object;
-4. links that object into the CVite process with LLVM ORC/JITLink;
-5. registers compiler-generated stable functions and persistent storage;
-6. calls the transformed program's real C `main` on the process main thread;
-7. watches the source file and every non-system header reported by Clang.
+1. locates `compile_commands.json` or `build/compile_commands.json` near the
+   project;
+2. asks libclang for every C compile command in the entry program and
+   normalizes each translation unit's project flags;
+3. invokes Clang 18 separately for each translation unit, producing LLVM IR and
+   a Make-style dependency file;
+4. applies `cvite-origin` to each module before linking, canonicalizing
+   translation-unit-local function and storage identities from the original
+   source path;
+5. links the canonical modules with `llvm-link` into one program IR module;
+6. applies `cvite-lowering`, `cvite-baseline`, and
+   `cvite-baseline-manifest` to the linked program;
+7. emits one position-independent object and links it into the CVite process
+   with LLVM ORC/JITLink;
+8. registers compiler-generated stable functions and persistent storage;
+9. calls the transformed program's real C `main` on the process main thread;
+10. watches every translation unit, the compilation database, and every
+    non-system header reported by Clang.
 
 CVite watches dependency **directories** and filters events by file name. This
 continues to work when an editor saves through an atomic rename instead of
 writing the original inode in place.
 
-On save, the watcher compiles a candidate through `cvite-candidate`, stages it
-in an isolated JIT generation, validates its function and storage manifest, and
-publishes one immutable dispatch snapshot. The previous generation remains
-active unless every stage succeeds.
+## Multi-translation-unit refresh
 
-After a candidate is published, its Clang dependency file atomically replaces
-the active watch graph. A header introduced by the edit therefore becomes
-refreshable immediately; a header no longer used by the translation unit is
-removed from the graph.
+CVite keeps an origin-tagged LLVM IR cache for every selected translation
+unit. A file-system event starts a candidate transaction, but only units whose
+source or Clang-reported dependencies are newer than their active cache are
+recompiled:
+
+```text
+worker.c changes
+      │
+      ├─ compile worker.c → staged worker IR
+      ├─ reuse active main.c IR
+      ├─ reuse active renderer.c IR
+      └─ llvm-link one complete candidate program
+                         │
+                         ▼
+            validate function/storage manifests
+                         │
+                         ▼
+             publish one dispatch snapshot
+                         │
+                         ▼
+          commit staged TU caches atomically
+```
+
+A shared-header edit invalidates every unit whose depfile names that header. A
+source-only edit normally recompiles one unit. The complete set of active and
+staged modules is still linked and validated as one program, so runtime
+publication remains all-or-nothing across translation-unit boundaries.
+
+Failed compilation, IR linking, ABI checks, or storage-layout checks discard
+all staged cache entries. The old IR cache, dependency graph, JIT code, and
+runtime dispatch snapshot remain active.
+
+The `cvite-origin` pass runs before `llvm-link`. It records each function and
+global object's original source file and declaration name. This prevents
+linker-generated renames from changing the identities of same-named private
+functions, file statics, and static locals in different `.c` files.
+
+## Candidate behavior
+
+On save, the watcher verifies that the active project model is unchanged,
+recompiles only invalidated translation units, links staged and cached IR into a
+complete candidate program, and runs `cvite-candidate`. The result is staged in
+an isolated ORC generation, validated against the active function and storage
+registries, and published atomically.
+
+After publication, all candidate dependency files replace the active watch
+graph as one set. Headers introduced by the edit therefore become refreshable
+immediately, and headers no longer used by any translation unit are removed.
+The compilation database itself is watched. Changing its translation-unit set
+or normalized compile flags currently requests a safe process restart rather
+than mutating the sealed host registry or silently compiling with mixed project
+semantics.
 
 A successful edit looks like:
 
 ```text
-[cvite] refreshed 3 functions → generation 4 (31.7 ms)
+[cvite] recompiled 1/4 translation units
+[cvite] refreshed 17 functions from 1/4 TUs → generation 4 (31.2 ms)
 ```
 
-A syntax error in either the source or a watched header is reported by Clang and
-followed by:
+A syntax error in any source or watched header is reported by Clang and followed
+by last-known-good behavior:
 
 ```text
-[cvite] candidate compilation failed; previous code remains active
+[cvite] candidate compilation failed for /project/src/physics.c; previous code remains active
 ```
 
-ABI and persistent-layout incompatibilities are rejected in the same
-last-known-good manner.
+Cross-TU link failures, ABI changes, and persistent-layout incompatibilities are
+rejected in the same way.
+
+## Compilation database
+
+CVite uses Clang's public compilation-database API rather than implementing a
+second JSON parser or a second interpretation of C compiler commands. Both the
+`arguments` and `command` forms accepted by libclang are supported.
+
+Every selected translation unit retains its own project semantics, including:
+
+- `-D` and `-U` definitions;
+- language-dialect flags;
+- include, quote, and system include paths;
+- target and machine-feature flags;
+- warning, extension, sanitizer, and project-specific frontend options.
+
+Relative include, sysroot, response-file, and resource paths are resolved
+against the command's recorded working directory. CVite removes the old source,
+output, dependency, optimization, debug, PIC, and compile-mode arguments, then
+appends its controlled development pipeline. This prevents an old `-o`, `-c`,
+`-O3`, or depfile option from escaping the Fast Refresh build boundary.
+
+The initial target-selection rule accepts C commands under the project root and
+requires the discovered entry source to be present. Projects whose compilation
+database contains several unrelated executables should provide a target-scoped
+database for now. Target-aware graph selection is planned before general M2
+project support.
+
+When no usable compilation database exists, CVite discovers sibling `.c`
+files beside the entry translation unit and compiles them with C11 development
+defaults. A compilation database remains the authoritative path for real project
+flags and source selection. If an already-active database disappears or no
+longer describes the entry program, the candidate is rejected and the previous
+code remains active.
 
 ## Toolchain selection
 
@@ -74,32 +163,34 @@ changing application source:
 ```console
 CVITE_CLANG=/usr/bin/clang-18 \
 CVITE_OPT=/usr/bin/opt-18 \
+CVITE_LLVM_LINK=/usr/bin/llvm-link-18 \
 CVITE_PASS_PLUGIN=/path/to/CViteLoweringPass.so \
-cvite run app.c
+cvite run .
 ```
 
-Set `CVITE_VERBOSE=1` to print every compiler command.
+Set `CVITE_VERBOSE=1` to print every compiler and LLVM command.
 
-`cvite doctor` reports the selected compiler, optimizer, pass plugin, and
-project mode.
+`cvite doctor` reports the compiler, optimizer, IR linker, pass plugin,
+compilation-database capability, and project mode.
 
-## M1 constraints
+## Current constraints
 
-The current command is intentionally narrow:
+The current command remains an experimental Linux/Clang vertical slice:
 
 - Linux with `inotify`;
 - Clang/LLVM 18;
-- one C11 translation unit;
-- the translation unit's Clang-reported non-system header graph;
-- debug/`-O0` development compilation;
-- exactly one supported C `main` entry;
-- no build-system compile flags, link libraries, or multi-translation-unit
-  invalidation yet;
-- JIT generations are retained until process exit.
+- C11-compatible application code and debug/`-O0` development generation;
+- one supported C `main` across the linked translation units;
+- incremental per-TU compilation with a whole-program LLVM relink;
+- compilation-database C commands under one project root;
+- no automatic external library/archive ingestion yet;
+- no automatic layout-changing state migration;
+- JIT generations retained until process exit.
 
-`compile_commands.json`, multiple translation units, custom link inputs,
-smallest-boundary process restart, and generation reclamation are the next
-orchestration milestones.
+Changed-function filtering, target-aware compile-command selection, custom
+link inputs, smallest-boundary restart, and generation reclamation are the next
+orchestration layers. The current TU cache already narrows compilation while
+retaining atomic project-wide publication.
 
 ## Lifetime policy
 

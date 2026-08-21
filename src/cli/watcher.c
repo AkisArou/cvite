@@ -17,7 +17,6 @@
 #define CVITE_WATCH_DEBOUNCE_NS UINT64_C(50000000)
 #define CVITE_WATCH_POLL_MS 100
 #define CVITE_EVENT_BUFFER_SIZE (16U * 1024U)
-#define CVITE_MAX_DEPFILE_SIZE (8U * 1024U * 1024U)
 #define CVITE_INITIAL_DIRECTORY_CAPACITY 4U
 #define CVITE_INITIAL_FILE_CAPACITY 4U
 
@@ -45,11 +44,24 @@ static int publish_candidate(cvite_run_state *state)
     struct timespec started = {0, 0};
     struct timespec finished = {0, 0};
 
+    cvite_build_result build_result;
+
     (void)clock_gettime(CLOCK_MONOTONIC, &started);
-    if (cvite_compile_translation_unit(
-            state,
-            CVITE_BUILD_CANDIDATE,
-            object_path) != 0) {
+    build_result = cvite_compile_program(
+        state,
+        CVITE_BUILD_CANDIDATE,
+        object_path);
+    if (build_result == CVITE_BUILD_RESULT_UNCHANGED) {
+        (void)fprintf(stderr, "[cvite] no invalidated translation units\n");
+        return 0;
+    }
+    if (build_result == CVITE_BUILD_RESULT_RESTART_REQUIRED) {
+        (void)fprintf(
+            stderr,
+            "[cvite] project shape changed; previous code remains active\n");
+        return -1;
+    }
+    if (build_result != CVITE_BUILD_RESULT_OK) {
         return -1;
     }
 
@@ -61,6 +73,7 @@ static int publish_candidate(cvite_run_state *state)
     cvite_remove_if_present(object_path);
     if (status != CVITE_STATUS_OK) {
         cvite_print_runtime_error("candidate linking", &error);
+        cvite_discard_candidate_build(state);
         return -1;
     }
 
@@ -71,6 +84,7 @@ static int publish_candidate(cvite_run_state *state)
             state->loader,
             generation,
             &error);
+        cvite_discard_candidate_build(state);
         return -1;
     }
 
@@ -88,6 +102,7 @@ static int publish_candidate(cvite_run_state *state)
             state->loader,
             generation,
             &error);
+        cvite_discard_candidate_build(state);
         return -1;
     }
 
@@ -99,10 +114,12 @@ static int publish_candidate(cvite_run_state *state)
             state->loader,
             generation,
             &error);
+        cvite_discard_candidate_build(state);
         return -1;
     }
 
-    if (cvite_refresh_source_watcher(state, CVITE_BUILD_CANDIDATE) != 0) {
+    cvite_commit_candidate_build(state);
+    if (cvite_refresh_source_watcher(state) != 0) {
         (void)fprintf(
             stderr,
             "[cvite] refreshed code, but dependency watches could not be updated\n");
@@ -111,9 +128,12 @@ static int publish_candidate(cvite_run_state *state)
     (void)clock_gettime(CLOCK_MONOTONIC, &finished);
     (void)fprintf(
         stderr,
-        "[cvite] refreshed %zu function%s → generation %" PRIu64 " (%.1f ms)\n",
+        "[cvite] refreshed %zu function%s from %zu/%zu TU%s → generation %" PRIu64 " (%.1f ms)\n",
         patch.function_count,
         patch.function_count == 1U ? "" : "s",
+        state->last_recompiled_count,
+        state->translation_unit_count,
+        state->translation_unit_count == 1U ? "" : "s",
         patch.candidate_generation,
         elapsed_milliseconds(started, finished));
     return 0;
@@ -179,7 +199,7 @@ int cvite_initialize_source_watcher(cvite_run_state *state)
             strerror(errno));
         return -1;
     }
-    if (cvite_refresh_source_watcher(state, CVITE_BUILD_BASELINE) != 0) {
+    if (cvite_refresh_source_watcher(state) != 0) {
         (void)close(state->watch_descriptor);
         state->watch_descriptor = -1;
         return -1;

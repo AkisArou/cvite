@@ -1,0 +1,7 @@
+#ifndef CVITE_RUN_MULTI_SHARED_H
+#define CVITE_RUN_MULTI_SHARED_H
+
+#define CVITE_MULTI_STEP 1
+#define CVITE_MULTI_SENTINEL 7
+
+#endif

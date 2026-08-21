@@ -129,6 +129,11 @@ if(CVITE_BUILD_LLVM_PASS)
         HINTS ${LLVM_TOOLS_BINARY_DIR}
         REQUIRED
     )
+    find_program(CVITE_LLVM_LINK_EXECUTABLE
+        NAMES llvm-link-18 llvm-link
+        HINTS ${LLVM_TOOLS_BINARY_DIR}
+        REQUIRED
+    )
 
     add_llvm_pass_plugin(CViteLoweringPass
         src/transform/lowering_pass.cpp
@@ -267,14 +272,22 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER)
         src/cli/run.c
         src/cli/toolchain.c
         src/cli/watcher.c
+        src/cli/dependencies.c
+        src/cli/compile_database.c
     )
     target_link_libraries(cvite PRIVATE cvite::orc_loader Threads::Threads)
+    if(CVITE_BUILD_COMPILER)
+        target_include_directories(cvite PRIVATE ${CVITE_LIBCLANG_INCLUDE_DIR})
+        target_link_libraries(cvite PRIVATE ${CVITE_LIBCLANG_LIBRARY})
+    endif()
     target_compile_definitions(cvite PRIVATE
         CVITE_RUNNER_ENABLED=1
+        CVITE_COMPILE_DATABASE_ENABLED=$<BOOL:${CVITE_BUILD_COMPILER}>
         _POSIX_C_SOURCE=200809L
         _XOPEN_SOURCE=700
         "CVITE_CLANG_PATH=\"${CVITE_CLANG_EXECUTABLE}\""
         "CVITE_OPT_PATH=\"${CVITE_OPT_EXECUTABLE}\""
+        "CVITE_LLVM_LINK_PATH=\"${CVITE_LLVM_LINK_EXECUTABLE}\""
         "CVITE_PASS_PLUGIN_BUILD_PATH=\"$<TARGET_FILE:CViteLoweringPass>\""
         "CVITE_PASS_PLUGIN_INSTALL_PATH=\"${CMAKE_INSTALL_FULL_LIBDIR}/cvite/$<TARGET_FILE_NAME:CViteLoweringPass>\""
     )
@@ -412,7 +425,19 @@ if(CVITE_BUILD_LLVM_PASS AND CVITE_BUILD_ORC_LOADER AND BUILD_TESTING)
             $<TARGET_FILE:cvite>
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/run_app.c
     )
-    set_tests_properties(run-fast-refresh PROPERTIES TIMEOUT 45)
+    set_tests_properties(run-fast-refresh PROPERTIES TIMEOUT 90)
+
+    add_test(
+        NAME run-multi-tu-refresh
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_multi_tu.py
+            $<TARGET_FILE:cvite>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/run_multi_main.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/run_multi_worker.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/run_multi_shared.h
+    )
+    set_tests_properties(run-multi-tu-refresh PROPERTIES TIMEOUT 100)
 endif()
 
 if(CVITE_BUILD_EXAMPLES)

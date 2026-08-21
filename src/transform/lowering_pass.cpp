@@ -20,6 +20,47 @@
 namespace {
 
 constexpr llvm::StringLiteral kPassName = "cvite-lowering";
+constexpr llvm::StringLiteral kOriginPassName = "cvite-origin";
+constexpr llvm::StringLiteral kOriginFlag = "cvite.origin.schema";
+
+
+class CViteOriginPass final : public llvm::PassInfoMixin<CViteOriginPass> {
+public:
+    llvm::PreservedAnalyses run(
+        llvm::Module &module,
+        llvm::ModuleAnalysisManager &)
+    {
+        if (module.getModuleFlag(kOriginFlag) != nullptr) {
+            return llvm::PreservedAnalyses::all();
+        }
+
+        std::string source = module.getSourceFileName();
+        if (source.empty()) {
+            source = module.getModuleIdentifier();
+        }
+
+        for (llvm::Function &function : module) {
+            if (!function.isDeclaration() && !function.isIntrinsic() &&
+                !function.getName().starts_with("__cvite_")) {
+                cvite::transform::setDeclarationOrigin(
+                    function, source, function.getName());
+            }
+        }
+        for (llvm::GlobalVariable &global : module.globals()) {
+            if (!global.isDeclaration() &&
+                !global.getName().starts_with("llvm.") &&
+                !global.getName().starts_with("__cvite_")) {
+                cvite::transform::setDeclarationOrigin(
+                    global, source, global.getName());
+            }
+        }
+
+        module.addModuleFlag(llvm::Module::Error, kOriginFlag, 1U);
+        return llvm::PreservedAnalyses::none();
+    }
+
+    static bool isRequired() { return true; }
+};
 
 class CViteLoweringPass final
     : public llvm::PassInfoMixin<CViteLoweringPass> {
@@ -101,11 +142,15 @@ void registerCallbacks(llvm::PassBuilder &builder)
         [](llvm::StringRef name,
            llvm::ModulePassManager &manager,
            llvm::ArrayRef<llvm::PassBuilder::PipelineElement>) {
-            if (name != kPassName) {
-                return false;
+            if (name == kOriginPassName) {
+                manager.addPass(CViteOriginPass());
+                return true;
             }
-            manager.addPass(CViteLoweringPass());
-            return true;
+            if (name == kPassName) {
+                manager.addPass(CViteLoweringPass());
+                return true;
+            }
+            return false;
         });
 
     builder.registerPipelineStartEPCallback(
