@@ -1,0 +1,33 @@
+name: Source snapshot for continued implementation
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Package source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=.github/workflows/source-snapshot-current.yml -czf /tmp/cvite-current.tar.gz .
+
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-current-${{ github.sha }}
+          path: /tmp/cvite-current.tar.gz
+          retention-days: 1
+          if-no-files-found: error
