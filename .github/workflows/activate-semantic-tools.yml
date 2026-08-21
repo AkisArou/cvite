@@ -53,6 +53,16 @@ jobs:
                   raise SystemExit('runtime-stress target marker is missing')
               text = text.replace(old, new, 1)
           experimental.write_text(text, encoding='utf-8')
+
+          stress = root / 'tests/test_runtime_stress.c'
+          text = stress.read_text(encoding='utf-8')
+          old = '''static const cvite_id function_ids[STRESS_SLOT_COUNT] = {\n    CVITE_ID(UINT64_C(0xA100), UINT64_C(1)),\n    CVITE_ID(UINT64_C(0xA100), UINT64_C(2)),\n    CVITE_ID(UINT64_C(0xA100), UINT64_C(3)),\n    CVITE_ID(UINT64_C(0xA100), UINT64_C(4)),\n};\n\nstatic const cvite_id function_abi =\n    CVITE_ID(UINT64_C(0xB200), UINT64_C(1));\n'''
+          new = '''static const cvite_id function_ids[STRESS_SLOT_COUNT] = {\n    CVITE_ID_INITIALIZER(UINT64_C(0xA100), UINT64_C(1)),\n    CVITE_ID_INITIALIZER(UINT64_C(0xA100), UINT64_C(2)),\n    CVITE_ID_INITIALIZER(UINT64_C(0xA100), UINT64_C(3)),\n    CVITE_ID_INITIALIZER(UINT64_C(0xA100), UINT64_C(4)),\n};\n\nstatic const cvite_id function_abi =\n    CVITE_ID_INITIALIZER(UINT64_C(0xB200), UINT64_C(1));\n'''
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('runtime-stress ID initializer marker is missing')
+              text = text.replace(old, new, 1)
+          stress.write_text(text, encoding='utf-8')
           PY
           git diff --check
 
@@ -130,7 +140,10 @@ jobs:
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- CMakeLists.txt cmake/CViteExperimental.cmake
+          git add -- \
+            CMakeLists.txt \
+            cmake/CViteExperimental.cmake \
+            tests/test_runtime_stress.c
           git rm -- .github/workflows/activate-semantic-tools.yml
           git diff --cached --check
           git commit -m 'build: activate semantic tooling and stress coverage'
