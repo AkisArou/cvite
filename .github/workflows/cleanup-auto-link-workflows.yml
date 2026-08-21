@@ -1,0 +1,70 @@
+name: Clean automatic native link staging workflows
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-automatic-link-discovery-finalize
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Check verified milestone
+        id: ready
+        shell: bash
+        run: |
+          if [[ -f docs/native-link-discovery.md && ! -f .cvite/apply-auto-link.py ]]; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Remove staging workflows
+        if: steps.ready.outputs.value == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- \
+            .github/workflows/apply-auto-link.yml \
+            .github/workflows/fix-auto-link-stage.yml \
+            .github/workflows/fix-auto-link-c-linkage.yml \
+            .github/workflows/fix-auto-link-fixture.yml \
+            .github/workflows/fix-auto-link-header.yml \
+            .github/workflows/verify-auto-link.yml \
+            .github/workflows/recover-auto-link.yml \
+            .github/workflows/export-auto-link-source.yml \
+            .github/workflows/finalize-auto-link-pr.yml \
+            .github/workflows/cleanup-auto-link-workflows.yml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm --cached --ignore-unmatch \
+            .github/workflows/apply-auto-link.yml \
+            .github/workflows/fix-auto-link-stage.yml \
+            .github/workflows/fix-auto-link-c-linkage.yml \
+            .github/workflows/fix-auto-link-fixture.yml \
+            .github/workflows/fix-auto-link-header.yml \
+            .github/workflows/verify-auto-link.yml \
+            .github/workflows/recover-auto-link.yml \
+            .github/workflows/export-auto-link-source.yml \
+            .github/workflows/finalize-auto-link-pr.yml \
+            .github/workflows/cleanup-auto-link-workflows.yml
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git diff --cached --check
+          git commit -m "chore: clean automatic link staging workflows"
+          git push origin HEAD:bootstrap/m0-runtime
