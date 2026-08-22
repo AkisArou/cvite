@@ -1,0 +1,56 @@
+name: Retire legacy consolidation workflows
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-workflow-cleanup
+  cancel-in-progress: false
+
+jobs:
+  retire:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.head_commit.message, '[retire-legacy-consolidators]')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Remove competing one-shot workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          find .github/workflows -maxdepth 1 -type f \
+            \( -name 'consolidate-*.yml' -o \
+               -name 'pro-snapshot.yml' -o \
+               -name 'source-snapshot-*.yml' \) \
+            -print -delete
+          rm -f -- \
+            .github/pro-snapshot-run-id \
+            .github/pro-snapshot.tar.gz.b64
+          rm -f -- .github/workflows/retire-legacy-consolidators.yml
+          git diff --check
+
+      - name: Commit workflow cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u -- .github
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "ci: retire legacy consolidation workflows [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
