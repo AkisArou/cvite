@@ -29,9 +29,8 @@ jobs:
           cat .cvite/managed-core.part-* | base64 -d > /tmp/managed-core.tar.gz
           echo "ef0fab6856ef460477b4dd3003208e942be92477167e02035f9a092659a8aa6d  /tmp/managed-core.tar.gz" | sha256sum --check
           tar -xzf /tmp/managed-core.tar.gz -C .
-          rm -rf -- .github/managed-next
-          rm -f -- .cvite/managed-core.part-* .github/workflows/apply-managed-core-direct.yml
-          rmdir .cvite 2>/dev/null || true
+          rm -rf -- .github/managed-next .cvite
+          rm -f -- .github/workflows/apply-managed-core-direct.yml
           git diff --check
 
       - name: Install development compilers
