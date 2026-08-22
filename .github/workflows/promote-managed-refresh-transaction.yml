@@ -1,0 +1,110 @@
+name: Promote managed refresh transaction
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-managed-pipeline-final
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: >-
+      github.actor == 'github-actions[bot]' &&
+      startsWith(github.event.head_commit.message,
+                 'feat: emit managed type manifests')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Promote transactional managed refresh
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f include/cvite/managed_memory.h
+          mapfile -t scripts < <(find .github/refresh-next -maxdepth 1 -type f -name 'apply-*.py' | sort)
+          test "${#scripts[@]}" -eq 1
+          python3 "${scripts[0]}"
+          git diff --check
+
+      - name: Validate source scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          fixed = {'CMakeLists.txt', 'CMakePresets.json', 'README.md'}
+          roots = {'cmake', 'docs', 'examples', 'include', 'scripts', 'src', 'tests'}
+          changed = subprocess.check_output(
+              ['git', 'diff', '--name-only', '--diff-filter=ACMRT'], text=True
+          ).splitlines()
+          selected = []
+          for item in changed:
+              path = Path(item)
+              if item in fixed or (path.parts and path.parts[0] in roots):
+                  selected.append(item)
+              elif not item.startswith('.github/'):
+                  raise SystemExit(f'unexpected managed-refresh path: {item}')
+          if not selected:
+              raise SystemExit('managed-refresh applicator produced no source changes')
+          Path('/tmp/cvite-managed-refresh-paths').write_text(
+              '\n'.join(selected) + '\n', encoding='utf-8'
+          )
+          print('\n'.join(selected))
+          PY
+
+      - name: Install LLVM 18
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build cmake clang-18 llvm-18 llvm-18-dev libclang-18-dev python3
+
+      - name: Verify complete refresh pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-managed-refresh -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCVITE_BUILD_COMPILER=ON \
+            -DCVITE_BUILD_LLVM_PASS=ON \
+            -DCVITE_BUILD_ORC_LOADER=ON \
+            -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18 \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-managed-refresh --verbose
+          ctest --test-dir build-managed-refresh --output-on-failure
+
+      - name: Publish verified managed refresh
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- .github/refresh-next
+          rm -f -- \
+            .github/workflows/consolidate-managed-refresh.yml \
+            .github/workflows/promote-managed-refresh-transaction.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          while IFS= read -r path; do
+            test -n "$path" && git add -- "$path"
+          done < /tmp/cvite-managed-refresh-paths
+          git add -u -- \
+            .github/refresh-next \
+            .github/workflows/consolidate-managed-refresh.yml \
+            .github/workflows/promote-managed-refresh-transaction.yml
+          git diff --cached --check
+          git commit -m "feat: publish code and managed migrations atomically [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
