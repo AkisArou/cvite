@@ -1,0 +1,120 @@
+name: Final semantic refresh verification
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-consolidate-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply all pending implementation layers
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in \
+            .cvite/apply-filter-reclaim.py \
+            .cvite/apply-safety-boundaries.py \
+            .cvite/apply-refresh-diagnostics.py \
+            .github/next/apply-semantic-next.py \
+            .github/next/apply-semantic-fixes.py
+          do
+            if [[ -f "$script" ]]; then
+              echo "Applying $script"
+              python3 "$script"
+            fi
+          done
+          git diff --check
+
+      - name: Install Clang and LLVM 18
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+          cmake
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-final-semantic -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-final-semantic --verbose
+
+      - name: Test
+        run: ctest --test-dir build-final-semantic --output-on-failure
+
+      - name: Verify semantic command line
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool=build-final-semantic/cvite-semantic-index
+          "$tool" index --source tests/fixtures/layout_old.c \
+            --output /tmp/old.cvsidx -- -std=c11
+          "$tool" index --source tests/fixtures/layout_append.c \
+            --output /tmp/new.cvsidx -- -std=c11
+          "$tool" diff --old /tmp/old.cvsidx --new /tmp/new.cvsidx \
+            | tee /tmp/diff.txt
+          grep -q 'health' /tmp/diff.txt
+          "$tool" plan --old /tmp/old.cvsidx --new /tmp/new.cvsidx \
+            --record Player | tee /tmp/plan.txt
+          grep -q 'managed migration candidate' /tmp/plan.txt
+
+      - name: Clean verification scaffolding
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- .cvite .github/next
+          find .github/workflows -maxdepth 1 -type f ! -name ci.yml -delete
+          git diff --check
+
+      - name: Commit verified source only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            CMakeLists.txt \
+            CMakePresets.json \
+            README.md \
+            cmake \
+            docs \
+            examples \
+            include \
+            scripts \
+            src \
+            tests
+          git add -u -- .github .cvite || true
+          git diff --cached --check
+          git commit -m "feat: add Clang semantic layout planning and stress gates"
+          git push origin HEAD:bootstrap/m0-runtime
