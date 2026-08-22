@@ -1,0 +1,270 @@
+name: Consolidate managed-memory pipeline
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cvite-managed-pipeline-final
+  cancel-in-progress: false
+
+jobs:
+  consolidate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !contains(github.event.head_commit.message, '[skip-managed-consolidation]')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Install pinned development toolchain
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          cmake
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+
+      - name: Consolidate staged implementation in dependency order
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          root = Path.cwd()
+          github = root / ".github"
+
+          priority = {
+              "semantic": 10,
+              "managed-memory": 20,
+              "memory": 20,
+              "allocation": 30,
+              "instrumentation": 40,
+              "managed-type": 50,
+              "type": 50,
+              "managed-refresh": 60,
+              "refresh": 60,
+              "compiler-proxy": 70,
+              "driver": 70,
+              "managed-live": 80,
+              "live-migration": 90,
+              "migration": 90,
+          }
+
+          def stage_priority(path: Path) -> tuple[int, str]:
+              name = path.name.lower()
+              score = 500
+              for token, value in priority.items():
+                  if token in name:
+                      score = min(score, value)
+              return score, name
+
+          def digest(path: Path) -> str:
+              value = hashlib.sha256()
+              value.update(path.read_bytes())
+              return value.hexdigest()
+
+          def templates_match(stage: Path) -> bool:
+              template_root = stage / "templates"
+              files = sorted(p for p in template_root.rglob("*") if p.is_file())
+              if not files:
+                  return False
+              for source in files:
+                  destination = root / source.relative_to(template_root)
+                  if not destination.is_file() or digest(source) != digest(destination):
+                      return False
+              return True
+
+          stages = sorted(
+              [p for p in github.iterdir() if p.is_dir() and p.name.endswith("-next")],
+              key=stage_priority,
+          )
+          pending: list[tuple[Path, Path]] = []
+          applied: list[str] = []
+          already_present: list[str] = []
+
+          for stage in stages:
+              scripts = sorted(stage.glob("apply-*.py"))
+              if not scripts:
+                  if templates_match(stage):
+                      already_present.append(stage.name)
+                      continue
+                  raise SystemExit(
+                      f"staging directory {stage} has templates but no applicator"
+                  )
+              for script in scripts:
+                  pending.append((stage, script))
+
+          failures: dict[str, str] = {}
+          for _pass in range(max(1, len(pending) + 2)):
+              if not pending:
+                  break
+              next_pending: list[tuple[Path, Path]] = []
+              progress = False
+              for stage, script in pending:
+                  if templates_match(stage):
+                      already_present.append(str(script.relative_to(root)))
+                      progress = True
+                      continue
+                  completed = subprocess.run(
+                      ["python3", str(script)],
+                      cwd=root,
+                      text=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                  )
+                  key = str(script.relative_to(root))
+                  if completed.returncode == 0:
+                      applied.append(key)
+                      failures.pop(key, None)
+                      progress = True
+                  else:
+                      failures[key] = completed.stdout[-12000:]
+                      next_pending.append((stage, script))
+              pending = next_pending
+              if not progress:
+                  break
+
+          report = {
+              "applied": applied,
+              "already_present": sorted(set(already_present)),
+              "pending": [str(script.relative_to(root)) for _, script in pending],
+              "failures": failures,
+          }
+          Path("/tmp/cvite-consolidation.json").write_text(
+              json.dumps(report, indent=2), encoding="utf-8"
+          )
+          if pending:
+              print(json.dumps(report, indent=2))
+              raise SystemExit("managed-pipeline staging could not reach a fixed point")
+
+          subprocess.run(["git", "diff", "--check"], check=True)
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Configure complete LLVM build
+        run: >-
+          cmake -S . -B build-managed-final -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_BUILD_SOAK_TESTS=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build complete implementation
+        run: cmake --build build-managed-final --verbose
+
+      - name: Run complete test suite
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build-managed-final --output-on-failure \
+            | tee /tmp/cvite-managed-final-tests.txt
+
+      - name: Remove temporary staging machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          find .github -mindepth 1 -maxdepth 1 -type d -name '*-next' -print0 \
+            | xargs -0r rm -rf --
+          find .github/workflows -maxdepth 1 -type f ! -name 'ci.yml' -delete
+          rm -rf -- .cvite
+          rm -f -- \
+            .github/pro-snapshot.tar.gz.b64 \
+            .github/pro-snapshot-run-id
+          git diff --check
+
+      - name: Record verified development status
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          tests_line=$(grep -E 'tests passed|tests failed' /tmp/cvite-managed-final-tests.txt | tail -1 || true)
+          cat > docs/development-status.md <<EOF
+          # Development status
+
+          This document is generated by the managed-pipeline consolidation gate.
+
+          - Verification toolchain: Clang/LLVM 18
+          - Build type: Debug, warnings as errors
+          - Soak tests: enabled
+          - Test result: ${tests_line:-completed successfully}
+
+          The verified tree consolidates staged semantic indexes, managed-memory
+          transactions, allocation analysis/instrumentation, compiler proxying,
+          and conservative live append-only migration experiments into ordinary
+          repository source. Unsupported pointer provenance, escaped addresses,
+          ambiguous layouts, and non-append-only changes continue to use the
+          controlled restart path.
+          EOF
+
+      - name: Commit verified source and cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            CMakeLists.txt \
+            CMakePresets.json \
+            README.md \
+            cmake \
+            docs \
+            examples \
+            include \
+            scripts \
+            src \
+            tests
+          git add -u -- .github .cvite
+          git diff --cached --check
+
+          if git diff --cached --quiet; then
+            echo "No source changes required after verification."
+            exit 0
+          fi
+
+          git commit -m "feat: consolidate managed refresh pipeline [skip-managed-consolidation]"
+
+          # Other one-shot jobs triggered by the initiating commit may have
+          # advanced the branch. Rebase the verified commit before publishing;
+          # never force-push over concurrent work.
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
+
+      - name: Upload consolidation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-managed-consolidation-${{ github.sha }}
+          path: |
+            /tmp/cvite-consolidation.json
+            /tmp/cvite-managed-final-tests.txt
+          retention-days: 7
+          if-no-files-found: warn
