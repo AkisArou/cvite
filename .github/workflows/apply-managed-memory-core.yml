@@ -1,0 +1,2029 @@
+name: Apply audited managed-memory core
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-managed-pipeline-final
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.head_commit.message, '[apply-managed-core]')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Write managed-memory source and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > include/cvite/managed_memory.h <<'CVITE_HEADER'
+          #ifndef CVITE_MANAGED_MEMORY_H
+          #define CVITE_MANAGED_MEMORY_H
+
+          #include <stddef.h>
+          #include <stdint.h>
+
+          #include "cvite/id.h"
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /*
+           * Internal development-runtime ABI. Ordinary application source does
+           * not include this header. Compiler instrumentation and the CVite host
+           * use it only while the native process is quiescent.
+           */
+
+          typedef enum cvite_managed_status {
+              CVITE_MANAGED_STATUS_OK = 0,
+              CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+              CVITE_MANAGED_STATUS_OUT_OF_MEMORY,
+              CVITE_MANAGED_STATUS_DUPLICATE_ID,
+              CVITE_MANAGED_STATUS_NOT_FOUND,
+              CVITE_MANAGED_STATUS_BUSY,
+              CVITE_MANAGED_STATUS_UNSAFE_LAYOUT,
+              CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT
+          } cvite_managed_status;
+
+          typedef struct cvite_managed_memory cvite_managed_memory;
+          typedef struct cvite_managed_transaction cvite_managed_transaction;
+
+          typedef struct cvite_managed_error {
+              cvite_managed_status status;
+              cvite_id object;
+              char message[256];
+          } cvite_managed_error;
+
+          typedef struct cvite_managed_allocation_info {
+              cvite_id id;
+              cvite_id type_id;
+              void *address;
+              size_t size;
+              size_t alignment;
+              uint64_t generation;
+          } cvite_managed_allocation_info;
+
+          cvite_managed_status cvite_managed_memory_create(
+              cvite_managed_memory **memory,
+              cvite_managed_error *error);
+
+          void cvite_managed_memory_destroy(cvite_managed_memory *memory);
+
+          cvite_managed_status cvite_managed_memory_allocate(
+              cvite_managed_memory *memory,
+              cvite_id id,
+              cvite_id type_id,
+              size_t size,
+              size_t alignment,
+              void **address,
+              cvite_managed_error *error);
+
+          cvite_managed_status cvite_managed_memory_free(
+              cvite_managed_memory *memory,
+              cvite_id id,
+              cvite_managed_error *error);
+
+          cvite_managed_status cvite_managed_memory_find(
+              const cvite_managed_memory *memory,
+              cvite_id id,
+              cvite_managed_allocation_info *info,
+              cvite_managed_error *error);
+
+          /*
+           * An external slot is a pointer variable outside managed storage. The
+           * caller guarantees that the slot outlives its registration.
+           */
+          cvite_managed_status cvite_managed_memory_track_external_pointer(
+              cvite_managed_memory *memory,
+              void **slot,
+              cvite_id target_id,
+              size_t target_offset,
+              cvite_managed_error *error);
+
+          cvite_managed_status cvite_managed_memory_untrack_external_pointer(
+              cvite_managed_memory *memory,
+              void **slot,
+              cvite_managed_error *error);
+
+          /*
+           * An owned slot is described by owner identity plus byte offset, not
+           * by its current address. It therefore remains valid when its owner is
+           * moved by the same transaction.
+           */
+          cvite_managed_status cvite_managed_memory_track_owned_pointer(
+              cvite_managed_memory *memory,
+              cvite_id owner_id,
+              size_t slot_offset,
+              cvite_id target_id,
+              size_t target_offset,
+              cvite_managed_error *error);
+
+          cvite_managed_status cvite_managed_memory_untrack_owned_pointer(
+              cvite_managed_memory *memory,
+              cvite_id owner_id,
+              size_t slot_offset,
+              cvite_managed_error *error);
+
+          cvite_managed_status cvite_managed_transaction_begin(
+              cvite_managed_memory *memory,
+              cvite_managed_transaction **transaction,
+              cvite_managed_error *error);
+
+          /*
+           * Stage an append-only evolution. Shrinking or changing alignment is
+           * rejected. Existing bytes are preserved and a new tail is zeroed.
+           */
+          cvite_managed_status cvite_managed_transaction_stage_append(
+              cvite_managed_transaction *transaction,
+              cvite_id id,
+              cvite_id new_type_id,
+              size_t new_size,
+              size_t new_alignment,
+              cvite_managed_error *error);
+
+          /*
+           * Commit is failure-atomic when called under the host quiescence gate:
+           * all replacement blocks and pointer locations are validated before
+           * any live pointer is changed.
+           */
+          cvite_managed_status cvite_managed_transaction_commit(
+              cvite_managed_transaction **transaction,
+              cvite_managed_error *error);
+
+          void cvite_managed_transaction_abort(
+              cvite_managed_transaction **transaction);
+
+          uint64_t cvite_managed_memory_generation(
+              const cvite_managed_memory *memory);
+
+          size_t cvite_managed_memory_allocation_count(
+              const cvite_managed_memory *memory);
+
+          size_t cvite_managed_memory_pointer_count(
+              const cvite_managed_memory *memory);
+
+          void cvite_managed_error_clear(cvite_managed_error *error);
+
+          const char *cvite_managed_status_string(cvite_managed_status status);
+
+          #ifdef __cplusplus
+          }
+          #endif
+
+          #endif
+          CVITE_HEADER
+
+          cat > src/runtime/managed_memory.c <<'CVITE_SOURCE'
+          #include "cvite/managed_memory.h"
+
+          #include <stdarg.h>
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+
+          typedef struct cvite_managed_allocation {
+              cvite_id id;
+              cvite_id type_id;
+              void *base;
+              unsigned char *address;
+              size_t size;
+              size_t alignment;
+          } cvite_managed_allocation;
+
+          typedef enum cvite_managed_pointer_kind {
+              CVITE_MANAGED_POINTER_EXTERNAL = 0,
+              CVITE_MANAGED_POINTER_OWNED
+          } cvite_managed_pointer_kind;
+
+          typedef struct cvite_managed_pointer {
+              cvite_managed_pointer_kind kind;
+              void **external_slot;
+              cvite_id owner_id;
+              size_t slot_offset;
+              cvite_id target_id;
+              size_t target_offset;
+          } cvite_managed_pointer;
+
+          typedef struct cvite_managed_transaction_entry {
+              cvite_id id;
+              cvite_id new_type_id;
+              size_t new_size;
+              size_t new_alignment;
+          } cvite_managed_transaction_entry;
+
+          typedef struct cvite_managed_block {
+              void *base;
+              unsigned char *address;
+          } cvite_managed_block;
+
+          struct cvite_managed_memory {
+              cvite_managed_allocation *allocations;
+              size_t allocation_count;
+              size_t allocation_capacity;
+              cvite_managed_pointer *pointers;
+              size_t pointer_count;
+              size_t pointer_capacity;
+              uint64_t generation;
+              bool transaction_active;
+          };
+
+          struct cvite_managed_transaction {
+              cvite_managed_memory *memory;
+              cvite_managed_transaction_entry *entries;
+              size_t entry_count;
+              size_t entry_capacity;
+          };
+
+          static bool cvite_managed_same_id(cvite_id left, cvite_id right)
+          {
+              return cvite_id_equal(left, right);
+          }
+
+          static bool cvite_managed_zero_id(cvite_id id)
+          {
+              return cvite_id_is_zero(id);
+          }
+
+          void cvite_managed_error_clear(cvite_managed_error *error)
+          {
+              if (error == NULL) {
+                  return;
+              }
+              memset(error, 0, sizeof(*error));
+              error->status = CVITE_MANAGED_STATUS_OK;
+              error->object = CVITE_ID_ZERO;
+          }
+
+          static cvite_managed_status cvite_managed_fail(
+              cvite_managed_error *error,
+              cvite_managed_status status,
+              cvite_id object,
+              const char *format,
+              ...)
+          {
+              if (error != NULL) {
+                  va_list arguments;
+                  cvite_managed_error_clear(error);
+                  error->status = status;
+                  error->object = object;
+                  va_start(arguments, format);
+                  (void)vsnprintf(
+                      error->message,
+                      sizeof(error->message),
+                      format,
+                      arguments);
+                  va_end(arguments);
+              }
+              return status;
+          }
+
+          static bool cvite_managed_power_of_two(size_t value)
+          {
+              return value != 0U && (value & (value - 1U)) == 0U;
+          }
+
+          static cvite_managed_status cvite_managed_reserve(
+              void **items,
+              size_t *capacity,
+              size_t element_size,
+              size_t required,
+              cvite_managed_error *error)
+          {
+              size_t next_capacity;
+              void *replacement;
+
+              if (required <= *capacity) {
+                  return CVITE_MANAGED_STATUS_OK;
+              }
+
+              next_capacity = *capacity == 0U ? 8U : *capacity;
+              while (next_capacity < required) {
+                  if (next_capacity > SIZE_MAX / 2U) {
+                      return cvite_managed_fail(
+                          error,
+                          CVITE_MANAGED_STATUS_OUT_OF_MEMORY,
+                          CVITE_ID_ZERO,
+                          "managed registry capacity overflow");
+                  }
+                  next_capacity *= 2U;
+              }
+              if (next_capacity > SIZE_MAX / element_size) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_OUT_OF_MEMORY,
+                      CVITE_ID_ZERO,
+                      "managed registry byte-size overflow");
+              }
+
+              replacement = realloc(*items, next_capacity * element_size);
+              if (replacement == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_OUT_OF_MEMORY,
+                      CVITE_ID_ZERO,
+                      "unable to grow the managed registry");
+              }
+              *items = replacement;
+              *capacity = next_capacity;
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          static cvite_managed_status cvite_managed_allocate_block(
+              size_t size,
+              size_t alignment,
+              cvite_managed_block *block,
+              cvite_id object,
+              cvite_managed_error *error)
+          {
+              size_t allocation_size;
+              uintptr_t raw_address;
+              uintptr_t mask;
+              uintptr_t aligned_address;
+
+              if (block == NULL || size == 0U ||
+                  !cvite_managed_power_of_two(alignment)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      object,
+                      "managed allocation requires a non-zero size and a "
+                      "power-of-two alignment");
+              }
+              if (size > SIZE_MAX - (alignment - 1U)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_OUT_OF_MEMORY,
+                      object,
+                      "managed allocation size overflow");
+              }
+
+              allocation_size = size + alignment - 1U;
+              block->base = malloc(allocation_size);
+              if (block->base == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_OUT_OF_MEMORY,
+                      object,
+                      "unable to allocate %zu managed bytes",
+                      size);
+              }
+
+              raw_address = (uintptr_t)block->base;
+              mask = (uintptr_t)(alignment - 1U);
+              aligned_address = (raw_address + mask) & ~mask;
+              block->address = (unsigned char *)aligned_address;
+              memset(block->address, 0, size);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          static bool cvite_managed_find_allocation_index(
+              const cvite_managed_memory *memory,
+              cvite_id id,
+              size_t *index)
+          {
+              size_t current;
+              for (current = 0U; current < memory->allocation_count; ++current) {
+                  if (cvite_managed_same_id(
+                          memory->allocations[current].id,
+                          id)) {
+                      if (index != NULL) {
+                          *index = current;
+                      }
+                      return true;
+                  }
+              }
+              return false;
+          }
+
+          static cvite_managed_status cvite_managed_require_idle(
+              const cvite_managed_memory *memory,
+              cvite_managed_error *error)
+          {
+              if (memory->transaction_active) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_BUSY,
+                      CVITE_ID_ZERO,
+                      "a managed-memory transaction is active");
+              }
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          static void cvite_managed_remove_pointer_at(
+              cvite_managed_memory *memory,
+              size_t index)
+          {
+              if (index + 1U < memory->pointer_count) {
+                  memmove(
+                      &memory->pointers[index],
+                      &memory->pointers[index + 1U],
+                      (memory->pointer_count - index - 1U) *
+                          sizeof(memory->pointers[0]));
+              }
+              --memory->pointer_count;
+          }
+
+          static cvite_managed_status cvite_managed_current_target(
+              const cvite_managed_memory *memory,
+              cvite_id target_id,
+              size_t target_offset,
+              void **value,
+              cvite_managed_error *error)
+          {
+              size_t index;
+              const cvite_managed_allocation *allocation;
+
+              if (value == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      target_id,
+                      "managed pointer output is null");
+              }
+              if (cvite_managed_zero_id(target_id)) {
+                  if (target_offset != 0U) {
+                      return cvite_managed_fail(
+                          error,
+                          CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT,
+                          target_id,
+                          "a null managed target cannot have an offset");
+                  }
+                  *value = NULL;
+                  return CVITE_MANAGED_STATUS_OK;
+              }
+              if (!cvite_managed_find_allocation_index(
+                      memory,
+                      target_id,
+                      &index)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_NOT_FOUND,
+                      target_id,
+                      "managed pointer target was not found");
+              }
+              allocation = &memory->allocations[index];
+              if (target_offset > allocation->size) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT,
+                      target_id,
+                      "managed pointer offset %zu exceeds object size %zu",
+                      target_offset,
+                      allocation->size);
+              }
+              *value = allocation->address + target_offset;
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          static cvite_managed_status cvite_managed_write_owned_slot(
+              cvite_managed_memory *memory,
+              cvite_id owner_id,
+              size_t slot_offset,
+              void *value,
+              cvite_managed_error *error)
+          {
+              size_t owner_index;
+              cvite_managed_allocation *owner;
+
+              if (!cvite_managed_find_allocation_index(
+                      memory,
+                      owner_id,
+                      &owner_index)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_NOT_FOUND,
+                      owner_id,
+                      "managed pointer owner was not found");
+              }
+              owner = &memory->allocations[owner_index];
+              if (owner->size < sizeof(value) ||
+                  slot_offset > owner->size - sizeof(value)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT,
+                      owner_id,
+                      "managed pointer slot at offset %zu does not fit in "
+                      "owner size %zu",
+                      slot_offset,
+                      owner->size);
+              }
+              memcpy(owner->address + slot_offset, &value, sizeof(value));
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          cvite_managed_status cvite_managed_memory_create(
+              cvite_managed_memory **memory,
+              cvite_managed_error *error)
+          {
+              cvite_managed_memory *created;
+              if (memory == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      CVITE_ID_ZERO,
+                      "managed-memory output is null");
+              }
+              *memory = NULL;
+              created = calloc(1U, sizeof(*created));
+              if (created == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_OUT_OF_MEMORY,
+                      CVITE_ID_ZERO,
+                      "unable to create the managed-memory registry");
+              }
+              *memory = created;
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          void cvite_managed_memory_destroy(cvite_managed_memory *memory)
+          {
+              size_t index;
+              if (memory == NULL) {
+                  return;
+              }
+              for (index = 0U; index < memory->allocation_count; ++index) {
+                  free(memory->allocations[index].base);
+              }
+              free(memory->pointers);
+              free(memory->allocations);
+              free(memory);
+          }
+
+          cvite_managed_status cvite_managed_memory_allocate(
+              cvite_managed_memory *memory,
+              cvite_id id,
+              cvite_id type_id,
+              size_t size,
+              size_t alignment,
+              void **address,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              cvite_managed_block block = {0};
+              cvite_managed_allocation *allocation;
+
+              if (memory == NULL || address == NULL ||
+                  cvite_managed_zero_id(id) ||
+                  cvite_managed_zero_id(type_id)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      id,
+                      "managed allocation arguments are invalid");
+              }
+              *address = NULL;
+              status = cvite_managed_require_idle(memory, error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              if (cvite_managed_find_allocation_index(memory, id, NULL)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_DUPLICATE_ID,
+                      id,
+                      "managed allocation identity is already registered");
+              }
+              status = cvite_managed_allocate_block(
+                  size,
+                  alignment,
+                  &block,
+                  id,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              status = cvite_managed_reserve(
+                  (void **)&memory->allocations,
+                  &memory->allocation_capacity,
+                  sizeof(memory->allocations[0]),
+                  memory->allocation_count + 1U,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  free(block.base);
+                  return status;
+              }
+
+              allocation = &memory->allocations[memory->allocation_count++];
+              allocation->id = id;
+              allocation->type_id = type_id;
+              allocation->base = block.base;
+              allocation->address = block.address;
+              allocation->size = size;
+              allocation->alignment = alignment;
+              ++memory->generation;
+              *address = allocation->address;
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          cvite_managed_status cvite_managed_memory_find(
+              const cvite_managed_memory *memory,
+              cvite_id id,
+              cvite_managed_allocation_info *info,
+              cvite_managed_error *error)
+          {
+              size_t index;
+              const cvite_managed_allocation *allocation;
+
+              if (memory == NULL || info == NULL || cvite_managed_zero_id(id)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      id,
+                      "managed lookup arguments are invalid");
+              }
+              if (!cvite_managed_find_allocation_index(memory, id, &index)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_NOT_FOUND,
+                      id,
+                      "managed allocation was not found");
+              }
+              allocation = &memory->allocations[index];
+              info->id = allocation->id;
+              info->type_id = allocation->type_id;
+              info->address = allocation->address;
+              info->size = allocation->size;
+              info->alignment = allocation->alignment;
+              info->generation = memory->generation;
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          cvite_managed_status cvite_managed_memory_track_external_pointer(
+              cvite_managed_memory *memory,
+              void **slot,
+              cvite_id target_id,
+              size_t target_offset,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              void *value;
+              size_t index;
+
+              if (memory == NULL || slot == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      target_id,
+                      "external managed pointer slot is null");
+              }
+              status = cvite_managed_require_idle(memory, error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              status = cvite_managed_current_target(
+                  memory,
+                  target_id,
+                  target_offset,
+                  &value,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+
+              for (index = 0U; index < memory->pointer_count; ++index) {
+                  cvite_managed_pointer *pointer = &memory->pointers[index];
+                  if (pointer->kind == CVITE_MANAGED_POINTER_EXTERNAL &&
+                      pointer->external_slot == slot) {
+                      pointer->target_id = target_id;
+                      pointer->target_offset = target_offset;
+                      *slot = value;
+                      ++memory->generation;
+                      cvite_managed_error_clear(error);
+                      return CVITE_MANAGED_STATUS_OK;
+                  }
+              }
+
+              status = cvite_managed_reserve(
+                  (void **)&memory->pointers,
+                  &memory->pointer_capacity,
+                  sizeof(memory->pointers[0]),
+                  memory->pointer_count + 1U,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              memory->pointers[memory->pointer_count++] =
+                  (cvite_managed_pointer){
+                      CVITE_MANAGED_POINTER_EXTERNAL,
+                      slot,
+                      CVITE_ID_ZERO,
+                      0U,
+                      target_id,
+                      target_offset,
+                  };
+              *slot = value;
+              ++memory->generation;
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          cvite_managed_status cvite_managed_memory_untrack_external_pointer(
+              cvite_managed_memory *memory,
+              void **slot,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              size_t index;
+
+              if (memory == NULL || slot == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      CVITE_ID_ZERO,
+                      "external managed pointer slot is null");
+              }
+              status = cvite_managed_require_idle(memory, error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              for (index = 0U; index < memory->pointer_count; ++index) {
+                  if (memory->pointers[index].kind ==
+                          CVITE_MANAGED_POINTER_EXTERNAL &&
+                      memory->pointers[index].external_slot == slot) {
+                      cvite_managed_remove_pointer_at(memory, index);
+                      ++memory->generation;
+                      cvite_managed_error_clear(error);
+                      return CVITE_MANAGED_STATUS_OK;
+                  }
+              }
+              return cvite_managed_fail(
+                  error,
+                  CVITE_MANAGED_STATUS_NOT_FOUND,
+                  CVITE_ID_ZERO,
+                  "external managed pointer slot is not tracked");
+          }
+
+          cvite_managed_status cvite_managed_memory_track_owned_pointer(
+              cvite_managed_memory *memory,
+              cvite_id owner_id,
+              size_t slot_offset,
+              cvite_id target_id,
+              size_t target_offset,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              void *value;
+              size_t index;
+
+              if (memory == NULL || cvite_managed_zero_id(owner_id)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      owner_id,
+                      "owned managed pointer arguments are invalid");
+              }
+              status = cvite_managed_require_idle(memory, error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              status = cvite_managed_current_target(
+                  memory,
+                  target_id,
+                  target_offset,
+                  &value,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              status = cvite_managed_write_owned_slot(
+                  memory,
+                  owner_id,
+                  slot_offset,
+                  value,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+
+              for (index = 0U; index < memory->pointer_count; ++index) {
+                  cvite_managed_pointer *pointer = &memory->pointers[index];
+                  if (pointer->kind == CVITE_MANAGED_POINTER_OWNED &&
+                      cvite_managed_same_id(pointer->owner_id, owner_id) &&
+                      pointer->slot_offset == slot_offset) {
+                      pointer->target_id = target_id;
+                      pointer->target_offset = target_offset;
+                      ++memory->generation;
+                      cvite_managed_error_clear(error);
+                      return CVITE_MANAGED_STATUS_OK;
+                  }
+              }
+
+              status = cvite_managed_reserve(
+                  (void **)&memory->pointers,
+                  &memory->pointer_capacity,
+                  sizeof(memory->pointers[0]),
+                  memory->pointer_count + 1U,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              memory->pointers[memory->pointer_count++] =
+                  (cvite_managed_pointer){
+                      CVITE_MANAGED_POINTER_OWNED,
+                      NULL,
+                      owner_id,
+                      slot_offset,
+                      target_id,
+                      target_offset,
+                  };
+              ++memory->generation;
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          cvite_managed_status cvite_managed_memory_untrack_owned_pointer(
+              cvite_managed_memory *memory,
+              cvite_id owner_id,
+              size_t slot_offset,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              size_t index;
+
+              if (memory == NULL || cvite_managed_zero_id(owner_id)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      owner_id,
+                      "owned managed pointer arguments are invalid");
+              }
+              status = cvite_managed_require_idle(memory, error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              for (index = 0U; index < memory->pointer_count; ++index) {
+                  if (memory->pointers[index].kind ==
+                          CVITE_MANAGED_POINTER_OWNED &&
+                      cvite_managed_same_id(
+                          memory->pointers[index].owner_id,
+                          owner_id) &&
+                      memory->pointers[index].slot_offset == slot_offset) {
+                      cvite_managed_remove_pointer_at(memory, index);
+                      ++memory->generation;
+                      cvite_managed_error_clear(error);
+                      return CVITE_MANAGED_STATUS_OK;
+                  }
+              }
+              return cvite_managed_fail(
+                  error,
+                  CVITE_MANAGED_STATUS_NOT_FOUND,
+                  owner_id,
+                  "owned managed pointer slot is not tracked");
+          }
+
+          cvite_managed_status cvite_managed_memory_free(
+              cvite_managed_memory *memory,
+              cvite_id id,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              size_t allocation_index;
+              size_t pointer_index;
+
+              if (memory == NULL || cvite_managed_zero_id(id)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      id,
+                      "managed free arguments are invalid");
+              }
+              status = cvite_managed_require_idle(memory, error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              if (!cvite_managed_find_allocation_index(
+                      memory,
+                      id,
+                      &allocation_index)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_NOT_FOUND,
+                      id,
+                      "managed allocation was not found");
+              }
+
+              pointer_index = 0U;
+              while (pointer_index < memory->pointer_count) {
+                  cvite_managed_pointer *pointer =
+                      &memory->pointers[pointer_index];
+                  if (pointer->kind == CVITE_MANAGED_POINTER_OWNED &&
+                      cvite_managed_same_id(pointer->owner_id, id)) {
+                      cvite_managed_remove_pointer_at(memory, pointer_index);
+                      continue;
+                  }
+                  if (cvite_managed_same_id(pointer->target_id, id)) {
+                      void *null_value = NULL;
+                      if (pointer->kind == CVITE_MANAGED_POINTER_EXTERNAL) {
+                          *pointer->external_slot = NULL;
+                      } else {
+                          status = cvite_managed_write_owned_slot(
+                              memory,
+                              pointer->owner_id,
+                              pointer->slot_offset,
+                              null_value,
+                              error);
+                          if (status != CVITE_MANAGED_STATUS_OK) {
+                              return status;
+                          }
+                      }
+                      pointer->target_id = CVITE_ID_ZERO;
+                      pointer->target_offset = 0U;
+                  }
+                  ++pointer_index;
+              }
+
+              free(memory->allocations[allocation_index].base);
+              if (allocation_index + 1U < memory->allocation_count) {
+                  memmove(
+                      &memory->allocations[allocation_index],
+                      &memory->allocations[allocation_index + 1U],
+                      (memory->allocation_count - allocation_index - 1U) *
+                          sizeof(memory->allocations[0]));
+              }
+              --memory->allocation_count;
+              ++memory->generation;
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          cvite_managed_status cvite_managed_transaction_begin(
+              cvite_managed_memory *memory,
+              cvite_managed_transaction **transaction,
+              cvite_managed_error *error)
+          {
+              cvite_managed_transaction *created;
+
+              if (memory == NULL || transaction == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      CVITE_ID_ZERO,
+                      "managed transaction arguments are invalid");
+              }
+              *transaction = NULL;
+              if (memory->transaction_active) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_BUSY,
+                      CVITE_ID_ZERO,
+                      "a managed-memory transaction is already active");
+              }
+              created = calloc(1U, sizeof(*created));
+              if (created == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_OUT_OF_MEMORY,
+                      CVITE_ID_ZERO,
+                      "unable to create a managed-memory transaction");
+              }
+              created->memory = memory;
+              memory->transaction_active = true;
+              *transaction = created;
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          cvite_managed_status cvite_managed_transaction_stage_append(
+              cvite_managed_transaction *transaction,
+              cvite_id id,
+              cvite_id new_type_id,
+              size_t new_size,
+              size_t new_alignment,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              cvite_managed_memory *memory;
+              size_t allocation_index;
+              size_t index;
+              const cvite_managed_allocation *allocation;
+
+              if (transaction == NULL || transaction->memory == NULL ||
+                  cvite_managed_zero_id(id) ||
+                  cvite_managed_zero_id(new_type_id)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      id,
+                      "managed migration arguments are invalid");
+              }
+              memory = transaction->memory;
+              if (!memory->transaction_active) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      id,
+                      "managed transaction is no longer active");
+              }
+              if (!cvite_managed_find_allocation_index(
+                      memory,
+                      id,
+                      &allocation_index)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_NOT_FOUND,
+                      id,
+                      "managed migration target was not found");
+              }
+              allocation = &memory->allocations[allocation_index];
+              if (new_size < allocation->size) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_UNSAFE_LAYOUT,
+                      id,
+                      "append-only migration cannot shrink from %zu to %zu "
+                      "bytes",
+                      allocation->size,
+                      new_size);
+              }
+              if (new_alignment != allocation->alignment) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_UNSAFE_LAYOUT,
+                      id,
+                      "append-only migration cannot change alignment from %zu "
+                      "to %zu",
+                      allocation->alignment,
+                      new_alignment);
+              }
+              for (index = 0U; index < transaction->entry_count; ++index) {
+                  if (cvite_managed_same_id(
+                          transaction->entries[index].id,
+                          id)) {
+                      return cvite_managed_fail(
+                          error,
+                          CVITE_MANAGED_STATUS_DUPLICATE_ID,
+                          id,
+                          "managed allocation is already staged");
+                  }
+              }
+              if (new_size == allocation->size &&
+                  cvite_managed_same_id(new_type_id, allocation->type_id)) {
+                  cvite_managed_error_clear(error);
+                  return CVITE_MANAGED_STATUS_OK;
+              }
+
+              status = cvite_managed_reserve(
+                  (void **)&transaction->entries,
+                  &transaction->entry_capacity,
+                  sizeof(transaction->entries[0]),
+                  transaction->entry_count + 1U,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              transaction->entries[transaction->entry_count++] =
+                  (cvite_managed_transaction_entry){
+                      id,
+                      new_type_id,
+                      new_size,
+                      new_alignment,
+                  };
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          static bool cvite_managed_find_transaction_entry(
+              const cvite_managed_transaction *transaction,
+              cvite_id id,
+              size_t *index)
+          {
+              size_t current;
+              for (current = 0U;
+                   current < transaction->entry_count;
+                   ++current) {
+                  if (cvite_managed_same_id(
+                          transaction->entries[current].id,
+                          id)) {
+                      if (index != NULL) {
+                          *index = current;
+                      }
+                      return true;
+                  }
+              }
+              return false;
+          }
+
+          static cvite_managed_status cvite_managed_staged_allocation(
+              const cvite_managed_transaction *transaction,
+              const cvite_managed_block *blocks,
+              cvite_id id,
+              unsigned char **address,
+              size_t *size,
+              cvite_managed_error *error)
+          {
+              size_t transaction_index;
+              size_t allocation_index;
+              const cvite_managed_allocation *allocation;
+
+              if (cvite_managed_find_transaction_entry(
+                      transaction,
+                      id,
+                      &transaction_index)) {
+                  *address = blocks[transaction_index].address;
+                  *size = transaction->entries[transaction_index].new_size;
+                  return CVITE_MANAGED_STATUS_OK;
+              }
+              if (!cvite_managed_find_allocation_index(
+                      transaction->memory,
+                      id,
+                      &allocation_index)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_NOT_FOUND,
+                      id,
+                      "managed pointer references an unknown allocation");
+              }
+              allocation = &transaction->memory->allocations[allocation_index];
+              *address = allocation->address;
+              *size = allocation->size;
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          static cvite_managed_status cvite_managed_staged_target(
+              const cvite_managed_transaction *transaction,
+              const cvite_managed_block *blocks,
+              cvite_id target_id,
+              size_t target_offset,
+              void **value,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              unsigned char *address;
+              size_t size;
+
+              if (cvite_managed_zero_id(target_id)) {
+                  if (target_offset != 0U) {
+                      return cvite_managed_fail(
+                          error,
+                          CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT,
+                          target_id,
+                          "a null managed target cannot have an offset");
+                  }
+                  *value = NULL;
+                  return CVITE_MANAGED_STATUS_OK;
+              }
+              status = cvite_managed_staged_allocation(
+                  transaction,
+                  blocks,
+                  target_id,
+                  &address,
+                  &size,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              if (target_offset > size) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT,
+                      target_id,
+                      "managed pointer offset %zu exceeds staged object size "
+                      "%zu",
+                      target_offset,
+                      size);
+              }
+              *value = address + target_offset;
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          static cvite_managed_status cvite_managed_staged_owned_slot(
+              const cvite_managed_transaction *transaction,
+              const cvite_managed_block *blocks,
+              cvite_id owner_id,
+              size_t slot_offset,
+              unsigned char **location,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              unsigned char *address;
+              size_t size;
+
+              status = cvite_managed_staged_allocation(
+                  transaction,
+                  blocks,
+                  owner_id,
+                  &address,
+                  &size,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              if (size < sizeof(void *) ||
+                  slot_offset > size - sizeof(void *)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT,
+                      owner_id,
+                      "managed pointer slot at offset %zu does not fit in "
+                      "staged owner size %zu",
+                      slot_offset,
+                      size);
+              }
+              *location = address + slot_offset;
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          static void cvite_managed_release_blocks(
+              cvite_managed_block *blocks,
+              size_t count)
+          {
+              size_t index;
+              if (blocks == NULL) {
+                  return;
+              }
+              for (index = 0U; index < count; ++index) {
+                  free(blocks[index].base);
+              }
+              free(blocks);
+          }
+
+          cvite_managed_status cvite_managed_transaction_commit(
+              cvite_managed_transaction **transaction_pointer,
+              cvite_managed_error *error)
+          {
+              cvite_managed_transaction *transaction;
+              cvite_managed_memory *memory;
+              cvite_managed_block *blocks;
+              cvite_managed_status status;
+              size_t index;
+
+              if (transaction_pointer == NULL ||
+                  *transaction_pointer == NULL ||
+                  (*transaction_pointer)->memory == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      CVITE_ID_ZERO,
+                      "managed transaction is null");
+              }
+              transaction = *transaction_pointer;
+              memory = transaction->memory;
+              if (!memory->transaction_active) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      CVITE_ID_ZERO,
+                      "managed transaction is no longer active");
+              }
+
+              blocks = calloc(transaction->entry_count, sizeof(*blocks));
+              if (transaction->entry_count != 0U && blocks == NULL) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_OUT_OF_MEMORY,
+                      CVITE_ID_ZERO,
+                      "unable to stage managed replacement blocks");
+              }
+
+              for (index = 0U; index < transaction->entry_count; ++index) {
+                  size_t allocation_index;
+                  const cvite_managed_transaction_entry *entry =
+                      &transaction->entries[index];
+                  const cvite_managed_allocation *allocation;
+
+                  if (!cvite_managed_find_allocation_index(
+                          memory,
+                          entry->id,
+                          &allocation_index)) {
+                      cvite_managed_release_blocks(blocks, index);
+                      return cvite_managed_fail(
+                          error,
+                          CVITE_MANAGED_STATUS_NOT_FOUND,
+                          entry->id,
+                          "staged managed allocation disappeared");
+                  }
+                  allocation = &memory->allocations[allocation_index];
+                  if (entry->new_size < allocation->size ||
+                      entry->new_alignment != allocation->alignment) {
+                      cvite_managed_release_blocks(blocks, index);
+                      return cvite_managed_fail(
+                          error,
+                          CVITE_MANAGED_STATUS_UNSAFE_LAYOUT,
+                          entry->id,
+                          "managed allocation changed after staging");
+                  }
+                  status = cvite_managed_allocate_block(
+                      entry->new_size,
+                      entry->new_alignment,
+                      &blocks[index],
+                      entry->id,
+                      error);
+                  if (status != CVITE_MANAGED_STATUS_OK) {
+                      cvite_managed_release_blocks(blocks, index);
+                      return status;
+                  }
+                  memcpy(
+                      blocks[index].address,
+                      allocation->address,
+                      allocation->size);
+              }
+
+              /* Validate every slot against the staged graph before mutation. */
+              for (index = 0U; index < memory->pointer_count; ++index) {
+                  const cvite_managed_pointer *pointer =
+                      &memory->pointers[index];
+                  void *value;
+                  status = cvite_managed_staged_target(
+                      transaction,
+                      blocks,
+                      pointer->target_id,
+                      pointer->target_offset,
+                      &value,
+                      error);
+                  if (status != CVITE_MANAGED_STATUS_OK) {
+                      cvite_managed_release_blocks(
+                          blocks,
+                          transaction->entry_count);
+                      return status;
+                  }
+                  if (pointer->kind == CVITE_MANAGED_POINTER_EXTERNAL) {
+                      if (pointer->external_slot == NULL) {
+                          cvite_managed_release_blocks(
+                              blocks,
+                              transaction->entry_count);
+                          return cvite_managed_fail(
+                              error,
+                              CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT,
+                              pointer->target_id,
+                              "external managed pointer slot became null");
+                      }
+                  } else {
+                      unsigned char *location;
+                      status = cvite_managed_staged_owned_slot(
+                          transaction,
+                          blocks,
+                          pointer->owner_id,
+                          pointer->slot_offset,
+                          &location,
+                          error);
+                      if (status != CVITE_MANAGED_STATUS_OK) {
+                          cvite_managed_release_blocks(
+                              blocks,
+                              transaction->entry_count);
+                          return status;
+                      }
+                  }
+              }
+
+              /* No operation below this point can fail. */
+              for (index = 0U; index < memory->pointer_count; ++index) {
+                  const cvite_managed_pointer *pointer =
+                      &memory->pointers[index];
+                  void *value = NULL;
+                  (void)cvite_managed_staged_target(
+                      transaction,
+                      blocks,
+                      pointer->target_id,
+                      pointer->target_offset,
+                      &value,
+                      NULL);
+                  if (pointer->kind == CVITE_MANAGED_POINTER_EXTERNAL) {
+                      *pointer->external_slot = value;
+                  } else {
+                      unsigned char *location = NULL;
+                      (void)cvite_managed_staged_owned_slot(
+                          transaction,
+                          blocks,
+                          pointer->owner_id,
+                          pointer->slot_offset,
+                          &location,
+                          NULL);
+                      memcpy(location, &value, sizeof(value));
+                  }
+              }
+
+              for (index = 0U; index < transaction->entry_count; ++index) {
+                  size_t allocation_index;
+                  cvite_managed_allocation *allocation;
+                  void *old_base;
+                  const cvite_managed_transaction_entry *entry =
+                      &transaction->entries[index];
+
+                  (void)cvite_managed_find_allocation_index(
+                      memory,
+                      entry->id,
+                      &allocation_index);
+                  allocation = &memory->allocations[allocation_index];
+                  old_base = allocation->base;
+                  allocation->base = blocks[index].base;
+                  allocation->address = blocks[index].address;
+                  allocation->size = entry->new_size;
+                  allocation->alignment = entry->new_alignment;
+                  allocation->type_id = entry->new_type_id;
+                  blocks[index].base = NULL;
+                  blocks[index].address = NULL;
+                  free(old_base);
+              }
+              free(blocks);
+
+              if (transaction->entry_count != 0U) {
+                  ++memory->generation;
+              }
+              memory->transaction_active = false;
+              free(transaction->entries);
+              free(transaction);
+              *transaction_pointer = NULL;
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+
+          void cvite_managed_transaction_abort(
+              cvite_managed_transaction **transaction_pointer)
+          {
+              cvite_managed_transaction *transaction;
+              if (transaction_pointer == NULL ||
+                  *transaction_pointer == NULL) {
+                  return;
+              }
+              transaction = *transaction_pointer;
+              if (transaction->memory != NULL) {
+                  transaction->memory->transaction_active = false;
+              }
+              free(transaction->entries);
+              free(transaction);
+              *transaction_pointer = NULL;
+          }
+
+          uint64_t cvite_managed_memory_generation(
+              const cvite_managed_memory *memory)
+          {
+              return memory == NULL ? UINT64_C(0) : memory->generation;
+          }
+
+          size_t cvite_managed_memory_allocation_count(
+              const cvite_managed_memory *memory)
+          {
+              return memory == NULL ? 0U : memory->allocation_count;
+          }
+
+          size_t cvite_managed_memory_pointer_count(
+              const cvite_managed_memory *memory)
+          {
+              return memory == NULL ? 0U : memory->pointer_count;
+          }
+
+          const char *cvite_managed_status_string(cvite_managed_status status)
+          {
+              switch (status) {
+                  case CVITE_MANAGED_STATUS_OK:
+                      return "ok";
+                  case CVITE_MANAGED_STATUS_INVALID_ARGUMENT:
+                      return "invalid argument";
+                  case CVITE_MANAGED_STATUS_OUT_OF_MEMORY:
+                      return "out of memory";
+                  case CVITE_MANAGED_STATUS_DUPLICATE_ID:
+                      return "duplicate identity";
+                  case CVITE_MANAGED_STATUS_NOT_FOUND:
+                      return "not found";
+                  case CVITE_MANAGED_STATUS_BUSY:
+                      return "busy";
+                  case CVITE_MANAGED_STATUS_UNSAFE_LAYOUT:
+                      return "unsafe layout";
+                  case CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT:
+                      return "invalid pointer slot";
+              }
+              return "unknown managed-memory status";
+          }
+          CVITE_SOURCE
+
+          cat > tests/test_managed_memory.c <<'CVITE_TEST'
+          #include "cvite/managed_memory.h"
+
+          #include <stddef.h>
+          #include <stdint.h>
+          #include <stdio.h>
+
+          static int failures = 0;
+
+          #define CHECK(condition)                                                \
+              do {                                                                \
+                  if (!(condition)) {                                              \
+                      (void)fprintf(                                               \
+                          stderr,                                                  \
+                          "%s:%d: check failed: %s\n",                           \
+                          __FILE__,                                                \
+                          __LINE__,                                                \
+                          #condition);                                             \
+                      ++failures;                                                  \
+                  }                                                               \
+              } while (0)
+
+          typedef struct node_v1 {
+              int value;
+              struct node_v1 *next;
+          } node_v1;
+
+          typedef struct node_v2 {
+              int value;
+              struct node_v2 *next;
+              int health;
+          } node_v2;
+
+          static cvite_id make_id(uint64_t high, uint64_t low)
+          {
+              const cvite_id id = {high, low};
+              return id;
+          }
+
+          static void expect_ok(
+              cvite_managed_status status,
+              const cvite_managed_error *error)
+          {
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  (void)fprintf(
+                      stderr,
+                      "unexpected managed-memory error: %s: %s\n",
+                      cvite_managed_status_string(status),
+                      error == NULL ? "" : error->message);
+                  ++failures;
+              }
+          }
+
+          static void test_cyclic_owner_relocation(void)
+          {
+              const cvite_id object_a = make_id(UINT64_C(1), UINT64_C(1));
+              const cvite_id object_b = make_id(UINT64_C(1), UINT64_C(2));
+              const cvite_id type_v1 = make_id(UINT64_C(2), UINT64_C(1));
+              const cvite_id type_v2 = make_id(UINT64_C(2), UINT64_C(2));
+              cvite_managed_memory *memory = NULL;
+              cvite_managed_transaction *transaction = NULL;
+              cvite_managed_error error;
+              cvite_managed_allocation_info info_a;
+              cvite_managed_allocation_info info_b;
+              node_v1 *a = NULL;
+              node_v1 *b = NULL;
+              node_v1 *root = NULL;
+              void *value_pointer = NULL;
+              node_v1 *old_a;
+              node_v1 *old_b;
+              node_v2 *new_a;
+              node_v2 *new_b;
+
+              expect_ok(cvite_managed_memory_create(&memory, &error), &error);
+              expect_ok(
+                  cvite_managed_memory_allocate(
+                      memory,
+                      object_a,
+                      type_v1,
+                      sizeof(*a),
+                      _Alignof(node_v1),
+                      (void **)&a,
+                      &error),
+                  &error);
+              expect_ok(
+                  cvite_managed_memory_allocate(
+                      memory,
+                      object_b,
+                      type_v1,
+                      sizeof(*b),
+                      _Alignof(node_v1),
+                      (void **)&b,
+                      &error),
+                  &error);
+              a->value = 11;
+              b->value = 22;
+
+              root = a;
+              value_pointer = &a->value;
+              expect_ok(
+                  cvite_managed_memory_track_external_pointer(
+                      memory,
+                      (void **)&root,
+                      object_a,
+                      0U,
+                      &error),
+                  &error);
+              expect_ok(
+                  cvite_managed_memory_track_external_pointer(
+                      memory,
+                      &value_pointer,
+                      object_a,
+                      offsetof(node_v1, value),
+                      &error),
+                  &error);
+              expect_ok(
+                  cvite_managed_memory_track_owned_pointer(
+                      memory,
+                      object_a,
+                      offsetof(node_v1, next),
+                      object_b,
+                      0U,
+                      &error),
+                  &error);
+              expect_ok(
+                  cvite_managed_memory_track_owned_pointer(
+                      memory,
+                      object_b,
+                      offsetof(node_v1, next),
+                      object_a,
+                      0U,
+                      &error),
+                  &error);
+              CHECK(a->next == b);
+              CHECK(b->next == a);
+              CHECK(cvite_managed_memory_pointer_count(memory) == 4U);
+
+              old_a = a;
+              old_b = b;
+              expect_ok(
+                  cvite_managed_transaction_begin(
+                      memory,
+                      &transaction,
+                      &error),
+                  &error);
+              expect_ok(
+                  cvite_managed_transaction_stage_append(
+                      transaction,
+                      object_a,
+                      type_v2,
+                      sizeof(node_v2),
+                      _Alignof(node_v2),
+                      &error),
+                  &error);
+              expect_ok(
+                  cvite_managed_transaction_stage_append(
+                      transaction,
+                      object_b,
+                      type_v2,
+                      sizeof(node_v2),
+                      _Alignof(node_v2),
+                      &error),
+                  &error);
+              expect_ok(
+                  cvite_managed_transaction_commit(&transaction, &error),
+                  &error);
+              CHECK(transaction == NULL);
+
+              expect_ok(
+                  cvite_managed_memory_find(
+                      memory,
+                      object_a,
+                      &info_a,
+                      &error),
+                  &error);
+              expect_ok(
+                  cvite_managed_memory_find(
+                      memory,
+                      object_b,
+                      &info_b,
+                      &error),
+                  &error);
+              new_a = info_a.address;
+              new_b = info_b.address;
+              CHECK((void *)new_a != (void *)old_a);
+              CHECK((void *)new_b != (void *)old_b);
+              CHECK(root == (node_v1 *)new_a);
+              CHECK(value_pointer == (void *)&new_a->value);
+              CHECK(new_a->value == 11);
+              CHECK(new_b->value == 22);
+              CHECK(new_a->health == 0);
+              CHECK(new_b->health == 0);
+              CHECK(new_a->next == new_b);
+              CHECK(new_b->next == new_a);
+              CHECK(info_a.size == sizeof(node_v2));
+              CHECK(info_b.size == sizeof(node_v2));
+
+              expect_ok(
+                  cvite_managed_memory_free(memory, object_a, &error),
+                  &error);
+              CHECK(root == NULL);
+              CHECK(value_pointer == NULL);
+              CHECK(new_b->next == NULL);
+              CHECK(cvite_managed_memory_pointer_count(memory) == 2U);
+              expect_ok(
+                  cvite_managed_memory_free(memory, object_b, &error),
+                  &error);
+              CHECK(cvite_managed_memory_allocation_count(memory) == 0U);
+              cvite_managed_memory_destroy(memory);
+          }
+
+          static void test_failure_atomicity_and_abort(void)
+          {
+              const cvite_id object = make_id(UINT64_C(3), UINT64_C(1));
+              const cvite_id type = make_id(UINT64_C(4), UINT64_C(1));
+              cvite_managed_memory *memory = NULL;
+              cvite_managed_transaction *transaction = NULL;
+              cvite_managed_error error;
+              cvite_managed_allocation_info before;
+              cvite_managed_allocation_info after;
+              uint64_t generation;
+              int *value = NULL;
+              cvite_managed_status status;
+
+              expect_ok(cvite_managed_memory_create(&memory, &error), &error);
+              expect_ok(
+                  cvite_managed_memory_allocate(
+                      memory,
+                      object,
+                      type,
+                      sizeof(*value),
+                      _Alignof(int),
+                      (void **)&value,
+                      &error),
+                  &error);
+              *value = 73;
+              expect_ok(
+                  cvite_managed_memory_find(
+                      memory,
+                      object,
+                      &before,
+                      &error),
+                  &error);
+              generation = cvite_managed_memory_generation(memory);
+
+              expect_ok(
+                  cvite_managed_transaction_begin(
+                      memory,
+                      &transaction,
+                      &error),
+                  &error);
+              status = cvite_managed_transaction_stage_append(
+                  transaction,
+                  object,
+                  type,
+                  sizeof(*value) - 1U,
+                  _Alignof(int),
+                  &error);
+              CHECK(status == CVITE_MANAGED_STATUS_UNSAFE_LAYOUT);
+              CHECK(transaction != NULL);
+              cvite_managed_transaction_abort(&transaction);
+              CHECK(transaction == NULL);
+
+              expect_ok(
+                  cvite_managed_memory_find(
+                      memory,
+                      object,
+                      &after,
+                      &error),
+                  &error);
+              CHECK(after.address == before.address);
+              CHECK(after.size == before.size);
+              CHECK(*(int *)after.address == 73);
+              CHECK(cvite_managed_memory_generation(memory) == generation);
+
+              expect_ok(
+                  cvite_managed_transaction_begin(
+                      memory,
+                      &transaction,
+                      &error),
+                  &error);
+              status = cvite_managed_memory_free(memory, object, &error);
+              CHECK(status == CVITE_MANAGED_STATUS_BUSY);
+              cvite_managed_transaction_abort(&transaction);
+              expect_ok(
+                  cvite_managed_memory_free(memory, object, &error),
+                  &error);
+              cvite_managed_memory_destroy(memory);
+          }
+
+          static void test_pointer_validation(void)
+          {
+              const cvite_id object = make_id(UINT64_C(5), UINT64_C(1));
+              const cvite_id type = make_id(UINT64_C(6), UINT64_C(1));
+              cvite_managed_memory *memory = NULL;
+              cvite_managed_error error;
+              void *address = NULL;
+              void *external = NULL;
+              cvite_managed_status status;
+
+              expect_ok(cvite_managed_memory_create(&memory, &error), &error);
+              expect_ok(
+                  cvite_managed_memory_allocate(
+                      memory,
+                      object,
+                      type,
+                      16U,
+                      8U,
+                      &address,
+                      &error),
+                  &error);
+              status = cvite_managed_memory_track_external_pointer(
+                  memory,
+                  &external,
+                  object,
+                  17U,
+                  &error);
+              CHECK(status == CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT);
+              CHECK(external == NULL);
+              status = cvite_managed_memory_track_owned_pointer(
+                  memory,
+                  object,
+                  12U,
+                  object,
+                  0U,
+                  &error);
+              CHECK(status == CVITE_MANAGED_STATUS_INVALID_POINTER_SLOT);
+              CHECK(cvite_managed_memory_pointer_count(memory) == 0U);
+              expect_ok(
+                  cvite_managed_memory_free(memory, object, &error),
+                  &error);
+              cvite_managed_memory_destroy(memory);
+          }
+
+          int main(void)
+          {
+              test_cyclic_owner_relocation();
+              test_failure_atomicity_and_abort();
+              test_pointer_validation();
+              if (failures != 0) {
+                  (void)fprintf(
+                      stderr,
+                      "managed-memory tests failed: %d\n",
+                      failures);
+                  return 1;
+              }
+              (void)puts("managed-memory tests passed");
+              return 0;
+          }
+          CVITE_TEST
+
+          cat > docs/managed-memory.md <<'CVITE_DOC'
+          # Managed-memory migration core
+
+          CVite's ordinary-C experience must not require application code to use
+          a framework allocator. The compiler/runtime still needs an internal
+          representation for allocations whose provenance it can prove.
+
+          The managed-memory core added here is that conservative internal
+          primitive. It is intentionally **not** exposed as the normal developer
+          programming model.
+
+          ## Safety boundary
+
+          A migration is allowed only when all of the following are true:
+
+          - CVite owns the allocation record and its backing block;
+          - the allocation identity is stable;
+          - the new layout is append-only;
+          - size does not shrink;
+          - alignment is unchanged;
+          - every pointer slot that must move is registered;
+          - the host has established quiescence before commit.
+
+          Existing bytes are copied and the appended tail is zero-initialized.
+          All replacement blocks and all pointer locations are validated before
+          any live pointer is changed.
+
+          ## Relocatable pointer slots
+
+          A pointer field inside a managed object is represented as:
+
+          ```text
+          owner allocation identity + byte offset
+          ```
+
+          rather than as the field's current machine address. If both the owner
+          and target move in one transaction, the slot is located in the new
+          owner and receives the new target address. Cyclic object graphs are
+          therefore handled without leaving registry entries pointed into freed
+          owner storage.
+
+          External pointer variables can also be tracked when their lifetime is
+          known. Interior target offsets, including a one-past pointer, are
+          preserved.
+
+          ## Explicit non-goals
+
+          This layer does not claim that arbitrary C memory is movable. The
+          following still require a controlled restart unless later analysis
+          proves a narrower safe case:
+
+          - uninstrumented or custom allocators;
+          - pointers escaped into foreign libraries;
+          - unknown stack and register roots;
+          - untracked interior pointers;
+          - unions, bit-fields, flexible arrays, or layout reordering;
+          - alignment changes;
+          - active native frames that depend on the old layout.
+
+          The compiler instrumentation and semantic type-diff layers will decide
+          which allocations and pointer stores qualify. This runtime only
+          executes a migration after that decision has been made.
+          CVITE_DOC
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("CMakeLists.txt")
+          text = path.read_text(encoding="utf-8")
+          source = "    src/runtime/managed_memory.c\n"
+          if source not in text:
+              marker = "    src/runtime/runtime_storage.c\n"
+              if marker not in text:
+                  raise SystemExit("cvite_runtime source marker was not found")
+              text = text.replace(marker, marker + source, 1)
+
+          block_marker = "# CVITE_MANAGED_MEMORY_TEST_BEGIN"
+          if block_marker not in text:
+              text += r'''
+
+          # CVITE_MANAGED_MEMORY_TEST_BEGIN
+          if(BUILD_TESTING)
+              add_executable(cvite_test_managed_memory
+                  tests/test_managed_memory.c
+              )
+              target_compile_features(cvite_test_managed_memory PRIVATE c_std_11)
+              target_link_libraries(cvite_test_managed_memory PRIVATE cvite_runtime)
+              if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                  target_compile_options(cvite_test_managed_memory PRIVATE
+                      -Wall
+                      -Wextra
+                      -Wpedantic
+                      -Wconversion
+                      -Wshadow
+                      -Wformat=2
+                      -Wundef
+                  )
+                  if(CVITE_WARNINGS_AS_ERRORS)
+                      target_compile_options(cvite_test_managed_memory PRIVATE -Werror)
+                  endif()
+              endif()
+              add_test(NAME managed-memory COMMAND cvite_test_managed_memory)
+          endif()
+          # CVITE_MANAGED_MEMORY_TEST_END
+          '''
+          path.write_text(text, encoding="utf-8")
+          PY
+
+          git diff --check
+
+      - name: Install build tools
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          cmake
+          clang-18
+
+      - name: Configure core runtime
+        run: >-
+          cmake -S . -B build-managed-core -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCVITE_BUILD_COMPILER=OFF
+          -DCVITE_BUILD_LLVM_PASS=OFF
+          -DCVITE_BUILD_ORC_LOADER=OFF
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build core runtime
+        run: cmake --build build-managed-core --verbose
+
+      - name: Run core test suite
+        run: ctest --test-dir build-managed-core --output-on-failure
+
+      - name: Run AddressSanitizer and UndefinedBehaviorSanitizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang-18 \
+            -std=c11 -O1 -g \
+            -fsanitize=address,undefined \
+            -fno-omit-frame-pointer \
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wundef -Werror \
+            -Iinclude \
+            src/runtime/managed_memory.c \
+            tests/test_managed_memory.c \
+            -o /tmp/cvite-test-managed-memory-sanitized
+          ASAN_OPTIONS=detect_leaks=1 \
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            /tmp/cvite-test-managed-memory-sanitized
+
+      - name: Commit only the verified implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- .github/workflows/apply-managed-memory-core.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            CMakeLists.txt \
+            include/cvite/managed_memory.h \
+            src/runtime/managed_memory.c \
+            tests/test_managed_memory.c \
+            docs/managed-memory.md
+          git add -u -- .github/workflows/apply-managed-memory-core.yml
+          git diff --cached --check
+          git commit -m "feat: add transactional managed-memory core [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
