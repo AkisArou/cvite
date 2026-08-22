@@ -1,0 +1,239 @@
+name: Recover managed-memory consolidation
+
+on:
+  workflow_run:
+    workflows:
+      - Consolidate managed-memory pipeline
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cvite-managed-pipeline-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Install pinned development toolchain
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          cmake
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+
+      - name: Reconcile staged templates and applicators
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          root = Path.cwd()
+          stage_dirs = sorted(
+              p for p in (root / ".github").iterdir()
+              if p.is_dir() and p.name.endswith("-next")
+          )
+          events: list[dict[str, object]] = []
+
+          priority_tokens = (
+              "semantic",
+              "managed-memory",
+              "memory",
+              "allocation",
+              "instrumentation",
+              "managed-type",
+              "type",
+              "managed-refresh",
+              "refresh",
+              "driver",
+              "compiler-proxy",
+              "managed-live",
+              "live-migration",
+              "migration",
+          )
+
+          def rank(path: Path) -> tuple[int, str]:
+              name = path.name.lower()
+              for index, token in enumerate(priority_tokens):
+                  if token in name:
+                      return index, name
+              return len(priority_tokens), name
+
+          stage_dirs.sort(key=rank)
+
+          # First allow applicators to perform their own marker-aware edits.
+          failed: list[tuple[Path, Path, str]] = []
+          for stage in stage_dirs:
+              for script in sorted(stage.glob("apply-*.py")):
+                  run = subprocess.run(
+                      ["python3", str(script)],
+                      cwd=root,
+                      text=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                  )
+                  events.append({
+                      "script": str(script.relative_to(root)),
+                      "phase": "applicator-first",
+                      "returncode": run.returncode,
+                      "output": run.stdout[-8000:],
+                  })
+                  if run.returncode != 0:
+                      failed.append((stage, script, run.stdout))
+
+          # Historical stages were sometimes committed one template at a time.
+          # Materialize their declared files, then give failed applicators one
+          # more chance to patch CMake/driver integration around those files.
+          copied: list[str] = []
+          for stage in stage_dirs:
+              template_root = stage / "templates"
+              if not template_root.is_dir():
+                  continue
+              for source in sorted(p for p in template_root.rglob("*") if p.is_file()):
+                  destination = root / source.relative_to(template_root)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  if not destination.exists() or destination.read_bytes() != source.read_bytes():
+                      shutil.copy2(source, destination)
+                      copied.append(str(destination.relative_to(root)))
+
+          unresolved: list[dict[str, object]] = []
+          for stage, script, _old_output in failed:
+              run = subprocess.run(
+                  ["python3", str(script)],
+                  cwd=root,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              record = {
+                  "script": str(script.relative_to(root)),
+                  "phase": "applicator-after-template-copy",
+                  "returncode": run.returncode,
+                  "output": run.stdout[-8000:],
+              }
+              events.append(record)
+              if run.returncode != 0:
+                  unresolved.append(record)
+
+          # A copied test that is not registered is not an implementation.
+          cmake_text = (root / "CMakeLists.txt").read_text(encoding="utf-8")
+          for module in sorted((root / "cmake").glob("*.cmake")):
+              cmake_text += "\n" + module.read_text(encoding="utf-8")
+
+          unwired_tests: list[str] = []
+          for stage in stage_dirs:
+              template_tests = stage / "templates" / "tests"
+              if not template_tests.is_dir():
+                  continue
+              for test in sorted(p for p in template_tests.rglob("*") if p.is_file()):
+                  relative = test.relative_to(stage / "templates")
+                  destination = root / relative
+                  if not destination.is_file():
+                      unwired_tests.append(f"missing:{relative}")
+                      continue
+                  if test.name not in cmake_text:
+                      unwired_tests.append(f"unregistered:{relative}")
+
+          report = {
+              "stages": [str(p.relative_to(root)) for p in stage_dirs],
+              "copied": copied,
+              "events": events,
+              "unresolved_applicators": unresolved,
+              "unwired_tests": unwired_tests,
+          }
+          Path("/tmp/cvite-managed-recovery.json").write_text(
+              json.dumps(report, indent=2), encoding="utf-8"
+          )
+          print(json.dumps(report, indent=2))
+
+          if unwired_tests:
+              raise SystemExit("staged tests are not integrated into the build")
+
+          subprocess.run(["git", "diff", "--check"], check=True)
+          PY
+
+      - name: Configure recovered implementation
+        run: >-
+          cmake -S . -B build-managed-recovery -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_BUILD_SOAK_TESTS=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build recovered implementation
+        run: cmake --build build-managed-recovery --verbose
+
+      - name: Test recovered implementation
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build-managed-recovery --output-on-failure \
+            | tee /tmp/cvite-managed-recovery-tests.txt
+
+      - name: Remove all temporary staging machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          find .github -mindepth 1 -maxdepth 1 -type d -name '*-next' -print0 \
+            | xargs -0r rm -rf --
+          find .github/workflows -maxdepth 1 -type f ! -name 'ci.yml' -delete
+          rm -rf -- .cvite
+          rm -f -- .github/pro-snapshot.tar.gz.b64 .github/pro-snapshot-run-id
+          git diff --check
+
+      - name: Commit recovered verified tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            CMakeLists.txt CMakePresets.json README.md \
+            cmake docs examples include scripts src tests
+          git add -u -- .github .cvite
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "feat: recover managed refresh pipeline [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
+
+      - name: Upload recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-managed-recovery-${{ github.event.workflow_run.head_sha }}
+          path: |
+            /tmp/cvite-managed-recovery.json
+            /tmp/cvite-managed-recovery-tests.txt
+          retention-days: 7
+          if-no-files-found: warn
