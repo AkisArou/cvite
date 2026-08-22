@@ -1,0 +1,182 @@
+name: Finalize verified managed-refresh pipeline
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cvite-managed-pipeline-final
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: >-
+      github.actor == 'github-actions[bot]' &&
+      startsWith(github.event.head_commit.message,
+                 'feat: preserve append-only managed state live')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Require the complete verified source chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f include/cvite/managed_memory.h
+          test -f src/runtime/managed_memory.c
+          test -f include/cvite/allocation_index.hpp
+          test -f src/compiler/allocation_index.cpp
+          test -f src/compiler/allocation_annotator.cpp
+          test -f src/compiler/clang_wrapper.cpp
+          test -f src/transform/managed_baseline_registration_pass.h
+          grep -q 'cvite_managed_pointer_patch' src/runtime/managed_memory.c
+
+      - name: Remove staging machinery and write status
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- \
+            .github/managed-next \
+            .github/next \
+            .github/allocation-next \
+            .github/instrumentation-next \
+            .github/type-manifest-next \
+            .github/refresh-next \
+            .github/driver-next \
+            .github/live-migration-next \
+            .cvite
+          rm -f -- \
+            .github/pro-snapshot-run-id \
+            .github/pro-snapshot.tar.gz.b64
+          find .github/workflows -maxdepth 1 -type f ! -name 'ci.yml' -delete
+          mkdir -p docs
+          cat > docs/development-status.md <<EOF
+          # Development status
+
+          The `bootstrap/m0-runtime` branch contains the verified Linux/Clang
+          vertical slice for invisible Fast Refresh of ordinary C.
+
+          ## Verified managed-refresh path
+
+          - transactional, failure-atomic managed allocation migration;
+          - owner-relative pointer-slot provenance, including cyclic graphs;
+          - append-only layout preservation with zero-initialized tails;
+          - Clang allocation-site inference;
+          - compiler-generated managed allocation instrumentation;
+          - candidate/baseline managed type manifests;
+          - atomic publication of code targets and eligible migrations;
+          - transparent Clang compiler proxy integration;
+          - end-to-end ordinary-C live migration test;
+          - controlled restart for unsupported or escaped native state.
+
+          The publishing workflow that produced this tree used Clang/LLVM 18,
+          warnings as errors, the complete CTest suite, and the opt-in soak tests.
+          Temporary generation templates and one-shot consolidation workflows
+          were removed after verification.
+
+          ## Deliberate limits
+
+          CVite still does not claim that arbitrary unmanaged C pointer graphs,
+          active stack frames, foreign-library pointers, unions, bit-fields,
+          flexible arrays, custom allocators, or alignment-changing layouts are
+          safely movable. Those cases remain restart boundaries.
+          EOF
+          git diff --check
+
+      - name: Commit clean verified tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- docs/development-status.md
+          git add -u -- .github .cvite
+          git diff --cached --check
+          git commit -m "ci: finalize verified managed-refresh pipeline"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
+
+      - name: Update draft pull request description
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cat > /tmp/pr-body.md <<'EOF'
+          ## Summary
+
+          CVite is an experimental React/Vite-style Fast Refresh runtime for
+          ordinary C. Application source does not require CVite macros,
+          annotations, state APIs, custom allocators, or lifecycle calls.
+
+          ```console
+          cvite run .
+          ```
+
+          Compatible edits are compiled with Clang, transformed through LLVM,
+          linked with ORC/JITLink, validated, and atomically published while the
+          native process and compatible state remain alive. Invalid candidates
+          leave the last known-good generation active. Unsafe native changes
+          take a controlled restart instead of risking memory corruption.
+
+          ## Implemented vertical slice
+
+          - Clang/libclang semantic and compilation-database integration; no
+            custom C parser.
+          - Stable native function entries and transactional dispatch snapshots.
+          - Single- and multi-translation-unit incremental compilation.
+          - Header, compile-command, CMake File API, CMake link-line, and Ninja
+            invalidation/discovery.
+          - Automatic native target and link-input validation.
+          - Last-known-good behavior after compiler and linker failures.
+          - Implementation-level candidate filtering and quiescent retirement
+            for safe native-code generations.
+          - Field-level semantic layout information and conservative append-only
+            compatibility planning.
+          - Failure-atomic managed allocation migration with owner-relative
+            pointer-slot provenance, interior-pointer offsets, and cyclic-graph
+            coverage.
+          - Clang allocation-site inference for ordinary allocation idioms.
+          - Compiler-injected managed allocation/type metadata.
+          - Atomic code + managed-state refresh transactions.
+          - Transparent Clang compiler proxy and an ordinary-C end-to-end live
+            migration test.
+
+          ## Safety boundary
+
+          CVite migrates only state whose ownership, layout, and pointer roots it
+          can prove. Unmanaged or escaped pointers, active incompatible stack
+          frames, foreign-library ownership, unions, bit-fields, flexible
+          arrays, custom allocation schemes, and alignment-changing layouts
+          remain controlled restart boundaries.
+
+          ## Current constraints
+
+          - Linux/inotify and Clang/LLVM 18.
+          - C11-compatible application source and development-oriented builds.
+          - One supported C `main` entry.
+          - Translation-unit-set changes currently restart the process.
+          - Candidate LLVM modules are still completely relinked before atomic
+            publication.
+          - macOS and Windows backends are not yet packaged.
+
+          ## Verification
+
+          Every managed-refresh layer was published only after a pinned
+          Clang/LLVM 18 warnings-as-errors build and the complete CTest suite.
+          The final end-to-end gate also enabled the longer live-refresh soak
+          tests. `docs/development-status.md` records the verified source state.
+          EOF
+          gh api \
+            --method PATCH \
+            repos/AkisArou/cvite/pulls/1 \
+            --raw-field body="$(cat /tmp/pr-body.md)" \
+            >/dev/null
