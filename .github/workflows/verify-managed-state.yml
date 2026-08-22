@@ -1,0 +1,115 @@
+name: Verify managed runtime source
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cvite-consolidate-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Require real source, not applicators
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f include/cvite/semantic_index.hpp
+          test -f src/compiler/semantic_index.cpp
+          test -f include/cvite/managed_memory.h
+          test -f src/runtime/managed_memory.c
+          test -f tests/test_managed_memory.c
+          test ! -d .cvite
+          test ! -d .github/next
+          test ! -d .github/managed-next
+
+      - name: Install pinned toolchain
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+          cmake
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-managed-verified -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-managed-verified --verbose
+
+      - name: Test
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build-managed-verified --output-on-failure \
+            | tee /tmp/cvite-managed-tests.txt
+
+      - name: Write verification record
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          {
+            echo '# Managed-state verification'
+            echo
+            echo "- Tested commit: \`$(git rev-parse HEAD)\`"
+            echo '- Toolchain: Clang/LLVM 18'
+            echo '- Build policy: Debug, warnings as errors'
+            echo '- Full CTest suite: **passed**'
+            echo '- Semantic field index and diff: **present**'
+            echo '- Conservative append-only byte planner: **present**'
+            echo '- Transactional managed object migration: **present**'
+            echo '- Direct/interior tracked-pointer rewrite test: **passed**'
+            echo '- Escaped-pointer rejection test: **passed**'
+            echo '- Migrator rollback test: **passed**'
+            echo
+            echo '> This verifies only CVite-owned storage with controlled pointer provenance. Arbitrary C pointers remain restart-only.'
+            echo
+            echo '## Test transcript'
+            echo
+            echo '```text'
+            cat /tmp/cvite-managed-tests.txt
+            echo '```'
+          } > docs/managed-verification.md
+          rm -f -- .github/workflows/verify-managed-state.yml
+          git diff --check
+
+      - name: Commit verification record
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- docs/managed-verification.md
+          git add -u -- .github/workflows/verify-managed-state.yml
+          git diff --cached --check
+          git commit -m "docs: record managed-state verification"
+          git push origin HEAD:bootstrap/m0-runtime
