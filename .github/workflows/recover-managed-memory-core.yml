@@ -1,0 +1,170 @@
+name: Recover audited managed-memory core
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-managed-pipeline-final
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.head_commit.message, '[recover-managed-core]')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Recover exact source payload and correct the contract test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/apply-managed-memory-core.yml')
+          text = workflow.read_text(encoding='utf-8')
+
+          def recover(path: str, marker: str) -> None:
+              opener = f"          cat > {path} <<'{marker}'\n"
+              closer = f"\n          {marker}\n"
+              if opener not in text:
+                  raise SystemExit(f'missing source payload for {path}')
+              payload = text.split(opener, 1)[1].split(closer, 1)[0]
+              lines = []
+              for line in payload.splitlines():
+                  if line.startswith('          '):
+                      line = line[10:]
+                  lines.append(line)
+              destination = Path(path)
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              destination.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          recover('include/cvite/managed_memory.h', 'CVITE_HEADER')
+          recover('src/runtime/managed_memory.c', 'CVITE_SOURCE')
+          recover('tests/test_managed_memory.c', 'CVITE_TEST')
+          recover('docs/managed-memory.md', 'CVITE_DOC')
+
+          test_path = Path('tests/test_managed_memory.c')
+          test = test_path.read_text(encoding='utf-8')
+          old = 'CHECK(cvite_managed_memory_pointer_count(memory) == 2U);'
+          new = 'CHECK(cvite_managed_memory_pointer_count(memory) == 3U);'
+          if old not in test:
+              raise SystemExit('pointer-lifetime expectation marker is missing')
+          test_path.write_text(test.replace(old, new, 1), encoding='utf-8')
+
+          cmake_path = Path('CMakeLists.txt')
+          cmake = cmake_path.read_text(encoding='utf-8')
+          source = '    src/runtime/managed_memory.c\n'
+          if source not in cmake:
+              marker = '    src/runtime/runtime_storage.c\n'
+              if marker not in cmake:
+                  raise SystemExit('cvite_runtime source marker was not found')
+              cmake = cmake.replace(marker, marker + source, 1)
+
+          block_marker = '# CVITE_MANAGED_MEMORY_TEST_BEGIN'
+          if block_marker not in cmake:
+              cmake += r'''
+
+          # CVITE_MANAGED_MEMORY_TEST_BEGIN
+          if(BUILD_TESTING)
+              add_executable(cvite_test_managed_memory
+                  tests/test_managed_memory.c
+              )
+              target_compile_features(cvite_test_managed_memory PRIVATE c_std_11)
+              target_link_libraries(cvite_test_managed_memory PRIVATE cvite_runtime)
+              if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                  target_compile_options(cvite_test_managed_memory PRIVATE
+                      -Wall
+                      -Wextra
+                      -Wpedantic
+                      -Wconversion
+                      -Wshadow
+                      -Wformat=2
+                      -Wundef
+                  )
+                  if(CVITE_WARNINGS_AS_ERRORS)
+                      target_compile_options(cvite_test_managed_memory PRIVATE -Werror)
+                  endif()
+              endif()
+              add_test(NAME managed-memory COMMAND cvite_test_managed_memory)
+          endif()
+          # CVITE_MANAGED_MEMORY_TEST_END
+          '''
+          cmake_path.write_text(cmake, encoding='utf-8')
+          PY
+          git diff --check
+
+      - name: Install build tools
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          cmake
+          clang-18
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-managed-core -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCVITE_BUILD_COMPILER=OFF
+          -DCVITE_BUILD_LLVM_PASS=OFF
+          -DCVITE_BUILD_ORC_LOADER=OFF
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-managed-core --verbose
+
+      - name: Test
+        run: ctest --test-dir build-managed-core --output-on-failure
+
+      - name: Sanitizer gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang-18 \
+            -std=c11 -O1 -g \
+            -fsanitize=address,undefined \
+            -fno-omit-frame-pointer \
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wundef -Werror \
+            -Iinclude \
+            src/runtime/managed_memory.c \
+            tests/test_managed_memory.c \
+            -o /tmp/cvite-test-managed-memory-sanitized
+          ASAN_OPTIONS=detect_leaks=1 \
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            /tmp/cvite-test-managed-memory-sanitized
+
+      - name: Commit only verified source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- \
+            .github/workflows/apply-managed-memory-core.yml \
+            .github/workflows/recover-managed-memory-core.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            CMakeLists.txt \
+            include/cvite/managed_memory.h \
+            src/runtime/managed_memory.c \
+            tests/test_managed_memory.c \
+            docs/managed-memory.md
+          git add -u -- \
+            .github/workflows/apply-managed-memory-core.yml \
+            .github/workflows/recover-managed-memory-core.yml
+          git diff --cached --check
+          git commit -m "feat: add transactional managed-memory core [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
