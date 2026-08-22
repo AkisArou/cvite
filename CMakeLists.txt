@@ -652,6 +652,7 @@ endif()
 # and opt-in development stress tests are declared after the core/compiler
 # targets they extend.
 include(cmake/CViteSemantic.cmake)
+include(cmake/CViteManagedMemory.cmake)
 include(cmake/CViteExperimental.cmake)
 
 if(CVITE_BUILD_EXAMPLES)
