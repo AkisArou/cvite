@@ -1,0 +1,135 @@
+name: Consolidate managed semantic refresh
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-consolidate-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply all pending implementation layers
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in \
+            .cvite/apply-filter-reclaim.py \
+            .cvite/apply-safety-boundaries.py \
+            .cvite/apply-refresh-diagnostics.py \
+            .github/next/apply-semantic-next.py \
+            .github/next/apply-semantic-fixes.py \
+            .github/managed-next/apply-managed-memory.py \
+            .github/allocation-next/apply-allocation-index.py \
+            .github/instrumentation-next/apply-managed-instrumentation.py \
+            .github/driver-next/apply-compiler-proxy.py \
+            .github/driver-next/apply-managed-live-test.py \
+            .github/refresh-next/apply-managed-refresh.py
+          do
+            if [[ -f "$script" ]]; then
+              echo "Applying $script"
+              python3 "$script"
+            fi
+          done
+          git diff --check
+
+      - name: Require semantic refresh bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f include/cvite/managed_refresh.hpp
+          test -f src/host/managed_refresh.cpp
+          test -f tests/test_managed_refresh.cpp
+          grep -q 'CViteManagedRefresh.cmake' CMakeLists.txt
+
+      - name: Install pinned toolchain
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+          cmake
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-refresh -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-refresh --verbose
+
+      - name: Test complete suite
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build-refresh --output-on-failure \
+            | tee /tmp/cvite-refresh-tests.txt
+
+      - name: Re-run migration safety tests
+        run: >-
+          ctest --test-dir build-refresh
+          --output-on-failure
+          -R 'semantic-managed-refresh|managed-memory-transaction|semantic-layout-plan'
+
+      - name: Remove all one-shot machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- \
+            .cvite \
+            .github/next \
+            .github/managed-next \
+            .github/allocation-next \
+            .github/instrumentation-next \
+            .github/driver-next \
+            .github/refresh-next
+          find .github/workflows -maxdepth 1 -type f ! -name ci.yml -delete
+          git diff --check
+
+      - name: Commit verified source only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            CMakeLists.txt \
+            CMakePresets.json \
+            README.md \
+            cmake \
+            docs \
+            examples \
+            include \
+            scripts \
+            src \
+            tests
+          git add -u -- .github .cvite || true
+          git diff --cached --check
+          git commit -m "feat: bridge Clang layout plans to managed heap migration"
+          git push origin HEAD:bootstrap/m0-runtime
