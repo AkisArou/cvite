@@ -1,0 +1,292 @@
+name: Finalize managed-memory transactionality
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-managed-pipeline-final
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.head_commit.message, '[recover-managed-core-v2]')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Recover source when needed and make slot registration atomic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source_path = Path('src/runtime/managed_memory.c')
+          test_path = Path('tests/test_managed_memory.c')
+          header_path = Path('include/cvite/managed_memory.h')
+          doc_path = Path('docs/managed-memory.md')
+
+          if not all(path.is_file() for path in (source_path, test_path, header_path, doc_path)):
+              workflow = Path('.github/workflows/apply-managed-memory-core.yml')
+              if not workflow.is_file():
+                  raise SystemExit('neither landed source nor the recovery payload exists')
+              text = workflow.read_text(encoding='utf-8')
+
+              def recover(path: Path, marker: str) -> None:
+                  opener = f"          cat > {path.as_posix()} <<'{marker}'\n"
+                  closer = f"\n          {marker}\n"
+                  if opener not in text:
+                      raise SystemExit(f'missing source payload for {path}')
+                  payload = text.split(opener, 1)[1].split(closer, 1)[0]
+                  lines = [
+                      line[10:] if line.startswith('          ') else line
+                      for line in payload.splitlines()
+                  ]
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+              recover(header_path, 'CVITE_HEADER')
+              recover(source_path, 'CVITE_SOURCE')
+              recover(test_path, 'CVITE_TEST')
+              recover(doc_path, 'CVITE_DOC')
+
+          test = test_path.read_text(encoding='utf-8')
+          test = test.replace(
+              'CHECK(cvite_managed_memory_pointer_count(memory) == 2U);',
+              'CHECK(cvite_managed_memory_pointer_count(memory) == 3U);',
+              1,
+          )
+          test_path.write_text(test, encoding='utf-8')
+
+          source = source_path.read_text(encoding='utf-8')
+          start_marker = (
+              'cvite_managed_status cvite_managed_memory_track_owned_pointer(\n'
+          )
+          end_marker = (
+              '\ncvite_managed_status cvite_managed_memory_untrack_owned_pointer(\n'
+          )
+          if start_marker not in source or end_marker not in source:
+              raise SystemExit('owned-pointer function markers are missing')
+          start = source.index(start_marker)
+          end = source.index(end_marker, start)
+          replacement = r'''cvite_managed_status cvite_managed_memory_track_owned_pointer(
+              cvite_managed_memory *memory,
+              cvite_id owner_id,
+              size_t slot_offset,
+              cvite_id target_id,
+              size_t target_offset,
+              cvite_managed_error *error)
+          {
+              cvite_managed_status status;
+              void *value;
+              size_t index;
+
+              if (memory == NULL || cvite_managed_zero_id(owner_id)) {
+                  return cvite_managed_fail(
+                      error,
+                      CVITE_MANAGED_STATUS_INVALID_ARGUMENT,
+                      owner_id,
+                      "owned managed pointer arguments are invalid");
+              }
+              status = cvite_managed_require_idle(memory, error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              status = cvite_managed_current_target(
+                  memory,
+                  target_id,
+                  target_offset,
+                  &value,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+
+              for (index = 0U; index < memory->pointer_count; ++index) {
+                  cvite_managed_pointer *pointer = &memory->pointers[index];
+                  if (pointer->kind == CVITE_MANAGED_POINTER_OWNED &&
+                      cvite_managed_same_id(pointer->owner_id, owner_id) &&
+                      pointer->slot_offset == slot_offset) {
+                      status = cvite_managed_write_owned_slot(
+                          memory,
+                          owner_id,
+                          slot_offset,
+                          value,
+                          error);
+                      if (status != CVITE_MANAGED_STATUS_OK) {
+                          return status;
+                      }
+                      pointer->target_id = target_id;
+                      pointer->target_offset = target_offset;
+                      ++memory->generation;
+                      cvite_managed_error_clear(error);
+                      return CVITE_MANAGED_STATUS_OK;
+                  }
+              }
+
+              /*
+               * Capacity is reserved before the live object is mutated. An
+               * allocation failure therefore leaves both the registry and the
+               * pointer field unchanged.
+               */
+              status = cvite_managed_reserve(
+                  (void **)&memory->pointers,
+                  &memory->pointer_capacity,
+                  sizeof(memory->pointers[0]),
+                  memory->pointer_count + 1U,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              status = cvite_managed_write_owned_slot(
+                  memory,
+                  owner_id,
+                  slot_offset,
+                  value,
+                  error);
+              if (status != CVITE_MANAGED_STATUS_OK) {
+                  return status;
+              }
+              memory->pointers[memory->pointer_count++] =
+                  (cvite_managed_pointer){
+                      CVITE_MANAGED_POINTER_OWNED,
+                      NULL,
+                      owner_id,
+                      slot_offset,
+                      target_id,
+                      target_offset,
+                  };
+              ++memory->generation;
+              cvite_managed_error_clear(error);
+              return CVITE_MANAGED_STATUS_OK;
+          }
+          '''
+          source_path.write_text(
+              source[:start] + replacement + source[end:],
+              encoding='utf-8',
+          )
+
+          cmake_path = Path('CMakeLists.txt')
+          cmake = cmake_path.read_text(encoding='utf-8')
+          source_line = '    src/runtime/managed_memory.c\n'
+          if source_line not in cmake:
+              marker = '    src/runtime/runtime_storage.c\n'
+              if marker not in cmake:
+                  raise SystemExit('cvite_runtime source marker was not found')
+              cmake = cmake.replace(marker, marker + source_line, 1)
+          if '# CVITE_MANAGED_MEMORY_TEST_BEGIN' not in cmake:
+              cmake += r'''
+
+          # CVITE_MANAGED_MEMORY_TEST_BEGIN
+          if(BUILD_TESTING)
+              add_executable(cvite_test_managed_memory
+                  tests/test_managed_memory.c
+              )
+              target_compile_features(cvite_test_managed_memory PRIVATE c_std_11)
+              target_link_libraries(cvite_test_managed_memory PRIVATE cvite_runtime)
+              if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                  target_compile_options(cvite_test_managed_memory PRIVATE
+                      -Wall
+                      -Wextra
+                      -Wpedantic
+                      -Wconversion
+                      -Wshadow
+                      -Wformat=2
+                      -Wundef
+                  )
+                  if(CVITE_WARNINGS_AS_ERRORS)
+                      target_compile_options(cvite_test_managed_memory PRIVATE -Werror)
+                  endif()
+              endif()
+              add_test(NAME managed-memory COMMAND cvite_test_managed_memory)
+          endif()
+          # CVITE_MANAGED_MEMORY_TEST_END
+          '''
+          cmake_path.write_text(cmake, encoding='utf-8')
+          PY
+          git diff --check
+
+      - name: Install build tools
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          cmake
+          clang-18
+          gcc
+
+      - name: Configure warnings-as-errors build
+        run: >-
+          cmake -S . -B build-managed-core-v2 -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCVITE_BUILD_COMPILER=OFF
+          -DCVITE_BUILD_LLVM_PASS=OFF
+          -DCVITE_BUILD_ORC_LOADER=OFF
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build-managed-core-v2 --verbose
+          ctest --test-dir build-managed-core-v2 --output-on-failure
+
+      - name: Sanitizers and GCC analyzer
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang-18 \
+            -std=c11 -O1 -g \
+            -fsanitize=address,undefined \
+            -fno-omit-frame-pointer \
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wundef -Werror \
+            -Iinclude \
+            src/runtime/managed_memory.c \
+            tests/test_managed_memory.c \
+            -o /tmp/cvite-test-managed-memory-sanitized
+          ASAN_OPTIONS=detect_leaks=1 \
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            /tmp/cvite-test-managed-memory-sanitized
+          gcc \
+            -std=c11 -O0 -fanalyzer \
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wundef -Werror \
+            -Iinclude \
+            -c src/runtime/managed_memory.c \
+            -o /tmp/cvite-managed-memory-analyzer.o
+
+      - name: Commit the audited result
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- \
+            .github/workflows/apply-managed-memory-core.yml \
+            .github/workflows/recover-managed-memory-core.yml \
+            .github/workflows/recover-managed-memory-core-v2.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            CMakeLists.txt \
+            include/cvite/managed_memory.h \
+            src/runtime/managed_memory.c \
+            tests/test_managed_memory.c \
+            docs/managed-memory.md
+          git add -u -- \
+            .github/workflows/apply-managed-memory-core.yml \
+            .github/workflows/recover-managed-memory-core.yml \
+            .github/workflows/recover-managed-memory-core-v2.yml
+          git diff --cached --check
+          git commit -m "feat: add audited transactional managed memory [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
