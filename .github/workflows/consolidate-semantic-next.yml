@@ -1,0 +1,145 @@
+name: Consolidate semantic refresh milestone
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-consolidate-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  consolidate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Apply pending source milestones
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for script in \
+            .cvite/apply-filter-reclaim.py \
+            .cvite/apply-safety-boundaries.py \
+            .cvite/apply-refresh-diagnostics.py \
+            .github/next/apply-semantic-next.py
+          do
+            if [[ -f "$script" ]]; then
+              echo "Applying $script"
+              python3 "$script"
+            fi
+          done
+          git diff --check
+
+      - name: Install pinned toolchain
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          python3
+          cmake
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-semantic -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build-semantic --verbose
+
+      - name: Test complete suite
+        run: ctest --test-dir build-semantic --output-on-failure
+
+      - name: Exercise semantic CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool=build-semantic/cvite-semantic-index
+          "$tool" index \
+            --source tests/fixtures/layout_old.c \
+            --output /tmp/layout-old.cvsidx \
+            -- -std=c11
+          "$tool" index \
+            --source tests/fixtures/layout_append.c \
+            --output /tmp/layout-append.cvsidx \
+            -- -std=c11
+          "$tool" diff \
+            --old /tmp/layout-old.cvsidx \
+            --new /tmp/layout-append.cvsidx | tee /tmp/layout-diff.txt
+          grep -q 'health' /tmp/layout-diff.txt
+          "$tool" plan \
+            --old /tmp/layout-old.cvsidx \
+            --new /tmp/layout-append.cvsidx \
+            --record Player | tee /tmp/layout-plan.txt
+          grep -q 'managed migration candidate' /tmp/layout-plan.txt
+
+      - name: Remove one-shot machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- .cvite .github/next
+          find .github/workflows -maxdepth 1 -type f ! -name ci.yml -delete
+          git diff --check
+
+      - name: Validate commit scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          unexpected=0
+          while IFS= read -r path; do
+            case "$path" in
+              CMakeLists.txt|CMakePresets.json|README.md|docs/*|include/*|src/*|tests/*|cmake/*|scripts/*|examples/*|.cvite/*|.github/next/*|.github/workflows/*)
+                ;;
+              *)
+                echo "Unexpected modified path: $path" >&2
+                unexpected=1
+                ;;
+            esac
+          done < <(git status --porcelain=v1 | sed -E 's/^.. //; s/.* -> //')
+          [[ "$unexpected" -eq 0 ]]
+
+      - name: Commit verified implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- \
+            CMakeLists.txt \
+            CMakePresets.json \
+            README.md \
+            cmake \
+            docs \
+            examples \
+            include \
+            scripts \
+            src \
+            tests
+          git add -u -- .github .cvite || true
+          git diff --cached --check
+
+          git commit -m "feat: add semantic layout diagnostics and managed migration plans"
+          git push origin HEAD:bootstrap/m0-runtime
