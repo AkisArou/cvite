@@ -1,0 +1,115 @@
+name: Report managed v4 result
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: write
+
+jobs:
+  report:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.head_commit.message, '[report-managed-v4]')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Find latest orchestrator run and collect evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_json=$(gh run list \
+            --workflow orchestrate-managed-pipeline-v4.yml \
+            --branch bootstrap/m0-runtime \
+            --limit 1 \
+            --json databaseId,status,conclusion,headSha,url,displayTitle)
+          printf '%s\n' "$run_json" > /tmp/cvite-managed-v4-run.json
+          run_id=$(python3 - <<'PY'
+          import json
+          rows=json.load(open('/tmp/cvite-managed-v4-run.json'))
+          if not rows:
+              raise SystemExit('no orchestrator run was found')
+          print(rows[0]['databaseId'])
+          PY
+          )
+          gh run view "$run_id" --json jobs > /tmp/cvite-managed-v4-jobs.json
+          gh run view "$run_id" --log-failed > /tmp/cvite-managed-v4-failed.log || true
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          run=json.load(open('/tmp/cvite-managed-v4-run.json'))[0]
+          jobs=json.load(open('/tmp/cvite-managed-v4-jobs.json')).get('jobs', [])
+          log=Path('/tmp/cvite-managed-v4-failed.log').read_text(errors='replace')
+          if len(log) > 50000:
+              log=log[-50000:]
+          lines=[
+              '## Managed-refresh v4 verification result',
+              '',
+              f"- Run: {run.get('url')}",
+              f"- Head: `{run.get('headSha')}`",
+              f"- Status: `{run.get('status')}`",
+              f"- Conclusion: `{run.get('conclusion')}`",
+              '',
+              '### Jobs and steps',
+              '',
+          ]
+          for job in jobs:
+              lines.append(f"- **{job.get('name')}** — `{job.get('status')}` / `{job.get('conclusion')}`")
+              for step in job.get('steps', []):
+                  lines.append(
+                      f"  - {step.get('number')}: {step.get('name')} — "
+                      f"`{step.get('status')}` / `{step.get('conclusion')}`"
+                  )
+          if log.strip():
+              lines += ['', '### Failed log tail', '', '```text', log.rstrip(), '```']
+          Path('/tmp/cvite-managed-v4-report.md').write_text(
+              '\n'.join(lines)+'\n', encoding='utf-8'
+          )
+          PY
+          cat /tmp/cvite-managed-v4-report.md
+
+      - name: Post exact report to PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh api repos/AkisArou/cvite/issues/1/comments \
+            --method POST \
+            --raw-field body="$(cat /tmp/cvite-managed-v4-report.md)" \
+            >/dev/null
+
+      - name: Upload machine-readable evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-managed-v4-report-${{ github.sha }}
+          path: |
+            /tmp/cvite-managed-v4-run.json
+            /tmp/cvite-managed-v4-jobs.json
+            /tmp/cvite-managed-v4-failed.log
+            /tmp/cvite-managed-v4-report.md
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Remove this one-shot reporter
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- .github/workflows/report-managed-v4-failure.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u -- .github/workflows/report-managed-v4-failure.yml
+          git commit -m "ci: remove managed v4 reporter [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
