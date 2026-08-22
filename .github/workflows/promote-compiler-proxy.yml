@@ -1,0 +1,109 @@
+name: Promote transparent compiler proxy
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-managed-pipeline-final
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: >-
+      github.actor == 'github-actions[bot]' &&
+      startsWith(github.event.head_commit.message,
+                 'feat: publish code and managed migrations atomically')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Promote compiler proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .github/driver-next/apply-compiler-proxy.py
+          python3 .github/driver-next/apply-compiler-proxy.py
+          test -f src/compiler/clang_wrapper.cpp
+          git diff --check
+
+      - name: Validate generated source scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          fixed = {'CMakeLists.txt', 'CMakePresets.json', 'README.md'}
+          roots = {'cmake', 'docs', 'examples', 'include', 'scripts', 'src', 'tests'}
+          changed = subprocess.check_output(
+              ['git', 'diff', '--name-only', '--diff-filter=ACMRT'], text=True
+          ).splitlines()
+          selected = []
+          for item in changed:
+              path = Path(item)
+              if item in fixed or (path.parts and path.parts[0] in roots):
+                  selected.append(item)
+              elif not item.startswith('.github/'):
+                  raise SystemExit(f'unexpected compiler-proxy path: {item}')
+          if not selected:
+              raise SystemExit('compiler-proxy applicator produced no source changes')
+          Path('/tmp/cvite-compiler-proxy-paths').write_text(
+              '\n'.join(selected) + '\n', encoding='utf-8'
+          )
+          print('\n'.join(selected))
+          PY
+
+      - name: Install pinned toolchain
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build cmake clang-18 llvm-18 llvm-18-dev libclang-18-dev python3
+
+      - name: Build and test proxy integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-compiler-proxy -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCVITE_BUILD_COMPILER=ON \
+            -DCVITE_BUILD_LLVM_PASS=ON \
+            -DCVITE_BUILD_ORC_LOADER=ON \
+            -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18 \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DCVITE_WARNINGS_AS_ERRORS=ON
+          cmake --build build-compiler-proxy --verbose
+          ctest --test-dir build-compiler-proxy --output-on-failure
+
+      - name: Publish verified compiler proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- \
+            .github/driver-next/apply-compiler-proxy.py \
+            .github/workflows/consolidate-compiler-proxy.yml \
+            .github/workflows/promote-compiler-proxy.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          while IFS= read -r path; do
+            test -n "$path" && git add -- "$path"
+          done < /tmp/cvite-compiler-proxy-paths
+          git add -u -- \
+            .github/driver-next/apply-compiler-proxy.py \
+            .github/workflows/consolidate-compiler-proxy.yml \
+            .github/workflows/promote-compiler-proxy.yml
+          git diff --cached --check
+          git commit -m "feat: add transparent Clang compiler proxy [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
