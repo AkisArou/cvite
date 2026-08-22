@@ -1,0 +1,41 @@
+name: Snapshot current source for managed migration
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.ref == 'bootstrap/m0-runtime'))
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+      - name: Package source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=.cvite \
+              --exclude=.github/workflows/snapshot-managed-final.yml \
+              -czf /tmp/cvite-managed-current.tar.gz .
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-managed-current-${{ github.sha }}
+          path: /tmp/cvite-managed-current.tar.gz
+          retention-days: 1
+          if-no-files-found: error
