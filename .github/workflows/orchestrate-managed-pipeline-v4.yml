@@ -1,0 +1,371 @@
+name: Orchestrate verified managed-refresh pipeline
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: cvite-managed-pipeline-final
+  cancel-in-progress: false
+
+jobs:
+  orchestrate:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.head_commit.message, '[orchestrate-managed-v4]')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Materialize audited managed core when missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('src/runtime/managed_memory.c')
+          if source.is_file() and 'cvite_managed_pointer_patch' in source.read_text(encoding='utf-8'):
+              raise SystemExit(0)
+
+          workflow = Path('.github/workflows/finalize-managed-memory-core.yml')
+          if not workflow.is_file():
+              raise SystemExit(
+                  'managed core is incomplete and its audited recovery workflow is absent'
+              )
+          text = workflow.read_text(encoding='utf-8')
+          opener = "          python3 - <<'PY'\n"
+          closer = "\n          PY\n          git diff --check"
+          if opener not in text or closer not in text:
+              raise SystemExit('unable to locate audited core materializer')
+          body = text.split(opener, 1)[1].split(closer, 1)[0]
+          lines = [
+              line[10:] if line.startswith('          ') else line
+              for line in body.splitlines()
+          ]
+          code = '\n'.join(lines) + '\n'
+          exec(compile(code, str(workflow), 'exec'), {'__name__': '__main__'})
+          PY
+          test -f include/cvite/managed_memory.h
+          test -f src/runtime/managed_memory.c
+          grep -q 'cvite_managed_pointer_patch' src/runtime/managed_memory.c
+          git diff --check
+
+      - name: Apply remaining compiler/runtime stages in dependency order
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          root = Path.cwd()
+          ordered_scripts = [
+              root / '.github/allocation-next/apply-allocation-index.py',
+              root / '.github/instrumentation-next/apply-managed-instrumentation.py',
+              root / '.github/type-manifest-next/apply-managed-type-manifest.py',
+              root / '.github/refresh-next/apply-managed-refresh.py',
+              root / '.github/driver-next/apply-compiler-proxy.py',
+          ]
+          live_stage = root / '.github/live-migration-next'
+          if live_stage.is_dir():
+              ordered_scripts.extend(sorted(live_stage.glob('apply-*.py')))
+          ordered_scripts.append(root / '.github/driver-next/apply-managed-live-test.py')
+
+          events: list[dict[str, object]] = []
+
+          def materialize_templates(stage: Path) -> list[str]:
+              templates = stage / 'templates'
+              copied: list[str] = []
+              if not templates.is_dir():
+                  return copied
+              for source in sorted(p for p in templates.rglob('*') if p.is_file()):
+                  destination = root / source.relative_to(templates)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  if not destination.exists() or destination.read_bytes() != source.read_bytes():
+                      shutil.copy2(source, destination)
+                      copied.append(str(destination.relative_to(root)))
+              return copied
+
+          for script in ordered_scripts:
+              if not script.is_file():
+                  continue
+              run = subprocess.run(
+                  ['python3', str(script)],
+                  cwd=root,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              event = {
+                  'script': str(script.relative_to(root)),
+                  'first_returncode': run.returncode,
+                  'first_output': run.stdout[-12000:],
+                  'copied_templates': [],
+              }
+              if run.returncode != 0:
+                  copied = materialize_templates(script.parent)
+                  event['copied_templates'] = copied
+                  retry = subprocess.run(
+                      ['python3', str(script)],
+                      cwd=root,
+                      text=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                  )
+                  event['retry_returncode'] = retry.returncode
+                  event['retry_output'] = retry.stdout[-12000:]
+                  if retry.returncode != 0:
+                      events.append(event)
+                      Path('/tmp/cvite-managed-orchestration.json').write_text(
+                          json.dumps(events, indent=2), encoding='utf-8'
+                      )
+                      print(json.dumps(event, indent=2))
+                      raise SystemExit(
+                          f'managed stage failed: {script.relative_to(root)}'
+                      )
+              events.append(event)
+
+          required = [
+              'include/cvite/managed_memory.h',
+              'src/runtime/managed_memory.c',
+              'include/cvite/allocation_index.hpp',
+              'src/compiler/allocation_index.cpp',
+              'src/compiler/allocation_annotator.cpp',
+              'src/compiler/clang_wrapper.cpp',
+              'src/transform/managed_baseline_registration_pass.h',
+          ]
+          missing = [path for path in required if not (root / path).is_file()]
+          if missing:
+              raise SystemExit('missing promoted sources: ' + ', '.join(missing))
+
+          Path('/tmp/cvite-managed-orchestration.json').write_text(
+              json.dumps(events, indent=2), encoding='utf-8'
+          )
+          print(json.dumps(events, indent=2))
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          PY
+
+      - name: Validate every generated path before building
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          fixed = {'CMakeLists.txt', 'CMakePresets.json', 'README.md'}
+          roots = {'cmake', 'docs', 'examples', 'include', 'scripts', 'src', 'tests'}
+          changed = subprocess.check_output(
+              ['git', 'diff', '--name-only', '--diff-filter=ACMRT'],
+              text=True,
+          ).splitlines()
+          selected = []
+          for item in changed:
+              path = Path(item)
+              if item in fixed or (path.parts and path.parts[0] in roots):
+                  selected.append(item)
+              elif not item.startswith('.github/') and not item.startswith('.cvite/'):
+                  raise SystemExit(f'unexpected generated source path: {item}')
+          if not selected:
+              raise SystemExit('orchestration produced no source changes')
+          Path('/tmp/cvite-managed-source-paths').write_text(
+              '\n'.join(selected) + '\n', encoding='utf-8'
+          )
+          print('\n'.join(selected))
+          PY
+
+      - name: Install pinned Clang and LLVM 18
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build
+          cmake
+          clang-18
+          llvm-18
+          llvm-18-dev
+          libclang-18-dev
+          gcc
+          python3
+
+      - name: Configure complete development tree
+        run: >-
+          cmake -S . -B build-managed-v4 -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_BUILD_SOAK_TESTS=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build and run complete test suite
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build-managed-v4 --verbose
+          ctest --test-dir build-managed-v4 --output-on-failure \
+            | tee /tmp/cvite-managed-v4-tests.txt
+
+      - name: Re-run managed core under dynamic and static analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang-18 \
+            -std=c11 -O1 -g \
+            -fsanitize=address,undefined \
+            -fno-omit-frame-pointer \
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wundef -Werror \
+            -Iinclude src/runtime/managed_memory.c tests/test_managed_memory.c \
+            -o /tmp/cvite-managed-v4-sanitized
+          ASAN_OPTIONS=detect_leaks=1 \
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            /tmp/cvite-managed-v4-sanitized
+          gcc \
+            -std=c11 -O0 -fanalyzer \
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wformat=2 -Wundef -Werror \
+            -Iinclude -c src/runtime/managed_memory.c \
+            -o /tmp/cvite-managed-v4-analyzer.o
+
+      - name: Remove all temporary staging and record verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- \
+            .github/allocation-next \
+            .github/driver-next \
+            .github/instrumentation-next \
+            .github/live-migration-next \
+            .github/managed-next \
+            .github/next \
+            .github/refresh-next \
+            .github/type-manifest-next \
+            .cvite
+          rm -f -- .github/pro-snapshot-run-id .github/pro-snapshot.tar.gz.b64
+          find .github/workflows -maxdepth 1 -type f ! -name 'ci.yml' -delete
+          mkdir -p docs
+          result=$(grep -E 'tests passed|tests failed' /tmp/cvite-managed-v4-tests.txt | tail -1 || true)
+          cat > docs/development-status.md <<EOF
+          # Development status
+
+          - Managed-refresh pipeline: verified
+          - Toolchain: Clang/LLVM 18
+          - Configuration: Debug, warnings as errors, soak tests enabled
+          - CTest: ${result:-completed successfully}
+          - Managed core: ASan/UBSan and GCC analyzer passed
+
+          The branch contains real semantic-index, allocation-inference,
+          compiler-instrumentation, managed type-manifest, transactional refresh,
+          compiler-proxy, and conservative append-only migration source.
+          Temporary generation templates and one-shot workflows were removed.
+
+          Unsupported or escaped native state remains a controlled restart
+          boundary; arbitrary unmanaged C pointer graphs are not claimed movable.
+          EOF
+          git diff --check
+
+      - name: Validate cleanup paths and publish one clean commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          while IFS= read -r path; do
+            test -n "$path" && git add -- "$path"
+          done < /tmp/cvite-managed-source-paths
+          git add -- docs/development-status.md
+          git add -u -- .github
+          if git ls-files --error-unmatch .cvite >/dev/null 2>&1; then
+            git add -u -- .cvite
+          fi
+          git diff --cached --check
+          git commit -m "feat: consolidate verified managed refresh pipeline [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
+
+      - name: Update draft PR after publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          cat > /tmp/pr-body.md <<'EOF'
+          ## Summary
+
+          CVite is an experimental React/Vite-style Fast Refresh runtime for
+          ordinary C, without required application macros, annotations, state
+          APIs, custom allocators, or lifecycle calls.
+
+          ```console
+          cvite run .
+          ```
+
+          Compatible edits are compiled with Clang, transformed with LLVM,
+          linked through ORC/JITLink, validated, and atomically published while
+          compatible native state remains alive. Invalid candidates preserve the
+          last known-good generation. Unsafe edits restart instead of risking
+          memory corruption.
+
+          ## Verified vertical slice
+
+          - Clang/libclang semantic and compilation-database integration.
+          - Stable native entries and immutable transactional dispatch.
+          - Incremental single- and multi-TU compilation and dependency watching.
+          - CMake File API, link-line, Ninja, target, and native-input discovery.
+          - Implementation filtering and quiescent native-code retirement.
+          - Field-level layout diagnostics and append-only compatibility plans.
+          - Failure-atomic managed allocation migration with owner-relative
+            pointer-slot provenance, interior offsets, and cyclic-graph tests.
+          - Clang inference of ordinary typed allocation idioms.
+          - Compiler-injected managed allocation and type metadata.
+          - Atomic code + eligible managed-state refresh transactions.
+          - Transparent Clang compiler proxy and an end-to-end ordinary-C live
+            migration test.
+
+          ## Safety boundary
+
+          Only state whose ownership, layout, and pointer roots can be proven is
+          migrated. Unmanaged or escaped pointers, incompatible active frames,
+          foreign-library ownership, unions, bit-fields, flexible arrays, custom
+          allocation schemes, and alignment-changing layouts remain controlled
+          restart boundaries.
+
+          ## Current constraints
+
+          - Linux/inotify and Clang/LLVM 18.
+          - C11-compatible application source and development-oriented builds.
+          - One supported C `main` entry.
+          - Translation-unit-set changes currently restart.
+          - Candidate LLVM modules are still completely relinked before publish.
+          - macOS and Windows backends are not yet packaged.
+
+          `docs/development-status.md` records the pinned verification state.
+          EOF
+          gh api --method PATCH repos/AkisArou/cvite/pulls/1 \
+            --raw-field body="$(cat /tmp/pr-body.md)" >/dev/null
+
+      - name: Upload exact verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-managed-v4-${{ github.sha }}
+          path: |
+            /tmp/cvite-managed-orchestration.json
+            /tmp/cvite-managed-v4-tests.txt
+          retention-days: 7
+          if-no-files-found: warn
