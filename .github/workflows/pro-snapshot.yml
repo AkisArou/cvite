@@ -7,10 +7,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   snapshot:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -22,12 +23,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tar --exclude=.git --exclude=.github/workflows/pro-snapshot.yml -czf /tmp/cvite-pro-current.tar.gz .
+          tar \
+            --exclude=.git \
+            --exclude=.github/workflows/pro-snapshot.yml \
+            --exclude=.github/pro-snapshot.tar.gz.b64 \
+            -czf /tmp/cvite-pro-current.tar.gz .
+          base64 -w 0 /tmp/cvite-pro-current.tar.gz > .github/pro-snapshot.tar.gz.b64
 
-      - name: Upload source snapshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: cvite-pro-current-${{ github.sha }}
-          path: /tmp/cvite-pro-current.tar.gz
-          retention-days: 1
-          if-no-files-found: error
+      - name: Commit snapshot payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- .github/pro-snapshot.tar.gz.b64
+          git diff --cached --check
+          git commit -m "ci: publish exact branch snapshot payload"
+          git push origin HEAD:bootstrap/m0-runtime
