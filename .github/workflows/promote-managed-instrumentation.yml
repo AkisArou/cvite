@@ -1,0 +1,117 @@
+name: Promote managed allocation instrumentation
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-managed-pipeline-final
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: >-
+      github.actor == 'github-actions[bot]' &&
+      startsWith(github.event.head_commit.message,
+                 'feat: infer typed allocation sites with Clang')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Require allocation inference and promote instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f include/cvite/allocation_index.hpp
+          test -f src/compiler/allocation_index.cpp
+          test -f .github/instrumentation-next/apply-managed-instrumentation.py
+          python3 .github/instrumentation-next/apply-managed-instrumentation.py
+          test -f src/compiler/allocation_annotator.cpp
+          git diff --check
+
+      - name: Validate generated path scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import subprocess
+          from pathlib import Path
+
+          allowed_files = {'CMakeLists.txt', 'CMakePresets.json', 'README.md'}
+          allowed_roots = {
+              'cmake', 'docs', 'examples', 'include', 'scripts', 'src', 'tests'
+          }
+          changed = subprocess.check_output(
+              ['git', 'diff', '--name-only', '--diff-filter=ACMRT'],
+              text=True,
+          ).splitlines()
+          selected = []
+          for item in changed:
+              path = Path(item)
+              if item in allowed_files or (path.parts and path.parts[0] in allowed_roots):
+                  selected.append(item)
+              elif not item.startswith('.github/'):
+                  raise SystemExit(f'unexpected generated path: {item}')
+          if not selected:
+              raise SystemExit('instrumentation applicator produced no source changes')
+          Path('/tmp/cvite-instrumentation-paths').write_text(
+              '\n'.join(selected) + '\n', encoding='utf-8'
+          )
+          print('\n'.join(selected))
+          PY
+
+      - name: Install pinned LLVM toolchain
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          ninja-build cmake clang-18 llvm-18 llvm-18-dev libclang-18-dev python3
+
+      - name: Configure full development build
+        run: >-
+          cmake -S . -B build-managed-instrumentation -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang-18
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DCVITE_BUILD_COMPILER=ON
+          -DCVITE_BUILD_LLVM_PASS=ON
+          -DCVITE_BUILD_ORC_LOADER=ON
+          -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18
+          -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build build-managed-instrumentation --verbose
+          ctest --test-dir build-managed-instrumentation --output-on-failure
+
+      - name: Publish only verified instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- .github/instrumentation-next
+          rm -f -- \
+            .github/workflows/consolidate-managed-instrumentation.yml \
+            .github/workflows/promote-managed-instrumentation.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          while IFS= read -r path; do
+            test -n "$path" && git add -- "$path"
+          done < /tmp/cvite-instrumentation-paths
+          git add -u -- \
+            .github/instrumentation-next \
+            .github/workflows/consolidate-managed-instrumentation.yml \
+            .github/workflows/promote-managed-instrumentation.yml
+          git diff --cached --check
+          git commit -m "feat: instrument inferred managed allocations [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
