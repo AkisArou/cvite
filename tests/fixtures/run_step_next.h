@@ -1,0 +1,6 @@
+#ifndef CVITE_RUN_STEP_NEXT_H
+#define CVITE_RUN_STEP_NEXT_H
+
+#define CVITE_NEXT_STEP 10
+
+#endif

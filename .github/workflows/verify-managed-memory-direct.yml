@@ -1,0 +1,172 @@
+name: Verify and land managed-memory transaction
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-managed-memory-direct
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Install compilers and build tools
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          cmake
+          ninja-build
+          gcc
+          clang
+
+      - name: Wire the managed-memory core into CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("CMakeLists.txt")
+          content = path.read_text(encoding="utf-8")
+
+          if "src/runtime/managed_memory.c" not in content:
+              marker = "    src/runtime/runtime_storage.c\n"
+              if marker not in content:
+                  raise SystemExit("runtime source marker is missing")
+              content = content.replace(
+                  marker,
+                  marker + "    src/runtime/managed_memory.c\n",
+                  1,
+              )
+
+          if "cvite_test_managed_memory" not in content:
+              marker = "    add_executable(cvite_test_runtime tests/test_runtime.c)\n"
+              block = """    add_executable(cvite_test_managed_memory tests/test_managed_memory.c)
+              target_link_libraries(cvite_test_managed_memory PRIVATE cvite::runtime)
+              cvite_set_warnings(cvite_test_managed_memory)
+              add_test(NAME managed-memory COMMAND cvite_test_managed_memory)
+
+          """
+              if marker not in content:
+                  raise SystemExit("runtime test marker is missing")
+              content = content.replace(marker, block + marker, 1)
+
+          path.write_text(content, encoding="utf-8")
+          PY
+          git diff --check
+
+      - name: Configure GCC
+        run: >-
+          cmake -S . -B build-managed-gcc -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=gcc
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+          -DCVITE_BUILD_COMPILER=OFF
+          -DCVITE_BUILD_LLVM_PASS=OFF
+          -DCVITE_BUILD_ORC_LOADER=OFF
+
+      - name: Build and test GCC
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build-managed-gcc --verbose 2>&1 | tee /tmp/gcc-build.log
+          ctest --test-dir build-managed-gcc --output-on-failure 2>&1 | tee /tmp/gcc-test.log
+
+      - name: Configure Clang
+        run: >-
+          cmake -S . -B build-managed-clang -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+          -DCVITE_BUILD_COMPILER=OFF
+          -DCVITE_BUILD_LLVM_PASS=OFF
+          -DCVITE_BUILD_ORC_LOADER=OFF
+
+      - name: Build and test Clang
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build-managed-clang --verbose 2>&1 | tee /tmp/clang-build.log
+          ctest --test-dir build-managed-clang --output-on-failure 2>&1 | tee /tmp/clang-test.log
+
+      - name: Configure ASan and UBSan
+        run: >-
+          cmake -S . -B build-managed-sanitizers -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=clang
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+          '-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer'
+          -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined
+          -DCVITE_BUILD_COMPILER=OFF
+          -DCVITE_BUILD_LLVM_PASS=OFF
+          -DCVITE_BUILD_ORC_LOADER=OFF
+
+      - name: Build and test ASan and UBSan
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: |
+          set -o pipefail
+          cmake --build build-managed-sanitizers --verbose 2>&1 | tee /tmp/sanitizer-build.log
+          ctest --test-dir build-managed-sanitizers --output-on-failure 2>&1 | tee /tmp/sanitizer-test.log
+
+      - name: Configure GCC analyzer
+        run: >-
+          cmake -S . -B build-managed-analyzer -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=gcc
+          -DCVITE_WARNINGS_AS_ERRORS=ON
+          -DCMAKE_C_FLAGS=-fanalyzer
+          -DCVITE_BUILD_COMPILER=OFF
+          -DCVITE_BUILD_LLVM_PASS=OFF
+          -DCVITE_BUILD_ORC_LOADER=OFF
+
+      - name: Build with GCC analyzer
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build-managed-analyzer --verbose 2>&1 | tee /tmp/analyzer-build.log
+
+      - name: Commit verified integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- CMakeLists.txt
+          git rm -- .github/workflows/verify-managed-memory-direct.yml
+          git diff --cached --check
+          git commit -m "feat: integrate failure-atomic managed migration [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime
+
+      - name: Upload verification logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvite-managed-memory-${{ github.sha }}
+          path: |
+            /tmp/gcc-build.log
+            /tmp/gcc-test.log
+            /tmp/clang-build.log
+            /tmp/clang-test.log
+            /tmp/sanitizer-build.log
+            /tmp/sanitizer-test.log
+            /tmp/analyzer-build.log
+          retention-days: 7
+          if-no-files-found: warn

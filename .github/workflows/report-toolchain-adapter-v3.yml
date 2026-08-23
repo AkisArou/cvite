@@ -1,0 +1,125 @@
+name: Report LLVM adapter implementation v3
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: cvite-toolchain-adapter-v1
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.head_commit.message, '[adapter-report-v3]')
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Gather exact implementation result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin bootstrap/m0-runtime
+          git reset --hard origin/bootstrap/m0-runtime
+
+          run_json=$(gh run list \
+            --workflow implement-toolchain-adapters-v3.yml \
+            --branch bootstrap/m0-runtime \
+            --limit 1 \
+            --json databaseId,status,conclusion,url,headSha,createdAt,updatedAt \
+            2>/dev/null || printf '[]')
+          printf '%s\n' "$run_json" > /tmp/adapter-v3-run.json
+          run_id=$(python3 - <<'PY'
+          import json
+          rows=json.load(open('/tmp/adapter-v3-run.json'))
+          print(rows[0]['databaseId'] if rows else '')
+          PY
+          )
+          if [[ -n "$run_id" ]]; then
+            gh run view "$run_id" --json jobs > /tmp/adapter-v3-jobs.json || printf '{}' > /tmp/adapter-v3-jobs.json
+            gh run view "$run_id" --log-failed > /tmp/adapter-v3-failed.log 2>&1 || true
+          else
+            printf '{}' > /tmp/adapter-v3-jobs.json
+            : > /tmp/adapter-v3-failed.log
+          fi
+
+          required=(
+            cmake/CViteLLVMAdapter.cmake
+            src/toolchain/llvm_adapter.h
+            src/toolchain/llvm_adapter_common.cpp
+            src/toolchain/adapters/llvm18.cpp
+            src/toolchain/adapters/llvm19.cpp
+            src/toolchain/adapters/llvm20.cpp
+            scripts/cvite-doctor.py
+            docs/toolchain-compatibility.md
+            src/compiler/allocation_annotator.cpp
+            src/transform/managed_allocation_pass.cpp
+            src/host/managed_host.c
+            src/compiler/clang_wrapper.cpp
+          )
+
+          mkdir -p docs
+          {
+            echo '# LLVM adapter and managed instrumentation checkpoint'
+            echo
+            echo "- Branch head: \`$(git rev-parse HEAD)\`"
+            echo "- Recorded at: \`$(date -u +'%Y-%m-%dT%H:%M:%SZ')\`"
+            echo
+            echo '## Source markers'
+            echo
+            for path in "${required[@]}"; do
+              if [[ -f "$path" ]]; then
+                echo "- ✅ \`$path\`"
+              else
+                echo "- ❌ \`$path\`"
+              fi
+            done
+            echo
+            echo '## Workflow run'
+            echo
+            echo '```json'
+            cat /tmp/adapter-v3-run.json
+            echo '```'
+            echo
+            echo '## Jobs'
+            echo
+            echo '```json'
+            cat /tmp/adapter-v3-jobs.json
+            echo '```'
+            if [[ -s /tmp/adapter-v3-failed.log ]]; then
+              echo
+              echo '## Failed log tail'
+              echo
+              echo '```text'
+              tail -n 500 /tmp/adapter-v3-failed.log
+              echo '```'
+            fi
+          } > docs/toolchain-adapter-gate.md
+
+      - name: Publish checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- .github/workflows/report-toolchain-adapter-v3.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- docs/toolchain-adapter-gate.md
+          git add -u -- .github/workflows/report-toolchain-adapter-v3.yml
+          git diff --cached --check
+          git commit -m "docs: record protected LLVM adapter gate [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime

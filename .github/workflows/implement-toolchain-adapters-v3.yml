@@ -1,0 +1,325 @@
+name: Implement LLVM adapters and managed instrumentation v3
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cvite-toolchain-adapter-v1
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    if: >-
+      github.actor != 'github-actions[bot]' &&
+      contains(github.event.head_commit.message, '[implement-adapter-v3]')
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+
+      - name: Install development toolchain
+        run: >-
+          sudo apt-get update &&
+          sudo apt-get install -y
+          build-essential ninja-build cmake python3
+          clang-18 llvm-18 llvm-18-dev libclang-18-dev lld-18
+
+      - name: Materialize adapter files idempotently
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+
+          root = Path.cwd()
+          workflow = root / '.github/workflows/implement-toolchain-adapters-v2.yml'
+          required = [
+              'src/toolchain/llvm_adapter.h',
+              'src/toolchain/llvm_adapter_common.cpp',
+              'src/toolchain/adapters/llvm18.cpp',
+              'src/toolchain/adapters/llvm19.cpp',
+              'src/toolchain/adapters/llvm20.cpp',
+              'src/toolchain/llvm_adapter_info.cpp',
+              'cmake/CViteLLVMAdapter.cmake',
+              'scripts/cvite-doctor.py',
+              'tests/check_toolchain_doctor.py',
+              'docs/toolchain-compatibility.md',
+          ]
+
+          missing = [path for path in required if not (root / path).is_file()]
+          if missing:
+              if not workflow.is_file():
+                  raise SystemExit(
+                      'adapter source is missing and v2 recovery workflow is absent: '
+                      + ', '.join(missing)
+                  )
+              text = workflow.read_text(encoding='utf-8')
+              for relative in missing:
+                  marker = f"          cat > {relative} <<'EOF'\n"
+                  if marker not in text:
+                      raise SystemExit(f'missing v2 payload for {relative}')
+                  body = text.split(marker, 1)[1].split('\n          EOF\n', 1)[0]
+                  lines = [
+                      line[10:] if line.startswith('          ') else line
+                      for line in body.splitlines()
+                  ]
+                  destination = root / relative
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          doctor = root / 'scripts/cvite-doctor.py'
+          doctor_text = doctor.read_text(encoding='utf-8')
+          doctor_text = doctor_text.replace(
+              r're.search(r"(?:version\\s+)?(\\d+)(?:\\.\\d+)+", output)',
+              r're.search(r"(?:version\\s+)?(\\d+)(?:\\.\\d+)+", output)',
+          )
+          doctor.write_text(doctor_text, encoding='utf-8')
+          doctor.chmod(0o755)
+
+          module = root / 'cmake/CViteLLVMAdapter.cmake'
+          module_text = module.read_text(encoding='utf-8')
+          if 'POSITION_INDEPENDENT_CODE ON' not in module_text:
+              needle = 'add_library(cvite_llvm_adapter STATIC\n'
+              position = module_text.find(needle)
+              if position < 0:
+                  raise SystemExit('adapter library marker was not found')
+              close = module_text.find('              )\n', position)
+              if close < 0:
+                  raise SystemExit('adapter library closing marker was not found')
+              close += len('              )\n')
+              module_text = (
+                  module_text[:close]
+                  + '              set_target_properties(cvite_llvm_adapter PROPERTIES\n'
+                    '                  POSITION_INDEPENDENT_CODE ON\n'
+                    '              )\n'
+                  + module_text[close:]
+              )
+              module.write_text(module_text, encoding='utf-8')
+          PY
+          git diff --check
+
+      - name: Promote only missing instrumentation files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          root = Path.cwd()
+
+          protected = {}
+          for relative in (
+              'src/host/managed_host.c',
+              'include/cvite/managed_memory.h',
+              'src/runtime/managed_memory.c',
+          ):
+              path = root / relative
+              if path.is_file():
+                  protected[relative] = path.read_bytes()
+
+          stages = [
+              (
+                  root / '.github/instrumentation-next',
+                  'apply-managed-instrumentation.py',
+                  'src/transform/managed_allocation_pass.cpp',
+              ),
+              (
+                  root / '.github/driver-next',
+                  'apply-compiler-proxy.py',
+                  'src/compiler/clang_wrapper.cpp',
+              ),
+          ]
+
+          for stage, script_name, marker in stages:
+              if (root / marker).is_file():
+                  continue
+              templates = stage / 'templates'
+              script = stage / script_name
+              if not templates.is_dir() or not script.is_file():
+                  raise SystemExit(f'missing staged source for {marker}')
+
+              for source in sorted(p for p in templates.rglob('*') if p.is_file()):
+                  relative = source.relative_to(templates)
+                  destination = root / relative
+                  if relative.as_posix() in protected:
+                      continue
+                  if not destination.exists():
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copy2(source, destination)
+
+              run = subprocess.run(
+                  ['python3', str(script)],
+                  cwd=root,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+              )
+              if run.returncode != 0 and not (root / marker).is_file():
+                  print(run.stdout)
+                  raise SystemExit(f'failed to wire {marker}')
+
+              for relative, data in protected.items():
+                  path = root / relative
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(data)
+
+          live = root / '.github/driver-next/apply-managed-live-test.py'
+          if live.is_file() and not (root / 'tests/check_managed_live.py').is_file():
+              run = subprocess.run(
+                  ['python3', str(live)], cwd=root, text=True,
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+              )
+              if run.returncode != 0:
+                  print(run.stdout)
+                  raise SystemExit('failed to wire managed live test')
+          PY
+          git diff --check
+
+      - name: Normalize CMake integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('CMakeLists.txt')
+          text = path.read_text(encoding='utf-8')
+
+          for module in (
+              'cmake/CViteManagedInstrumentation.cmake',
+              'cmake/CViteCompilerProxy.cmake',
+          ):
+              statement = f'include({module})'
+              if Path(module).is_file() and statement not in text:
+                  text = text.rstrip() + f'\n\n{statement}\n'
+
+          adapter = '''
+
+          # Keep LLVM-major-specific compiler and JIT APIs behind a thin adapter.
+          if(CVITE_BUILD_LLVM_PASS OR CVITE_BUILD_ORC_LOADER)
+              include(cmake/CViteLLVMAdapter.cmake)
+              cvite_configure_llvm_adapter()
+          endif()
+
+          if(BUILD_TESTING AND CVITE_BUILD_LLVM_PASS)
+              find_package(Python3 REQUIRED COMPONENTS Interpreter)
+              add_test(
+                  NAME toolchain-doctor
+                  COMMAND
+                      "${Python3_EXECUTABLE}"
+                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_toolchain_doctor.py"
+                      "${CMAKE_CURRENT_SOURCE_DIR}/scripts/cvite-doctor.py"
+                      "${CMAKE_C_COMPILER}"
+                      "/usr/bin/llvm-config-18"
+              )
+          endif()
+          '''
+          if 'include(cmake/CViteLLVMAdapter.cmake)' not in text:
+              text = text.rstrip() + adapter + '\n'
+          path.write_text(text, encoding='utf-8')
+
+          readme = Path('README.md')
+          body = readme.read_text(encoding='utf-8')
+          section = '''
+
+          ## Compiler compatibility
+
+          LLVM 18 is the first known-good development-toolchain pin, not a
+          permanent requirement. LLVM-major-specific Clang, pass-plugin, and
+          ORC/JITLink APIs are isolated behind thin adapters. See
+          [`docs/toolchain-compatibility.md`](docs/toolchain-compatibility.md).
+          '''
+          if '## Compiler compatibility' not in body:
+              readme.write_text(body.rstrip() + section + '\n', encoding='utf-8')
+          PY
+          git diff --check
+
+      - name: Verify core with GCC
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-gcc -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCVITE_WARNINGS_AS_ERRORS=ON \
+            -DCVITE_BUILD_COMPILER=OFF \
+            -DCVITE_BUILD_LLVM_PASS=OFF \
+            -DCVITE_BUILD_ORC_LOADER=OFF
+          cmake --build build-gcc --verbose
+          ctest --test-dir build-gcc --output-on-failure
+
+      - name: Verify complete LLVM 18 pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-llvm18 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCVITE_WARNINGS_AS_ERRORS=ON \
+            -DCVITE_BUILD_COMPILER=ON \
+            -DCVITE_BUILD_LLVM_PASS=ON \
+            -DCVITE_BUILD_ORC_LOADER=ON \
+            -DCVITE_LIBCLANG_ROOT=/usr/lib/llvm-18 \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+          cmake --build build-llvm18 --verbose
+          ctest --test-dir build-llvm18 --output-on-failure
+          test "$(build-llvm18/cvite-llvm-adapter-info --json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["llvm_major"])')" = 18
+          python3 scripts/cvite-doctor.py \
+            --clang clang-18 --llvm-config llvm-config-18 --json \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["compatible"]'
+
+      - name: Verify sanitizers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-sanitize -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang-18 \
+            -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+            -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined' \
+            -DCVITE_WARNINGS_AS_ERRORS=ON \
+            -DCVITE_BUILD_COMPILER=OFF \
+            -DCVITE_BUILD_LLVM_PASS=OFF \
+            -DCVITE_BUILD_ORC_LOADER=OFF
+          cmake --build build-sanitize --verbose
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+          UBSAN_OPTIONS=halt_on_error=1 \
+            ctest --test-dir build-sanitize --output-on-failure
+
+      - name: Publish verified implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf -- .github/driver-next .github/instrumentation-next
+          rm -f -- \
+            .github/workflows/implement-toolchain-adapters.yml \
+            .github/workflows/implement-toolchain-adapters-v2.yml \
+            .github/workflows/implement-toolchain-adapters-v3.yml \
+            .github/workflows/report-toolchain-adapter-v1.yml \
+            .github/workflows/report-toolchain-adapter-v2.yml
+
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "feat: add versioned LLVM adapters and managed instrumentation [skip-managed-consolidation]"
+          git fetch origin bootstrap/m0-runtime
+          git rebase origin/bootstrap/m0-runtime
+          git push origin HEAD:bootstrap/m0-runtime

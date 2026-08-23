@@ -356,4 +356,19 @@ These constraints protect the final DX. They are implementation limits, not sour
 
 ## Status
 
-The repository is being bootstrapped. The next code change will create the M0 build/protocol/runtime skeleton and a testable vertical slice toward M1.
+CVite now has a working experimental Linux/Clang vertical slice. `cvite run .`
+can compile ordinary single- or multi-translation-unit C projects, preserve
+compatible global/static/heap state, keep the last known-good generation active
+through compile errors, and atomically publish linked candidates through LLVM
+ORC/JITLink.
+
+Project integration currently includes libclang `compile_commands.json`
+ingestion, incremental per-translation-unit IR caching, Clang dependency-graph
+watching, and automatic native support discovery from CMake File API replies,
+CMake `link.txt`, or Ninja commands. Native library/archive/object contents are
+fingerprinted, so replacement at an unchanged pathname triggers a controlled
+full restart rather than leaving stale external code mapped.
+
+The active implementation target remains Linux, C11, and Clang/LLVM 18. Layout
+migration for arbitrary C pointer graphs, safe active-code reclamation, and
+portable macOS/Windows backends remain future work.

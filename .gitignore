@@ -1,0 +1,14 @@
+/build/
+/build-*/
+/cmake-build-*/
+/.local-clang/
+/.cache/
+/compile_commands.json
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+*.profraw
+*.profdata
