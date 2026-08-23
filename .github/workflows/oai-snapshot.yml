@@ -1,0 +1,30 @@
+name: OAI exact source snapshot
+
+on:
+  push:
+    branches:
+      - bootstrap/m0-runtime
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bootstrap/m0-runtime
+          fetch-depth: 0
+      - name: Package exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git --exclude=.github/workflows/oai-snapshot.yml -czf /tmp/cvite-exact.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cvite-exact-${{ github.sha }}
+          path: /tmp/cvite-exact.tar.gz
+          retention-days: 1
+          if-no-files-found: error
